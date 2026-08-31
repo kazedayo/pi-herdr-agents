@@ -221,7 +221,7 @@ test("release workflow uses package.json identity and trusted publishing", async
     version: string;
   };
 
-  assert.equal(pkg.name, "pi-herdr-agents");
+  assert.equal(pkg.name, "@kazedayo/pi-herdr-agents");
   assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
   assert.match(pkg.scripts.test, /--experimental-strip-types/);
   assert.match(pkg.scripts["test:integration"], /--experimental-strip-types/);

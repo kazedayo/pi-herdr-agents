@@ -29,14 +29,14 @@ Other terminal multiplexers are not supported. Worktrees isolate Git checkouts, 
 Install from npm:
 
 ```bash
-pi install npm:pi-herdr-agents
+pi install npm:@kazedayo/pi-herdr-agents
 ```
 
 Install project-locally or try it for one run:
 
 ```bash
-pi install -l npm:pi-herdr-agents
-pi -e npm:pi-herdr-agents
+pi install -l npm:@kazedayo/pi-herdr-agents
+pi -e npm:@kazedayo/pi-herdr-agents
 ```
 
 Then start Pi inside Herdr:
@@ -106,7 +106,7 @@ If the entry exists, spawning and result extraction worked; investigate parent w
 Git package refs are pinned. To move an installed development copy back to the current `main`, install that ref explicitly and reload the active Pi session:
 
 ```bash
-pi install git:github.com/giuseppecrj/pi-herdr-agents@main
+pi install git:github.com/kazedayo/pi-herdr-agents@main
 # Then run /reload inside Pi.
 ```
 
@@ -680,7 +680,7 @@ Install both packages through Pi; the role pack remains inert if
 `pi-herdr-agents` is absent:
 
 ```bash
-pi install npm:pi-herdr-agents
+pi install npm:@kazedayo/pi-herdr-agents
 pi install npm:@acme/security-roles
 ```
 
