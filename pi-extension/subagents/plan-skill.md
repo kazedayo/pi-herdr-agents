@@ -229,7 +229,7 @@ A worktree completion is a review handoff, not acceptance. For every result:
 6. Re-run affected tests on the destination branch after each integration.
 7. Keep the worktree until the result is accepted and preserved; cleanup is explicit.
 
-The extension does not push, create PRs, merge, or remove worktrees automatically. `subagent_resume` does not reattach worktree tracking; continue follow-up in the retained workspace. See `docs/worktree-subagents.md` when this package's guide is available.
+The extension does not push, create PRs, merge, or remove worktrees automatically. `subagent_resume` can open a tab in the retained worktree workspace but does not reattach worktree tracking. See `docs/worktree-subagents.md` when this package's guide is available.
 
 Skip this phase when all workers used the shared checkout.
 

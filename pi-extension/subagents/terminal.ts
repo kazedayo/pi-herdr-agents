@@ -48,9 +48,9 @@ export function shellQuote(value: string): string {
 }
 
 /** Create a new herdr tab and return its root pane ID. */
-export function createSubagentPane(name: string): PaneId {
+export function createSubagentPane(name: string, workspaceId?: string): PaneId {
 	assertTerminalAvailable();
-	return createHerdrSurface(name);
+	return createHerdrSurface(name, workspaceId);
 }
 
 /** Create a Git worktree in its own herdr workspace and return its root surface. */

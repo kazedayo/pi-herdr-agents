@@ -246,6 +246,12 @@ const SubagentParams = Type.Object({
 			),
 		}),
 	),
+	workspace: Type.Optional(
+		Type.String({
+			description:
+				"Herdr workspace ID to open the subagent's tab in (e.g. a retained worktree's workspace, from a prior worktree handoff or `herdr worktree list`). Defaults to the current space. Cannot be combined with worktree.",
+		}),
+	),
 	fork: Type.Optional(
 		Type.Boolean({
 			description:
@@ -835,6 +841,38 @@ const BUNDLED_WORKTREE_WARNINGS: Readonly<Record<string, string>> = {
 		"It normally uses an ordinary pane, not a new worktree. " +
 		"Herdr worktree workspaces persist until explicitly removed.",
 };
+
+// Spawns whose cwd sits inside a retained herdr worktree open in that
+// worktree's space, so callers don't have to pass `workspace` explicitly.
+function autoWorktreeWorkspace(
+	cwd: string,
+	hasWorktree: boolean,
+): string | undefined {
+	if (hasWorktree) return undefined;
+	try {
+		return listHerdrWorktrees(cwd)
+			.filter(
+				(w) =>
+					w.isLinkedWorktree &&
+					w.workspaceId &&
+					(cwd === w.path || cwd.startsWith(w.path + "/")),
+			)
+			.sort((a, b) => b.path.length - a.path.length)[0]?.workspaceId;
+	} catch {
+		return undefined;
+	}
+}
+
+// cwd recorded on the first line of a pi session file, for workspace routing.
+function sessionFileCwd(sessionPath: string): string | undefined {
+	try {
+		const line = readFileSync(sessionPath, "utf8").split("\n", 1)[0];
+		const cwd = (JSON.parse(line) as { cwd?: unknown }).cwd;
+		return typeof cwd === "string" && cwd.startsWith("/") ? cwd : undefined;
+	} catch {
+		return undefined;
+	}
+}
 
 function resolveWorktreeLaunchWarning(
 	params: Pick<Static<typeof SubagentParams>, "agent" | "worktree">,
@@ -1856,6 +1894,8 @@ async function launchSubagent(
 			diagnostic?.message ?? `Agent "${params.agent}" was not found.`,
 		);
 	}
+	if (params.worktree && params.workspace)
+		throw new Error("workspace cannot be combined with worktree.");
 	if (!ctx.model)
 		throw new Error("Subagent launch requires a resolved parent model");
 	const runtimePlan =
@@ -1890,6 +1930,9 @@ async function launchSubagent(
 		worktree: params.worktree,
 		fork: params.fork,
 		surface: options?.surface,
+		workspace:
+			params.workspace ??
+			autoWorktreeWorkspace(params.cwd ?? ctx.cwd, !!params.worktree),
 		parent: {
 			cwd: ctx.cwd,
 			invocationCwd: process.cwd(),
@@ -3532,6 +3575,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 							"Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
 					}),
 				),
+				workspace: Type.Optional(
+					Type.String({
+						description:
+							"Herdr workspace ID to open the resumed tab in (e.g. a retained worktree's workspace). Defaults to the current space.",
+					}),
+				),
 			}),
 
 			renderCall(args, theme) {
@@ -3591,6 +3640,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					name,
 					sessionFile: params.sessionPath,
 					message: params.message,
+					workspace:
+						params.workspace ??
+						autoWorktreeWorkspace(
+							sessionFileCwd(params.sessionPath) ?? ctx.cwd,
+							false,
+						),
 					parent: {
 						sessionId: ctx.sessionManager.getSessionId(),
 						sessionDir: ctx.sessionManager.getSessionDir(),

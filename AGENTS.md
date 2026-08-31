@@ -59,7 +59,7 @@ Read [`docs/worktree-subagents.md`](docs/worktree-subagents.md) before changing 
 - Keep overlapping or dependent writing tasks sequential unless the dependency is committed and used as the next exact base.
 - Tell worktree workers whether to commit. A good default is: edit, test, commit, report the SHA, and do not push/merge/remove.
 - The parent owns review, integration, publication, and cleanup.
-- Do not use `subagent_resume` as if it reattached worktree ownership; v1 resumes into an ordinary pane.
+- Do not use `subagent_resume` as if it reattached worktree ownership; v1 can open the tab in the retained worktree workspace but does not reattach the managed lifecycle.
 
 ## Documentation synchronization
 

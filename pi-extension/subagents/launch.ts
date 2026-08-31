@@ -66,6 +66,7 @@ export interface FreshPiLaunchRequest {
 	fork?: boolean;
 	handoff?: { leafId: string };
 	surface?: string;
+	workspace?: string;
 	parent: {
 		cwd: string;
 		invocationCwd?: string;
@@ -94,6 +95,7 @@ export interface ResumePiLaunchRequest {
 	name: string;
 	sessionFile: string;
 	message?: string;
+	workspace?: string;
 	parent: {
 		sessionId: string;
 		sessionDir: string;
@@ -123,7 +125,7 @@ export interface PiRunningChild {
 }
 
 export interface PiLaunchOperations {
-	createPane(name: string): string;
+	createPane(name: string, workspaceId?: string): string;
 	createWorktree(
 		name: string,
 		cwd: string,
@@ -317,7 +319,9 @@ function prepareLaunchSurface(
 	const { request } = resolved;
 	if (!request.worktree) {
 		return {
-			surface: request.surface ?? operations.createPane(request.name),
+			surface:
+				request.surface ??
+				operations.createPane(request.name, request.workspace),
 			targetCwd: resolved.sourceCwd,
 			effectiveAgentDir: resolved.localAgentDir ?? resolved.agentDir,
 			localAgentDir: resolved.localAgentDir,
@@ -658,7 +662,7 @@ async function launchResumedPiSubagent(
 		"artifacts",
 		request.parent.sessionId,
 	);
-	const surface = operations.createPane(request.name);
+	const surface = operations.createPane(request.name, request.workspace);
 	await operations.waitForShellReady(surface);
 	const activityFile = getSubagentActivityFile(artifactDir, id);
 	mkdirSync(dirname(activityFile), { recursive: true });

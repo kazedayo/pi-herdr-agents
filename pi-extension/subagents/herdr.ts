@@ -205,13 +205,20 @@ function buildWorktreeCreateArgs(
 	];
 }
 
-export function createHerdrSurface(name: string): string {
+export function createHerdrSurface(
+	name: string,
+	targetWorkspaceId?: string,
+): string {
 	// Create a new tab per subagent so parallel spawns each get a full tab
 	// instead of ever-narrower splits of the parent pane. Target the current
 	// workspace explicitly because Herdr's implicit default may be another space.
-	const { workspace_id: workspaceId } = getHerdrCurrentPaneInfo();
+	const { workspace_id: currentWorkspaceId } = getHerdrCurrentPaneInfo();
 	const output = herdrExec(
-		buildTabCreateArgs(name, process.cwd(), workspaceId),
+		buildTabCreateArgs(
+			name,
+			process.cwd(),
+			targetWorkspaceId ?? currentWorkspaceId,
+		),
 	);
 	const paneId = extractHerdrRootPaneId(output, "tab create");
 	try {

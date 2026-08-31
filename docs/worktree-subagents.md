@@ -138,7 +138,7 @@ If Git inspection fails, SHA/count/state/file fields are reported as unknown rat
 For parallel read-only review, prepare one stable existing checkout of the pull request or retained worker result. Do not create one managed worktree per reviewer.
 
 1. The parent records the exact base and head SHAs and makes sure no writer changes the checkout while review runs.
-2. Start each read-only child in an ordinary pane with `cwd` set to that checkout. Omit `worktree`.
+2. Start each read-only child with `cwd` set to that checkout. Omit `worktree`. If the checkout is a retained Herdr worktree, the child's tab opens in that worktree's workspace.
 3. Give every reviewer the same exact base and head SHAs. Require it to report `git rev-parse HEAD` before its review result.
 4. Before the parent reports or publishes the review, recheck the checkout SHA. If it changed, treat the prior reviews as stale and review the new commit again.
 
@@ -184,11 +184,11 @@ The extension never pushes, creates a PR, merges, cherry-picks, or changes the p
 - **Creation failure:** the manifest is marked failed. If Herdr created the branch but returned an incomplete response, the extension reconciles a unique branch match through `/worktree list` and records any recovered workspace/path.
 - **Launch failure after creation:** the manifest is marked failed and the workspace, forked session, and path are retained. The destination is not focused unless Pi startup is confirmed.
 - **Worker failure:** summary and available Git state are returned; the workspace remains open.
-- **`caller_ping`:** the child exits with `needs_help`; continue worktree-bound follow-up in the retained workspace rather than through `subagent_resume`.
+- **`caller_ping`:** the child exits with `needs_help`; continue worktree-bound follow-up in the retained workspace. `subagent_resume` can open a tab there, but it does not reattach the managed lifecycle.
 - **Parent `/reload`, `/new`, `/resume`, or `/fork`:** active in-memory watchers transfer to the replacement parent session.
 - **Full process restart or crash:** the worktree remains, but v1 does not automatically rediscover and resume its watcher.
 
-`subagent_resume` resumes a session in a new ordinary Herdr pane. It does not reattach the managed worktree lifecycle or produce a new worktree handoff. For worktree follow-up, focus the retained workspace and resume manually from its shell:
+`subagent_resume` resumes a session in a new Herdr tab. If the session cwd sits in a retained worktree, the tab opens in that worktree's workspace (or pass `workspace` explicitly). It does not reattach the managed worktree lifecycle or produce a new worktree handoff. For a fully attached continuation, focus the retained workspace and resume from its shell:
 
 ```bash
 herdr workspace focus <workspace-id>
@@ -221,7 +221,7 @@ This first version intentionally does not provide:
 
 - automatic push, PR creation, merge, or cherry-pick
 - automatic worktree or branch removal
-- worktree-aware `subagent_resume`
+- reattach managed worktree lifecycle on `subagent_resume`
 - durable restart reconciliation
 - dependency DAG scheduling or merge queues
 - stacked-branch management

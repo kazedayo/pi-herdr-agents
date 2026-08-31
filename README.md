@@ -125,7 +125,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `subagent`           | Spawn a sub-agent in a dedicated herdr pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
 | `subagents_list`     | List available agent definitions                                                            |
-| `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
+| `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new herdr pane (async)                          |
 | `herdr_workflow`     | Prepare, start, or cancel one exact approved project-local review workflow                   |
 
 | Pi child-only tool | Description |
@@ -385,6 +385,7 @@ subagent({
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory, or source repository when `worktree` is set (see [Role Folders](#role-folders)) |
 | `worktree`             | object  | —              | Isolated Herdr-managed Git worktree; requires `branch`, with optional `base` (committed `HEAD` by default) |
+| `workspace`            | string  | current space  | Herdr workspace ID for the child's tab. Cannot be combined with `worktree`. If omitted and `cwd` is inside a retained worktree, that worktree's space is used. |
 
 ### Naming coordinated children
 
@@ -405,7 +406,7 @@ The child starts at the returned worktree root. Tell writing agents to test and 
 
 Successful, failed, and help-requesting runs retain their workspace. Completion includes the worktree path, Herdr workspace, branch, base/head SHAs, commits ahead, changed and untracked files, and clean/dirty/conflicted state. Here, `clean` means no uncommitted files; the branch may still contain commits. If Git inspection fails, state is reported as unknown rather than guessed.
 
-An ownership manifest is written under the parent session's `artifacts/<session-id>/worktree-runs/` directory before Herdr creates resources. V1 does not automatically recover watchers after a full process restart, and `subagent_resume` does not reattach the managed worktree lifecycle.
+An ownership manifest is written under the parent session's `artifacts/<session-id>/worktree-runs/` directory before Herdr creates resources. V1 does not automatically recover watchers after a full process restart. `subagent_resume` can open the new tab in a retained worktree's Herdr workspace, but it does not reattach the managed worktree lifecycle.
 
 The extension does **not** push, create a PR, merge, cherry-pick, or remove the worktree or branch automatically. For task selection, lifecycle states, review commands, failure recovery, and safe cleanup, read [Worktree subagents](docs/worktree-subagents.md). The [research report](docs/research/worktree-subagent-orchestration.md) records the rationale and deferred roadmap.
 
@@ -481,6 +482,7 @@ The `caller_ping` tool lets a Pi-backed subagent request help from its parent ag
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+- `workspace` (optional): Herdr workspace ID to open the resumed tab in. Defaults to the current space, or the retained worktree space when the session cwd sits in one.
 
 **Interaction flow:**
 
@@ -501,7 +503,7 @@ await caller_ping({
 // with guidance like "Use v2, v1 is deprecated"
 ```
 
-> **Note:** `caller_ping` is only available inside Pi-backed subagent contexts. Calling it from a standalone Pi session returns an error. For a worktree child, the help handoff retains the workspace, but `subagent_resume` does not reattach worktree tracking; continue the work in the retained workspace.
+> **Note:** `caller_ping` is only available inside Pi-backed subagent contexts. Calling it from a standalone Pi session returns an error. For a worktree child, the help handoff retains the workspace. `subagent_resume` can open the tab in that workspace, but it does not reattach worktree tracking.
 
 ---
 

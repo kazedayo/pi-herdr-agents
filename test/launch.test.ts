@@ -79,14 +79,16 @@ function withFixture(
 describe("Pi launch", () => {
 	it("launches an ordinary child through one transaction", async () => {
 		await withFixture(async ({ request, project, agentDir }) => {
+			request.workspace = "space-9";
 			const projectAgentDir = join(project, ".pi", "agent");
 			mkdirSync(projectAgentDir, { recursive: true });
 			const events: string[] = [];
 			let command = "";
 			let scriptPath = "";
 			const operations: PiLaunchOperations = {
-				createPane(name) {
+				createPane(name, workspaceId) {
 					assert.equal(name, "Worker");
+					assert.equal(workspaceId, "space-9");
 					events.push("create");
 					return "pane-1";
 				},
@@ -187,11 +189,13 @@ describe("Pi launch", () => {
 					name: "Resume worker",
 					sessionFile,
 					message: "Use the approved schema.",
+					workspace: "wt-space",
 					parent: { sessionId: "parent", sessionDir },
 				};
 				const operations: PiLaunchOperations = {
-					createPane(name) {
+					createPane(name, workspaceId) {
 						assert.equal(name, "Resume worker");
+						assert.equal(workspaceId, "wt-space");
 						events.push("create");
 						return "pane-resume";
 					},

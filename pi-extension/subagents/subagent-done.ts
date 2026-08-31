@@ -150,6 +150,7 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
+  let lastRunMessages: any[] | undefined;
 
   // Show widget + status bar on session start
   pi.on("session_start", (_event, ctx) => {
@@ -178,8 +179,20 @@ export default function (pi: ExtensionAPI) {
     recorder.agentStart();
   });
 
-  pi.on("agent_end", (event, ctx) => {
-    const messages = (event as any).messages as any[] | undefined;
+  // agent_end fires for every low-level run, but Pi may still auto-retry or
+  // auto-compact-and-retry after it. Exiting here would publish the .exit
+  // sidecar while the run is still recoverable: the parent watcher consumes
+  // it once, reports failure, and drops the subagent from its list, so the
+  // recovered retry would run untracked. Only capture the messages.
+  pi.on("agent_end", (event) => {
+    lastRunMessages = (event as any).messages as any[] | undefined;
+  });
+
+  // agent_settled fires only when no automatic retry, compaction, or queued
+  // continuation will run — the run is terminal and safe to hand to the parent.
+  pi.on("agent_settled", (_event, ctx) => {
+    if (!agentStarted) return;
+    const messages = lastRunMessages;
     const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
