@@ -14,7 +14,7 @@ Do not design a release that creates a GitHub Release without a successful npm p
 
 You need:
 
-- Permission to manage this repository's GitHub Actions settings and npm package access for `@kazedayo/pi-herdr-agents`
+- Permission to manage this repository's GitHub Actions settings and npm package access for `pi-herdr-agents`
 - A clean local `main` branch
 
 Automated release gates (run by the workflow and required locally):
@@ -48,9 +48,9 @@ Do not release from skipped Herdr tests. Confirm the package preview includes `R
 
 After the package exists on npm, steady-state releases use npm trusted publishing (OIDC). No long-lived `NPM_TOKEN` is required.
 
-1. Open the package settings for `@kazedayo/pi-herdr-agents` on [npmjs.com](https://www.npmjs.com/).
+1. Open the package settings for `pi-herdr-agents` on [npmjs.com](https://www.npmjs.com/).
 2. Add a trusted publisher for GitHub Actions with:
-   - Organization or user: `kazedayo`
+   - Organization or user: `giuseppecrj`
    - Repository: `pi-herdr-agents`
    - Workflow filename: `publish.yml`
    - Allowed action: `npm publish`
@@ -62,7 +62,7 @@ When the repository secret `NPM_TOKEN` is absent, the publish step unsets `NODE_
 
 ### Bootstrap history
 
-The first publication of `@kazedayo/pi-herdr-agents` needs a temporary `NPM_TOKEN` bootstrap. After that version exists, add a trusted publisher for `kazedayo/pi-herdr-agents` and `publish.yml`, then remove `NPM_TOKEN`. Later version bumps use trusted publishing only.
+The initial `0.0.1` publication established the npm package. Trusted publishing is now configured for `giuseppecrj/pi-herdr-agents` and `publish.yml`, so all later releases use OIDC only. Later version bumps use trusted publishing only. Do not add `NPM_TOKEN`: the workflow rejects it once the package exists.
 
 ## Publish a release
 
@@ -93,16 +93,16 @@ You can rerun a failed or incomplete release from **Actions → Release → Run 
 After the workflow succeeds, inspect the published package:
 
 ```bash
-npm view @kazedayo/pi-herdr-agents
+npm view pi-herdr-agents
 ```
 
 Test installation through Pi:
 
 ```bash
-pi install npm:@kazedayo/pi-herdr-agents
+pi install npm:pi-herdr-agents
 ```
 
-The package should appear at <https://pi.dev/packages/@kazedayo/pi-herdr-agents> after the gallery indexes the npm release.
+The package should appear at <https://pi.dev/packages/pi-herdr-agents> after the gallery indexes the npm release.
 
 ## Troubleshooting
 
@@ -112,7 +112,7 @@ The workflow stops if the matching version tag already points to a different com
 
 ### npm rejects authentication
 
-Confirm that the trusted publisher matches owner `kazedayo`, repository `pi-herdr-agents`, and workflow `publish.yml`, that the job has `id-token: write`, and that the runner is GitHub-hosted. If a release reports that `NPM_TOKEN` is bootstrap-only, remove the secret and use the trusted publisher.
+Confirm that the trusted publisher matches owner `giuseppecrj`, repository `pi-herdr-agents`, and workflow `publish.yml`, that the job has `id-token: write`, and that the runner is GitHub-hosted. If a release reports that `NPM_TOKEN` is bootstrap-only, remove the secret and use the trusted publisher.
 
 ### npm reports that the version already exists
 
@@ -120,7 +120,7 @@ If the published `gitHead` does not match this commit, the workflow fails before
 
 ### Initial branch creation did not release
 
-A clean repository's first push has `github.event.before` all zeroes. The workflow treats that as `release=false`. Bootstrap the first `@kazedayo/pi-herdr-agents` version with `NPM_TOKEN`, then switch to tokenless trusted publishing.
+A clean repository's first push has `github.event.before` all zeroes. The workflow treats that as `release=false`. This package is already established on npm, so use tokenless trusted publishing for later releases.
 
 ### The package is absent from pi.dev
 

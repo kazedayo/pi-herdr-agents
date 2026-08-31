@@ -22,21 +22,21 @@ const packageFiles = new Set(
 
 describe("production package manifest", () => {
 	it("declares the public npm identity and publish metadata", () => {
-		assert.equal(manifest.name, "@kazedayo/pi-herdr-agents");
+		assert.equal(manifest.name, "pi-herdr-agents");
 		assert.match(manifest.version, /^\d+\.\d+\.\d+$/);
 		assert.equal(manifest.license, "MIT");
 		assert.equal(manifest.publishConfig?.access, "public");
 		assert.equal(
 			manifest.repository?.url,
-			"git+https://github.com/kazedayo/pi-herdr-agents.git",
+			"git+https://github.com/giuseppecrj/pi-herdr-agents.git",
 		);
 		assert.equal(
 			manifest.bugs?.url,
-			"https://github.com/kazedayo/pi-herdr-agents/issues",
+			"https://github.com/giuseppecrj/pi-herdr-agents/issues",
 		);
 		assert.equal(
 			manifest.homepage,
-			"https://github.com/kazedayo/pi-herdr-agents#readme",
+			"https://github.com/giuseppecrj/pi-herdr-agents#readme",
 		);
 		assert.equal(manifest.author?.name, "Giuseppe Rodriguez");
 		assert.equal(manifest.author?.url, "https://github.com/giuseppecrj");
