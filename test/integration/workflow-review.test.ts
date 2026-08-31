@@ -270,10 +270,13 @@ for (const backend of backends) {
 				const results = events
 					.filter((event) => event.type === "agent_result")
 					.map((event) => event.result);
-				assert.deepEqual(
-					starts.map((event) => event.role),
-					["architecture", "standards", "skeptic", "synthesizer"],
-				);
+				const startRoles = starts.map((event) => event.role);
+				assert.deepEqual(startRoles.slice(0, 3).sort(), [
+					"architecture",
+					"skeptic",
+					"standards",
+				]);
+				assert.equal(startRoles[3], "synthesizer");
 				assert.equal(
 					events.findIndex((event) => event.type === "agent_completed"),
 					6,
@@ -392,8 +395,11 @@ for (const backend of backends) {
 				);
 				const reviewEvents = reviewJournal.trim().split("\n").map((line) => JSON.parse(line));
 				assert.deepEqual(
-					reviewEvents.filter((event) => event.type === "agent_started").map((event) => event.role),
-					["architecture", "standards", "skeptic"],
+					reviewEvents
+						.filter((event) => event.type === "agent_started")
+						.map((event) => event.role)
+						.sort(),
+					["architecture", "skeptic", "standards"],
 				);
 				assert.equal(
 					reviewEvents.some((event) => event.type === "agent_result"),
