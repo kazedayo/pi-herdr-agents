@@ -195,7 +195,8 @@ Optional prerequisites fail closed and are not bundled:
 
 This package does not install optional prerequisites.
 
-Bundled agents use model defaults from `config.json` when configured; otherwise
+Bundled agents use model defaults from the subagent config file (see
+[Configuration](#configuration)) when configured; otherwise
 they inherit the parent model. Thinking defaults still come from agent
 frontmatter or the parent level. This resolution chain remains available as a
 fallback, but orchestrators should explicitly set each child's exact
@@ -276,10 +277,17 @@ A fixed internal watchdog marks a run as `stalled` when pane inspection fails or
 
 #### Configuration
 
-The extension reads `config.json` from the installed package root—the directory
-containing this README and `package.json`, not `pi-extension/subagents/` or
-Herdr's `config.toml`. That file is package-local: npm or git package updates may
-overwrite it. Common global package roots are:
+The extension reads one JSON config file. The canonical location is
+`~/.pi/agent/pi-herdr-agents.config.json`—outside the installed package, so
+package updates cannot overwrite it. When pi's `PI_CODING_AGENT_DIR` override
+is set, the extension reads `$PI_CODING_AGENT_DIR/pi-herdr-agents.config.json`
+instead.
+
+If the user-level file is absent, the extension falls back to `config.json` in
+the installed package root—the directory containing this README and
+`package.json`, not `pi-extension/subagents/` or Herdr's `config.toml`. That
+fallback exists for development checkouts: it is package-local, and npm or git
+package updates may overwrite it. Common global package roots are:
 
 - npm: `~/.pi/agent/npm/node_modules/pi-herdr-agents/`
 - git: `~/.pi/agent/git/<host>/<owner>/pi-herdr-agents/`
@@ -302,9 +310,9 @@ cp config.json.example config.json
 }
 ```
 
-If `config.json` is absent, status settings fall back to `config.json.example`.
-Model routing does not read the example: no model overrides apply until a real
-`config.json` exists.
+With no user-level file and no package-root `config.json`, status settings
+fall back to `config.json.example`. Model routing does not read the example:
+no model overrides apply until a real config file exists.
 
 The copyable example is model-neutral, so it works without requiring credentials
 for a specific provider. To configure models, replace the empty section with
@@ -337,9 +345,18 @@ list reports every attempted model. Workflow metadata accepts one exact model
 only, to keep approved workflow runtimes deterministic.
 
 `config.json` is gitignored in the source tree so local overrides are not
-committed from a checkout. On an installed package root, treat it as disposable
-local state that package updates may replace. Run `/reload` after changing it;
-status and model configuration are loaded when the extension starts.
+committed from a checkout. On an installed package, prefer the user-level file;
+migrate an existing package-root config with:
+
+```bash
+cp ~/.pi/agent/npm/node_modules/pi-herdr-agents/config.json \
+	~/.pi/agent/pi-herdr-agents.config.json
+```
+
+Adjust the source path for git installs or a custom `PI_CODING_AGENT_DIR`.
+
+Run `/reload` after changing the config; status and model configuration are
+loaded when the extension starts.
 
 ---
 

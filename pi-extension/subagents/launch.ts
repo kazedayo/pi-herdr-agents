@@ -7,9 +7,9 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { getSubagentActivityFile } from "./activity.ts";
+import { getAgentConfigDir } from "./config-paths.ts";
 import { createLifecycle, type SubagentLifecycle } from "./lifecycle.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 import { HerdrWorktreeCreateError } from "./herdr.ts";
@@ -294,9 +294,7 @@ async function launchFreshPiSubagent(
 function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
 	const id = request.id ?? Math.random().toString(16).slice(2, 10);
 	const agentDir =
-		request.parent.agentDir ??
-		process.env.PI_CODING_AGENT_DIR ??
-		join(homedir(), ".pi", "agent");
+		request.parent.agentDir ?? getAgentConfigDir();
 	const rawCwd = request.cwd ?? request.behavior.cwd;
 	const cwdBase =
 		request.cwd == null && request.behavior.cwd != null

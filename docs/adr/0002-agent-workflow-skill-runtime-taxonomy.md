@@ -140,7 +140,9 @@ Apply these rules:
 
 1. Prefer per-invocation `model` and `thinking` for a workflow's deliberate
    diversity or cost/quality policy.
-2. Use ignored local `config.json` for a person's durable role preferences.
+2. Use the user-level config file (`~/.pi/agent/pi-herdr-agents.config.json`)
+   for a person's durable role preferences; it survives package updates, unlike
+   the package-local `config.json` fallback.
 3. Leave bundled role `model` unset unless a particular model is a functional
    prerequisite.
 4. State runtime prerequisites before launch and fail closed when a required

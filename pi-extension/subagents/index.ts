@@ -13,6 +13,7 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { getAgentConfigDir } from "./config-paths.ts";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
 import {
@@ -24,7 +25,6 @@ import {
 	rmSync,
 	statSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import {
 	isTerminalAvailable,
 	terminalSetupHint,
@@ -377,11 +377,6 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
 	}
 
 	return denied;
-}
-
-/** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
-function getAgentConfigDir(): string {
-	return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
 function getBundledAgentsDir(): string {

@@ -47,6 +47,7 @@ import {
 	waitForProcessesExit,
 	__herdrTest__,
 } from "../pi-extension/subagents/herdr.ts";
+import { resolveConfigPath } from "../pi-extension/subagents/config-paths.ts";
 import {
 	loadModelConfig,
 	parseModelConfig,
@@ -889,6 +890,59 @@ describe("session.ts", () => {
 			// Target should now have 3 entries
 			const targetLines = readFileSync(targetFile, "utf8").trim().split("\n");
 			assert.equal(targetLines.length, 3);
+		});
+	});
+});
+
+describe("config-paths.ts", () => {
+	it("prefers the user-level config when it exists", () => {
+		withTempDir((dir) => {
+			writeFileSync(join(dir, "pi-herdr-agents.config.json"), "{}\n");
+			const previous = process.env.PI_CODING_AGENT_DIR;
+			process.env.PI_CODING_AGENT_DIR = dir;
+			try {
+				assert.equal(
+					resolveConfigPath("/fallback/config.json"),
+					join(dir, "pi-herdr-agents.config.json"),
+				);
+			} finally {
+				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			}
+		});
+	});
+
+	it("falls back to the package-local config when the user-level file is absent", () => {
+		withTempDir((dir) => {
+			const previous = process.env.PI_CODING_AGENT_DIR;
+			process.env.PI_CODING_AGENT_DIR = dir;
+			try {
+				assert.equal(
+					resolveConfigPath("/fallback/config.json"),
+					"/fallback/config.json",
+				);
+			} finally {
+				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			}
+		});
+	});
+
+	it("routes the no-argument loaders through the user-level config", () => {
+		withTempDir((dir) => {
+			writeFileSync(
+				join(dir, "pi-herdr-agents.config.json"),
+				JSON.stringify({
+					status: { enabled: false },
+					models: { default: "x/y" },
+				}) + "\n",
+			);
+			const previous = process.env.PI_CODING_AGENT_DIR;
+			process.env.PI_CODING_AGENT_DIR = dir;
+			try {
+				assert.equal(loadStatusConfig().enabled, false);
+				assert.equal(loadModelConfig().default, "x/y");
+			} finally {
+				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			}
 		});
 	});
 });

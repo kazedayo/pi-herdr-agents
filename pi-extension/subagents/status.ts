@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveConfigPath } from "./config-paths.ts";
 import { isBoolean, isPlainObject } from "./type-guards.ts";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
@@ -208,7 +209,7 @@ function readStatusConfigFile(
 }
 
 export function loadStatusConfig(
-	configPath = DEFAULT_STATUS_CONFIG_PATH,
+	configPath = resolveConfigPath(DEFAULT_STATUS_CONFIG_PATH),
 	examplePath = STATUS_CONFIG_EXAMPLE_PATH,
 ): StatusConfig {
 	const { sourcePath, rawConfig } = readStatusConfigFile(

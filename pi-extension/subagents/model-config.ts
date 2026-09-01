@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveConfigPath } from "./config-paths.ts";
 import { isPlainObject, isString } from "./type-guards.ts";
 
 const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -86,7 +87,7 @@ export function resolveModelDefault(
 }
 
 export function loadModelConfig(
-	configPath = DEFAULT_MODEL_CONFIG_PATH,
+	configPath = resolveConfigPath(DEFAULT_MODEL_CONFIG_PATH),
 ): ModelConfig {
 	let raw: string;
 	try {
