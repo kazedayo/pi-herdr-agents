@@ -601,9 +601,7 @@ function buildPiCommand(
 		env.push(`PI_SUBAGENT_NAME=${shellQuote(request.name)}`);
 		if (request.agent)
 			env.push(`PI_SUBAGENT_AGENT=${shellQuote(request.agent)}`);
-		env.push(
-			`PI_SUBAGENT_AUTO_EXIT=${request.behavior.autoExit ? "1" : "0"}`,
-		);
+		env.push(`PI_SUBAGENT_AUTO_EXIT=${request.behavior.autoExit ? "1" : "0"}`);
 		env.push(`PI_SUBAGENT_SESSION=${shellQuote(artifacts.sessionFile)}`);
 		env.push(`PI_SUBAGENT_ID=${shellQuote(resolved.id)}`);
 		env.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(artifacts.activityFile)}`);
@@ -635,10 +633,10 @@ function startPiProcess(
 	return operations.runScript(artifacts.surface, command, {
 		scriptPath: launchScriptFile,
 		scriptPreamble: [
-			`# Subagent launch script for ${resolved.request.name}`,
-			`# Generated: ${new Date().toISOString()}`,
-			`# Session: ${artifacts.sessionFile}`,
-			`# Surface: ${artifacts.surface}`,
+			shellComment(`Subagent launch script for ${resolved.request.name}`),
+			shellComment(`Generated: ${new Date().toISOString()}`),
+			shellComment(`Session: ${artifacts.sessionFile}`),
+			shellComment(`Surface: ${artifacts.surface}`),
 		].join("\n"),
 	});
 }
@@ -723,11 +721,13 @@ async function launchResumedPiSubagent(
 				`${safeName(request.name) || "resume"}-resume-${Date.now()}.sh`,
 			),
 			scriptPreamble: [
-				`# Subagent resume script for ${request.name}`,
-				`# Generated: ${new Date().toISOString()}`,
-				`# Session: ${request.sessionFile}`,
-				`# Surface: ${surface}`,
-				...(messageFile ? [`# Resume message file: ${messageFile}`] : []),
+				shellComment(`Subagent resume script for ${request.name}`),
+				shellComment(`Generated: ${new Date().toISOString()}`),
+				shellComment(`Session: ${request.sessionFile}`),
+				shellComment(`Surface: ${surface}`),
+				...(messageFile
+					? [shellComment(`Resume message file: ${messageFile}`)]
+					: []),
 			].join("\n"),
 		},
 	);
@@ -796,6 +796,10 @@ function timestampForFile(includeMilliseconds = true): string {
 	);
 }
 
+function shellComment(value: string): string {
+	return `# ${value.replace(/[\r\n\u2028\u2029]/g, " ")}`;
+}
+
 function safeName(name: string): string {
 	return name
 		.toLowerCase()
@@ -812,10 +816,7 @@ function resolveGitCommit(cwd: string, ref: string): string {
 	}).trim();
 }
 
-export function writeWorktreeManifest(
-	path: string,
-	value: JsonObject,
-): void {
+export function writeWorktreeManifest(path: string, value: JsonObject): void {
 	mkdirSync(dirname(path), { recursive: true });
 	let existing: JsonObject = {};
 	if (existsSync(path)) {

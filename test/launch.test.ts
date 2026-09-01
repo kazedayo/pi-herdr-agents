@@ -142,6 +142,49 @@ describe("Pi launch", () => {
 		});
 	});
 
+	it("keeps untrusted launch metadata inside shell comments", async () => {
+		await withFixture(async ({ request, root, sessionDir }) => {
+			const preambles: string[] = [];
+			let pane = 0;
+			const operations: PiLaunchOperations = {
+				createPane: () => `pane-${++pane}`,
+				createWorktree: () => {
+					throw new Error("unexpected worktree creation");
+				},
+				waitForShellReady: async () => {},
+				runScript: (_surface, _command, options) => {
+					preambles.push(options.scriptPreamble);
+					return options.scriptPath;
+				},
+			};
+			const injectedName =
+				"Worker\nprintf fresh-injection\rprintf carriage-return\u2028printf line-separator\u2029printf paragraph-separator";
+
+			await launchPiSubagent({ ...request, name: injectedName }, operations);
+
+			const resumedSession = join(root, "resumed.jsonl");
+			writeFileSync(resumedSession, "existing session\n");
+			await launchPiSubagent(
+				{
+					kind: "resume",
+					id: "resume-injection",
+					name: injectedName,
+					sessionFile: resumedSession,
+					parent: { sessionId: "parent", sessionDir },
+				},
+				operations,
+			);
+
+			assert.equal(preambles.length, 2);
+			for (const preamble of preambles) {
+				const lines = preamble.split("\n");
+				assert.equal(lines.length, 4);
+				assert.ok(lines.every((line) => line.startsWith("# ")));
+				assert.doesNotMatch(preamble, /\nprintf (?:fresh|carriage)/);
+			}
+		});
+	});
+
 	it("clears inherited auto-exit state for interactive children", async () => {
 		await withFixture(async ({ request }) => {
 			let command = "";
@@ -230,25 +273,37 @@ describe("Pi launch", () => {
 				assert.equal(running.worktree, undefined);
 				assert.match(
 					command,
-					new RegExp(`^PI_CODING_AGENT_DIR='${process.env.PI_CODING_AGENT_DIR}' `),
+					new RegExp(
+						`^PI_CODING_AGENT_DIR='${process.env.PI_CODING_AGENT_DIR}' `,
+					),
 				);
 				assert.match(command, new RegExp(`pi --session '${sessionFile}' -e `));
 				assert.match(command, /PI_SUBAGENT_NAME='Resume worker'/);
-				assert.match(command, new RegExp(`PI_SUBAGENT_SESSION='${sessionFile}'`));
+				assert.match(
+					command,
+					new RegExp(`PI_SUBAGENT_SESSION='${sessionFile}'`),
+				);
 				assert.match(command, /PI_SUBAGENT_ID='resume-1'/);
 				assert.match(command, /PI_SUBAGENT_ACTIVITY_FILE='/);
 				assert.match(command, /PI_SUBAGENT_AUTO_EXIT=1/);
 				assert.doesNotMatch(command, /--model|--thinking|^cd /);
 				const messagePath = command.match(/'@([^']+\.md)'/)?.[1];
 				assert.ok(messagePath, "expected artifact-backed follow-up message");
-				assert.equal(readFileSync(messagePath, "utf8"), "Use the approved schema.");
-				assert.match(scriptPreamble, /# Subagent resume script for Resume worker/);
+				assert.equal(
+					readFileSync(messagePath, "utf8"),
+					"Use the approved schema.",
+				);
+				assert.match(
+					scriptPreamble,
+					/# Subagent resume script for Resume worker/,
+				);
 				assert.match(
 					scriptPreamble,
 					new RegExp(`# Resume message file: ${messagePath}`),
 				);
 			} finally {
-				if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+				if (previousAgentDir === undefined)
+					delete process.env.PI_CODING_AGENT_DIR;
 				else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 			}
 		});
@@ -303,7 +358,9 @@ describe("Pi launch", () => {
 				cwd: project,
 			});
 			execFileSync("git", ["config", "user.name", "Test"], { cwd: project });
-			execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: project });
+			execFileSync("git", ["config", "commit.gpgsign", "false"], {
+				cwd: project,
+			});
 			writeFileSync(join(project, "base.txt"), "base\n");
 			execFileSync("git", ["add", "base.txt"], { cwd: project });
 			execFileSync("git", ["commit", "-qm", "base"], { cwd: project });
@@ -428,7 +485,9 @@ describe("Pi launch", () => {
 				cwd: project,
 			});
 			execFileSync("git", ["config", "user.name", "Test"], { cwd: project });
-			execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: project });
+			execFileSync("git", ["config", "commit.gpgsign", "false"], {
+				cwd: project,
+			});
 			writeFileSync(join(project, "base.txt"), "base\n");
 			execFileSync("git", ["add", "base.txt"], { cwd: project });
 			execFileSync("git", ["commit", "-qm", "base"], { cwd: project });
@@ -494,9 +553,15 @@ describe("Pi launch", () => {
 
 			assert.deepEqual(events, ["create", "ready", "run", "pi-ready", "focus"]);
 			assert.equal(result.focusError, undefined);
-			assert.equal(readFileSync(request.parent.sessionFile, "utf8"), parentBefore);
+			assert.equal(
+				readFileSync(request.parent.sessionFile, "utf8"),
+				parentBefore,
+			);
 			assert.match(command, new RegExp(`^cd '${worktreePath}' && `));
-			assert.doesNotMatch(command, /subagent-done|PI_SUBAGENT_|__SUBAGENT_DONE_/);
+			assert.doesNotMatch(
+				command,
+				/subagent-done|PI_SUBAGENT_|__SUBAGENT_DONE_/,
+			);
 			assert.doesNotMatch(command, /Implement the bounded change/);
 			const child = JSON.parse(
 				readFileSync(result.running.sessionFile, "utf8").split("\n")[0],
@@ -506,7 +571,10 @@ describe("Pi launch", () => {
 			assert.match(childText, /pi-herdr-worktree-handoff/);
 			assert.match(childText, /handoff\/feature/);
 			assert.match(childText, /Implement the bounded change\./);
-			assert.equal(readFileSync(join(worktreePath, "base.txt"), "utf8"), "base\n");
+			assert.equal(
+				readFileSync(join(worktreePath, "base.txt"), "utf8"),
+				"base\n",
+			);
 			assert.ok(sessionDir);
 		});
 	});
@@ -518,7 +586,9 @@ describe("Pi launch", () => {
 				cwd: project,
 			});
 			execFileSync("git", ["config", "user.name", "Test"], { cwd: project });
-			execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: project });
+			execFileSync("git", ["config", "commit.gpgsign", "false"], {
+				cwd: project,
+			});
 			writeFileSync(join(project, "base.txt"), "base\n");
 			execFileSync("git", ["add", "base.txt"], { cwd: project });
 			execFileSync("git", ["commit", "-qm", "base"], { cwd: project });
@@ -618,7 +688,9 @@ describe("Pi launch", () => {
 				cwd: project,
 			});
 			execFileSync("git", ["config", "user.name", "Test"], { cwd: project });
-			execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: project });
+			execFileSync("git", ["config", "commit.gpgsign", "false"], {
+				cwd: project,
+			});
 			writeFileSync(join(project, "base.txt"), "base\n");
 			execFileSync("git", ["add", "base.txt"], { cwd: project });
 			execFileSync("git", ["commit", "-qm", "base"], { cwd: project });
@@ -701,7 +773,10 @@ describe("Pi launch", () => {
 				/worktree retained.*pi exited before startup/i,
 			);
 			assert.equal(focused, false);
-			assert.equal(JSON.parse(readFileSync(manifestFile, "utf8")).state, "failed");
+			assert.equal(
+				JSON.parse(readFileSync(manifestFile, "utf8")).state,
+				"failed",
+			);
 		});
 	});
 
@@ -712,7 +787,9 @@ describe("Pi launch", () => {
 				cwd: project,
 			});
 			execFileSync("git", ["config", "user.name", "Test"], { cwd: project });
-			execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd: project });
+			execFileSync("git", ["config", "commit.gpgsign", "false"], {
+				cwd: project,
+			});
 			writeFileSync(join(project, "base.txt"), "base\n");
 			execFileSync("git", ["add", "base.txt"], { cwd: project });
 			execFileSync("git", ["commit", "-qm", "base"], { cwd: project });
@@ -809,7 +886,10 @@ describe("Pi launch", () => {
 				readFileSync(manifest.sessionFile, "utf8"),
 				/pi-herdr-worktree-handoff/,
 			);
-			assert.equal(readFileSync(request.parent.sessionFile, "utf8"), parentBefore);
+			assert.equal(
+				readFileSync(request.parent.sessionFile, "utf8"),
+				parentBefore,
+			);
 		});
 	});
 });
