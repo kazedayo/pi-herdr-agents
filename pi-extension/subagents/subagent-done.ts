@@ -166,12 +166,21 @@ export default function (pi: ExtensionAPI) {
 	let agentStarted = false;
 	let lastRunMessages: any[] | undefined;
 
+	// Re-read the live active set and re-render only when it changed.
+	// Extensions like pi-fff register/activate tools inside their own
+	// session_start handler, so a one-shot snapshot here can miss them.
+	function refreshTools(ctx: { ui: { setWidget: Function } }) {
+		const names = pi.getActiveTools().sort();
+		if (names.join(",") === toolNames.join(",")) return;
+		toolNames = names;
+		renderWidget(ctx, null);
+	}
+
 	// Show widget + status bar on session start
 	pi.on("session_start", (_event, ctx) => {
 		recorder.sessionStart();
-		const tools = pi.getAllTools();
-		toolNames = tools.map((t) => t.name).sort();
 		denied = parseDeniedTools(deniedToolsValue);
+		toolNames = pi.getActiveTools().sort();
 
 		renderWidget(ctx, null);
 	});
@@ -184,8 +193,11 @@ export default function (pi: ExtensionAPI) {
 		userTookOver = true;
 	});
 
-	pi.on("before_agent_start", () => {
+	pi.on("before_agent_start", (_event, ctx) => {
 		recorder.beforeAgentStart();
+		// By the first turn, every extension's session_start has run, so
+		// late-registered tools (e.g. pi-fff's multi_grep) are visible here.
+		refreshTools(ctx);
 	});
 
 	pi.on("agent_start", () => {

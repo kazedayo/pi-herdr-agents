@@ -176,6 +176,9 @@ function createMockExtensionApi(extensionEvents = createEventBus()) {
 			getAllTools() {
 				return [];
 			},
+			getActiveTools() {
+				return [];
+			},
 		} as any,
 	};
 }

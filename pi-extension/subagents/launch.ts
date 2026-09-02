@@ -293,8 +293,7 @@ async function launchFreshPiSubagent(
 
 function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
 	const id = request.id ?? Math.random().toString(16).slice(2, 10);
-	const agentDir =
-		request.parent.agentDir ?? getAgentConfigDir();
+	const agentDir = request.parent.agentDir ?? getAgentConfigDir();
 	const rawCwd = request.cwd ?? request.behavior.cwd;
 	const cwdBase =
 		request.cwd == null && request.behavior.cwd != null
