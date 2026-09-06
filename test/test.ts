@@ -39,6 +39,9 @@ import {
 	seedSubagentSessionFile,
 	createBtwSessionSnapshot,
 	createWorktreeSessionFork,
+	getSubagentSessionPolicyFile,
+	readSubagentSessionPolicy,
+	writeSubagentSessionPolicy,
 	type SessionEntry,
 } from "../pi-extension/subagents/session.ts";
 
@@ -53,6 +56,15 @@ import {
 	parseModelConfig,
 	resolveModelDefault,
 } from "../pi-extension/subagents/model-config.ts";
+import {
+	loadRoleConfig,
+	parseRoleConfig,
+} from "../pi-extension/subagents/role-config.ts";
+import {
+	createSubagentPaneFactory,
+	loadPaneConfig,
+	parsePaneConfig,
+} from "../pi-extension/subagents/pane-config.ts";
 import {
 	advanceStatusState,
 	capStatusLines,
@@ -95,6 +107,7 @@ import {
 	type SubagentLifecycle,
 } from "../pi-extension/subagents/lifecycle.ts";
 import type { PendingWorkflow } from "../pi-extension/subagents/workflow.ts";
+import { launchPiSubagent } from "../pi-extension/subagents/launch.ts";
 
 // Tool-registration behavior is environment-sensitive for child subagents.
 // Isolate the unit suite from inherited parent/child capability variables.
@@ -528,6 +541,61 @@ describe("session.ts", () => {
 		});
 	});
 
+	describe("subagent session policy", () => {
+		it("persists an explicit allowlist separately from unrestricted launches", () => {
+			const restricted = join(dir, "restricted-policy.jsonl");
+			const unrestricted = join(dir, "unrestricted-policy.jsonl");
+			writeSubagentSessionPolicy(restricted, {
+				owner: "public",
+				tools: "read, read, ",
+				deniedTools: ["subagent", "subagent"],
+			});
+			writeSubagentSessionPolicy(unrestricted, {
+				owner: "public",
+				deniedTools: [],
+			});
+
+			assert.deepEqual(readSubagentSessionPolicy(restricted), {
+				version: 1,
+				owner: "public",
+				tools: ["read"],
+				deniedTools: ["subagent"],
+			});
+			assert.equal(readSubagentSessionPolicy(unrestricted).tools, null);
+			assert.equal(existsSync(getSubagentSessionPolicyFile(restricted)), true);
+		});
+
+		it("fails closed for missing, malformed, and unsupported policies", () => {
+			const sessionFile = join(dir, "policy-errors.jsonl");
+			assert.throws(
+				() => readSubagentSessionPolicy(sessionFile),
+				/saved launch policy is missing/,
+			);
+
+			const policyFile = getSubagentSessionPolicyFile(sessionFile);
+			writeFileSync(policyFile, "not json", "utf8");
+			assert.throws(
+				() => readSubagentSessionPolicy(sessionFile),
+				/saved launch policy cannot be read/,
+			);
+
+			writeFileSync(
+				policyFile,
+				JSON.stringify({
+					version: 2,
+					owner: "public",
+					tools: null,
+					deniedTools: [],
+				}),
+				"utf8",
+			);
+			assert.throws(
+				() => readSubagentSessionPolicy(sessionFile),
+				/launch policy version is unsupported/,
+			);
+		});
+	});
+
 	describe("seedSubagentSessionFile", () => {
 		it("creates a lineage-only child session with parent linkage and no copied turns", () => {
 			const parentFile = createSessionFile(dir, [
@@ -947,6 +1015,164 @@ describe("config-paths.ts", () => {
 				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
 			}
 		});
+	});
+});
+
+describe("subagent resume launch policy", () => {
+	function runtimePlan() {
+		return {
+			provider: "test",
+			modelId: "model",
+			model: "test/model",
+			thinking: "low" as const,
+			modelSource: "request" as const,
+			thinkingSource: "request" as const,
+		};
+	}
+
+	function launchOperations(commands: string[], createPane = () => "pane") {
+		return {
+			createPane,
+			createWorktree() {
+				throw new Error("worktree creation is not expected");
+			},
+			async waitForShellReady() {},
+			runScript(_surface: string, command: string) {
+				commands.push(command);
+				return "/tmp/launch.sh";
+			},
+			closePane() {},
+		};
+	}
+
+	it("snapshots restricted tools and spawning denial for repeated public resumes", async () => {
+		const dir = createTestDir();
+		try {
+			const commands: string[] = [];
+			const parentSession = join(dir, "parent.jsonl");
+			writeFileSync(
+				parentSession,
+				`${JSON.stringify(SESSION_HEADER)}\n`,
+				"utf8",
+			);
+			const fresh = await launchPiSubagent(
+				{
+					kind: "fresh",
+					id: "fresh-id",
+					name: "Restricted",
+					task: "inspect",
+					parent: {
+						cwd: dir,
+						sessionFile: parentSession,
+						sessionId: "parent-id",
+						sessionDir: join(dir, "parent-sessions"),
+						agentDir: join(dir, "agent"),
+					},
+					runtimePlan: runtimePlan(),
+					behavior: {
+						tools: "read",
+						deniedTools: ["subagent", "subagent_resume"],
+						autoExit: true,
+						interactive: false,
+						sessionMode: "standalone",
+					},
+				},
+				launchOperations(commands),
+			);
+			assert.deepEqual(readSubagentSessionPolicy(fresh.sessionFile), {
+				version: 1,
+				owner: "public",
+				tools: ["read"],
+				deniedTools: ["subagent", "subagent_resume"],
+			});
+
+			await launchPiSubagent(
+				{
+					kind: "resume",
+					name: "Restricted",
+					sessionFile: fresh.sessionFile,
+					parent: {
+						sessionId: "parent-id",
+						sessionDir: join(dir, "parent-sessions"),
+					},
+					behavior: { autoExit: false },
+				},
+				launchOperations(commands),
+			);
+			await launchPiSubagent(
+				{
+					kind: "resume",
+					name: "Restricted again",
+					sessionFile: fresh.sessionFile,
+					parent: {
+						sessionId: "parent-id",
+						sessionDir: join(dir, "parent-sessions"),
+					},
+				},
+				launchOperations(commands),
+			);
+
+			assert.match(
+				commands[1],
+				/PI_DENY_TOOLS='subagent,subagent_resume'.*--tools 'read,caller_ping,subagent_done'/,
+			);
+			assert.match(
+				commands[2],
+				/PI_DENY_TOOLS='subagent,subagent_resume'.*--tools 'read,caller_ping'/,
+			);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects absent, malformed, workflow, and worktree policies before pane creation", async () => {
+		const dir = createTestDir();
+		try {
+			const sessionFile = join(dir, "resume.jsonl");
+			let panes = 0;
+			const operations = launchOperations([], () => {
+				panes += 1;
+				return "unexpected-pane";
+			});
+			const resume = () =>
+				launchPiSubagent(
+					{
+						kind: "resume",
+						name: "Resume",
+						sessionFile,
+						parent: { sessionId: "parent-id", sessionDir: dir },
+					},
+					operations,
+				);
+
+			await assert.rejects(resume, /saved launch policy is missing/);
+			writeFileSync(getSubagentSessionPolicyFile(sessionFile), "{", "utf8");
+			await assert.rejects(resume, /saved launch policy cannot be read/);
+			for (const tools of [[], ["read,write"], [" read"]]) {
+				writeFileSync(
+					getSubagentSessionPolicyFile(sessionFile),
+					JSON.stringify({
+						version: 1,
+						owner: "public",
+						tools,
+						deniedTools: [],
+					}),
+					"utf8",
+				);
+				await assert.rejects(resume, /saved launch tool policy is malformed/);
+			}
+			for (const owner of ["workflow", "managed-worktree"] as const) {
+				writeSubagentSessionPolicy(sessionFile, {
+					owner,
+					tools: ["read"],
+					deniedTools: [],
+				});
+				await assert.rejects(resume, new RegExp(`Cannot resume ${owner}`));
+			}
+			assert.equal(panes, 0);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -1428,6 +1654,88 @@ describe("status.ts", () => {
 	});
 });
 
+describe("pane configuration", () => {
+	it("defaults to tabs and rightward splits when panes are absent", () => {
+		assert.deepEqual(parsePaneConfig({}), {
+			mode: "tab",
+			direction: "right",
+		});
+	});
+
+	it("parses split mode and direction", () => {
+		assert.deepEqual(
+			parsePaneConfig({ panes: { mode: "split", direction: "down" } }),
+			{ mode: "split", direction: "down" },
+		);
+	});
+
+	it("rejects invalid pane settings", () => {
+		for (const panes of [null, [], "split"]) {
+			assert.throws(
+				() => parsePaneConfig({ panes }),
+				/panes must be an object/,
+			);
+		}
+		assert.throws(
+			() => parsePaneConfig({ panes: { mode: "window" } }),
+			/panes\.mode must be "tab" or "split"/,
+		);
+		assert.throws(
+			() => parsePaneConfig({ panes: { direction: "left" } }),
+			/panes\.direction must be "right" or "down"/,
+		);
+		assert.throws(
+			() => parsePaneConfig({ panes: { mode: "tab", extra: true } }),
+			/panes has unsupported key\(s\): extra/,
+		);
+	});
+
+	it("loads the shared example when local config is absent", () => {
+		withTempDir((dir) => {
+			const examplePath = join(dir, "config.json.example");
+			writeFileSync(
+				examplePath,
+				JSON.stringify({ panes: { mode: "split", direction: "down" } }),
+			);
+
+			assert.deepEqual(loadPaneConfig(join(dir, "config.json"), examplePath), {
+				mode: "split",
+				direction: "down",
+			});
+		});
+	});
+
+	it("uses tabs unchanged and passes split direction to the split creator", () => {
+		const calls: string[] = [];
+		const createTab = (name: string) => {
+			calls.push(`tab:${name}`);
+			return "tab-pane";
+		};
+		const createSplit = (name: string, direction: "right" | "down") => {
+			calls.push(`split:${name}:${direction}`);
+			return "split-pane";
+		};
+
+		assert.equal(
+			createSubagentPaneFactory(
+				{ mode: "tab", direction: "down" },
+				createTab,
+				createSplit,
+			)("Scout"),
+			"tab-pane",
+		);
+		assert.equal(
+			createSubagentPaneFactory(
+				{ mode: "split", direction: "right" },
+				createTab,
+				createSplit,
+			)("Reviewer"),
+			"split-pane",
+		);
+		assert.deepEqual(calls, ["tab:Scout", "split:Reviewer:right"]);
+	});
+});
+
 describe("model configuration", () => {
 	it("parses global and per-agent model defaults", () => {
 		assert.deepEqual(
@@ -1509,8 +1817,148 @@ describe("model configuration", () => {
 	});
 });
 
+describe("role configuration", () => {
+	it("defaults bundled roles to enabled when omitted", () => {
+		assert.deepEqual(parseRoleConfig({}), { bundled: true });
+		assert.deepEqual(parseRoleConfig({ roles: {} }), { bundled: true });
+	});
+
+	it("rejects explicit null and non-object role settings", () => {
+		for (const roles of [null, [], "roles"]) {
+			assert.throws(
+				() => parseRoleConfig({ roles }),
+				/roles must be an object/,
+			);
+		}
+		for (const bundled of [null, "false", []]) {
+			assert.throws(
+				() => parseRoleConfig({ roles: { bundled } }),
+				/roles\.bundled must be a boolean/,
+			);
+		}
+	});
+
+	it("loads the shared example when local config is absent", () => {
+		withTempDir((dir) => {
+			const examplePath = join(dir, "config.json.example");
+			writeFileSync(examplePath, JSON.stringify({ roles: { bundled: false } }));
+
+			assert.deepEqual(loadRoleConfig(join(dir, "config.json"), examplePath), {
+				bundled: false,
+			});
+		});
+	});
+
+	it("rejects malformed bundled-role settings without falling back", () => {
+		assert.throws(
+			() => parseRoleConfig({ roles: { bundled: "false" } }),
+			/roles\.bundled must be a boolean/,
+		);
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			const examplePath = join(dir, "config.json.example");
+			writeFileSync(
+				configPath,
+				JSON.stringify({ roles: { bundled: "false" } }),
+			);
+			writeFileSync(examplePath, JSON.stringify({ roles: { bundled: false } }));
+
+			assert.throws(
+				() => loadRoleConfig(configPath, examplePath),
+				/roles\.bundled must be a boolean/,
+			);
+		});
+	});
+});
+
 describe("subagent discovery", () => {
 	const testApi = subagentsModule.__test__;
+
+	it("excludes bundled roles while retaining role-pack and override roles", async () => {
+		await withIsolatedAgentEnv(
+			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+				const rolesDir = join(projectDir, "scout-pack", "roles");
+				mkdirSync(rolesDir, { recursive: true });
+				writeFileSync(
+					join(rolesDir, "..", "package.json"),
+					JSON.stringify({ name: "@acme/scout-pack", version: "1.0.0" }),
+				);
+				writeAgentFile(
+					rolesDir,
+					"scout",
+					"description: Role-pack scout enabled without bundled roles",
+				);
+
+				const disabled = { bundled: false };
+				const emptyCatalog = testApi.discoverAgentCatalog(undefined, disabled);
+				assert.equal(
+					emptyCatalog.agents.some((agent) => agent.name === "scout"),
+					false,
+					"listing excludes bundled scouts when disabled",
+				);
+				assert.equal(
+					testApi.loadAgentDefaults("scout", undefined, disabled),
+					null,
+					"exact-name lookup cannot launch an omitted bundled scout",
+				);
+
+				const { api } = createMockExtensionApi();
+				api.events.on(
+					"pi-herdr-subagents:roles:discover:v1",
+					(request: { register(path: string): void }) =>
+						request.register(rolesDir),
+				);
+				const catalog = testApi.discoverAgentCatalog(api, disabled);
+				assert.equal(
+					catalog.agents.find((agent) => agent.name === "scout")?.provider,
+					"@acme/scout-pack",
+					"a role pack may supply a name that no enabled bundled role owns",
+				);
+				assert.equal(
+					catalog.diagnostics.some(
+						(diagnostic) => diagnostic.code === "bundled-role-collision",
+					),
+					false,
+				);
+				assert.equal(
+					testApi.loadAgentDefaults("worker", api, disabled),
+					null,
+					"exact-name lookup cannot launch an omitted bundled role",
+				);
+
+				writeAgentFile(
+					globalAgentsDir,
+					"global-scout",
+					"description: Global scout",
+				);
+				assert.equal(
+					testApi.loadAgentDefaults("global-scout", api, disabled)?.source,
+					"global",
+				);
+
+				writeAgentFile(
+					globalAgentsDir,
+					"scout",
+					"description: Global scout override",
+				);
+				assert.equal(
+					testApi.loadAgentDefaults("scout", api, disabled)?.source,
+					"global",
+					"a global definition can supply a disabled bundled name",
+				);
+				writeAgentFile(
+					projectAgentsDir,
+					"scout",
+					"description: Project scout override",
+				);
+				assert.equal(
+					testApi.loadAgentDefaults("scout", api, disabled)?.source,
+					"project",
+					"a project definition retains precedence over a global definition",
+				);
+			},
+		);
+	});
 
 	it("loads session-mode from frontmatter", async () => {
 		await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
@@ -1789,31 +2237,81 @@ describe("subagent discovery", () => {
 		);
 
 		assert.equal(adversarial.spawning, true);
-		assert.ok(
-			new Set(
-				(adversarial.tools ?? "").split(",").map((tool: string) => tool.trim()),
-			).has("subagent"),
-			"adversarial reviewer must expose the subagent tool used by its workflow",
+		assert.equal(
+			adversarial.autoExit,
+			false,
+			"multi-wave coordinator must remain open after each child-result steer",
+		);
+		assert.equal(
+			adversarial.interactive,
+			false,
+			"automatic completion steers must wake the multi-wave coordinator",
+		);
+		assert.equal(
+			testApi.resolveEffectiveAutoExit(
+				{ name: "Adversarial review", task: "Review" },
+				adversarial,
+			),
+			false,
+		);
+		assert.equal(
+			testApi.resolveEffectiveInteractive(
+				{ name: "Adversarial review", task: "Review" },
+				adversarial,
+			),
+			false,
+		);
+		const adversarialTools = new Set(
+			(adversarial.tools ?? "").split(",").map((tool: string) => tool.trim()),
+		);
+		assert.equal(adversarialTools.has("subagent"), true);
+		for (const tool of ["read", "bash", "grep", "find", "ls"]) {
+			assert.equal(
+				adversarialTools.has(tool),
+				true,
+				`adversarial reviewer must expose ${tool}`,
+			);
+		}
+		assert.equal(
+			testApi.resolveEffectiveSessionMode(
+				{ name: "Adversarial review", task: "Review", fork: false },
+				adversarial,
+			),
+			"standalone",
 		);
 
 		const instructions = adversarial.body ?? "";
-		assert.match(instructions, /live authenticated model catalog/i);
+		assert.match(instructions, /model-catalog source/i);
+		assert.match(instructions, /how authentication was\s+confirmed/i);
 		assert.doesNotMatch(
 			instructions,
 			/model:\s*["'][^"']+\/[^"']+["']/,
 			"adversarial reviewer must not hard-code provider model IDs",
 		);
+		assert.match(instructions, /project review rules/i);
 		assert.match(
 			instructions,
-			/select three distinct exact\s+authenticated model IDs/i,
+			/Routine\s+risk uses two distinct eligible\s+exact model IDs/i,
 		);
-		assert.match(instructions, /project'?s review constraints/i);
-		assert.match(instructions, /prefer different\s+providers/i);
-		assert.match(instructions, /reuse the three selected model IDs/i);
-		assert.match(instructions, /fresh `reviewer` synthesis pass/i);
 		assert.match(
 			instructions,
-			/Do not\s+create artifacts in the reviewed checkout/i,
+			/High risk uses three distinct eligible IDs with lenses/i,
+		);
+		assert.match(instructions, /candidate-dependent/i);
+		assert.match(instructions, /different provider\/model family/i);
+		assert.match(instructions, /fresh reviewer carrying alias\s+`S1`/i);
+		assert.match(instructions, /subagent_ping.*not a review report/is);
+		assert.match(instructions, /nonzero exit, provider error, launch error/i);
+		assert.match(instructions, /Never silently replace a\s+runtime/i);
+		assert.match(instructions, /16,000 characters/i);
+		assert.match(instructions, /call\s+`subagent_done`/i);
+		assert.match(
+			instructions,
+			/Never call it[\s\S]*lacks a terminal envelope/i,
+		);
+		assert.match(
+			instructions,
+			/Do not run verification that can generate\s+artifacts/i,
 		);
 		assert.doesNotMatch(instructions, /tools:\s*["']read,bash,write["']/);
 	});
@@ -1854,6 +2352,14 @@ describe("subagent discovery", () => {
 				{ sessionMode: "lineage-only" },
 			),
 			"fork",
+		);
+		assert.equal(
+			testApi.resolveEffectiveSessionMode(
+				{ name: "A", task: "T", fork: false },
+				{ sessionMode: "fork" },
+			),
+			"fork",
+			"fork: false must not override an inherited fork session mode",
 		);
 	});
 
@@ -2238,6 +2744,305 @@ describe("subagent discovery", () => {
 		);
 	});
 
+	it("rejects malformed capability declarations without widening role tools", async () => {
+		await withIsolatedAgentEnv(async ({ projectDir, projectAgentsDir }) => {
+			const rolePackDir = join(projectDir, "invalid-capability-pack");
+			const rolesDir = join(rolePackDir, "roles");
+			mkdirSync(rolesDir, { recursive: true });
+			writeFileSync(
+				join(rolePackDir, "package.json"),
+				JSON.stringify({ name: "@acme/invalid-capability-pack" }),
+			);
+			writeAgentFile(
+				rolesDir,
+				"multiline-tools",
+				["description: Invalid multiline tools", "tools:", "  - read"].join(
+					"\n",
+				),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"empty-tools",
+				["description: Invalid empty tools", "tools:"].join("\n"),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"duplicate-tools",
+				[
+					"description: Invalid duplicate tools",
+					"tools: read",
+					"tools: grep",
+				].join("\n"),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"invalid-deny-tools",
+				[
+					"description: Invalid multiline deny tools",
+					"deny-tools:",
+					"  - subagent",
+				].join("\n"),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"invalid-spawning",
+				["description: Invalid spawning boolean", "spawning: maybe"].join("\n"),
+			);
+			for (const [name, frontmatter] of [
+				[
+					"quoted-deny-tools",
+					["description: Quoted deny tools", 'deny-tools: "subagent"'].join(
+						"\n",
+					),
+				],
+				[
+					"comment-deny-tools",
+					[
+						"description: Commented deny tools",
+						"deny-tools: subagent # prevent recursion",
+					].join("\n"),
+				],
+				[
+					"quoted-tools",
+					["description: Quoted tools", 'tools: "read"'].join("\n"),
+				],
+				[
+					"comment-tools",
+					["description: Commented tools", "tools: read # inspection"].join(
+						"\n",
+					),
+				],
+				[
+					"indented-tools",
+					["description: Indented tools", "  tools: read"].join("\n"),
+				],
+				[
+					"spaced-tools",
+					["description: Spaced tools", "tools : read"].join("\n"),
+				],
+				[
+					"quoted-key-tools",
+					["description: Quoted key tools", '"tools": read'].join("\n"),
+				],
+			] as const) {
+				writeAgentFile(projectAgentsDir, name, frontmatter);
+			}
+			writeAgentFile(
+				projectAgentsDir,
+				"scout",
+				["description: Invalid bundled override", "tools: []"].join("\n"),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"valid-comma-tools",
+				["description: Valid comma tools", "tools: read, grep"].join("\n"),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"valid-deny-tools",
+				["description: Valid deny tools", "deny-tools: subagent"].join("\n"),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"omitted-tools",
+				"description: Intentionally unrestricted",
+			);
+
+			const { api, registeredTools } = createMockExtensionApi();
+			api.events.on(
+				"pi-herdr-subagents:roles:discover:v1",
+				(request: { register(path: string): void }) =>
+					request.register(rolesDir),
+			);
+			subagentsModule.default(api);
+
+			const listTool = registeredTools.find(
+				(tool) => tool.name === "subagents_list",
+			);
+			assert.ok(listTool, "expected subagents_list to be registered");
+			const result = await listTool.execute();
+			const names = new Set(
+				result.details.agents.map((agent: any) => agent.name),
+			);
+			for (const name of [
+				"multiline-tools",
+				"empty-tools",
+				"duplicate-tools",
+				"invalid-deny-tools",
+				"invalid-spawning",
+				"quoted-deny-tools",
+				"comment-deny-tools",
+				"quoted-tools",
+				"comment-tools",
+				"indented-tools",
+				"spaced-tools",
+				"quoted-key-tools",
+				"scout",
+			]) {
+				assert.equal(names.has(name), false, `${name} must be rejected`);
+			}
+			assert.equal(
+				result.details.agents.find(
+					(agent: any) => agent.name === "valid-comma-tools",
+				)?.tools,
+				"read, grep",
+			);
+			assert.equal(
+				result.details.agents.find(
+					(agent: any) => agent.name === "omitted-tools",
+				)?.tools,
+				undefined,
+			);
+			assert.equal(
+				testApi
+					.resolveDenyTools(testApi.loadAgentDefaults("valid-deny-tools"))
+					.has("subagent"),
+				true,
+				"a valid deny-tools scalar must resolve the actual tool name",
+			);
+			assert.equal(
+				result.details.diagnostics.filter(
+					(diagnostic: any) =>
+						diagnostic.code === "invalid-capability-declaration",
+				).length,
+				13,
+			);
+			assert.match(result.content[0].text, /tools must use a non-empty/i);
+			assert.match(result.content[0].text, /spawning must be true or false/i);
+			assert.match(
+				result.content[0].text,
+				/comments and quotes are unsupported/i,
+			);
+			assert.match(result.content[0].text, /unquoted, unindented key/i);
+
+			const subagentTool = registeredTools.find(
+				(tool) => tool.name === "subagent",
+			);
+			assert.ok(subagentTool, "expected subagent to be registered");
+			const previousHerdrEnv = process.env.HERDR_ENV;
+			delete process.env.HERDR_ENV;
+			try {
+				const launch = await subagentTool.execute(
+					"call-1",
+					{ name: "Malformed", task: "Review this branch", agent: "scout" },
+					new AbortController().signal,
+					() => {},
+					{},
+				);
+				assert.equal(launch.details.error, "invalid-capability-declaration");
+				assert.match(launch.content[0].text, /tools/i);
+			} finally {
+				restoreEnvVar("HERDR_ENV", previousHerdrEnv);
+			}
+		});
+	});
+
+	it("uses the effective higher-precedence role before launch diagnostics", async () => {
+		await withIsolatedAgentEnv(
+			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+				const rolePackDir = join(projectDir, "precedence-capability-pack");
+				const rolesDir = join(rolePackDir, "roles");
+				mkdirSync(rolesDir, { recursive: true });
+				writeFileSync(
+					join(rolePackDir, "package.json"),
+					JSON.stringify({ name: "@acme/precedence-capability-pack" }),
+				);
+				writeAgentFile(
+					globalAgentsDir,
+					"global-invalid-project-valid",
+					["description: Invalid global", "tools: []"].join("\n"),
+				);
+				writeAgentFile(
+					projectAgentsDir,
+					"global-invalid-project-valid",
+					["description: Valid project", "tools: read"].join("\n"),
+				);
+				writeAgentFile(
+					rolesDir,
+					"pack-invalid-project-valid",
+					["description: Invalid pack", "tools: []"].join("\n"),
+				);
+				writeAgentFile(
+					projectAgentsDir,
+					"pack-invalid-project-valid",
+					["description: Valid project", "tools: read"].join("\n"),
+				);
+				writeAgentFile(
+					globalAgentsDir,
+					"invalid-hidden-project-valid",
+					["description: Invalid global", "tools: []"].join("\n"),
+				);
+				writeAgentFile(
+					projectAgentsDir,
+					"invalid-hidden-project-valid",
+					[
+						"description: Valid hidden project",
+						"tools: read",
+						"disable-model-invocation: true",
+					].join("\n"),
+				);
+
+				const { api, registeredTools } = createMockExtensionApi();
+				api.events.on(
+					"pi-herdr-subagents:roles:discover:v1",
+					(request: { register(path: string): void }) =>
+						request.register(rolesDir),
+				);
+				subagentsModule.default(api);
+
+				const catalog = testApi.discoverAgentCatalog(api);
+				assert.equal(
+					catalog.diagnostics.filter(
+						(diagnostic) =>
+							diagnostic.code === "invalid-capability-declaration",
+					).length,
+					3,
+					"invalid lower-precedence roles remain visible as diagnostics",
+				);
+				for (const name of [
+					"global-invalid-project-valid",
+					"pack-invalid-project-valid",
+					"invalid-hidden-project-valid",
+				]) {
+					const agent = catalog.agents.find(
+						(candidate) => candidate.name === name,
+					);
+					assert.equal(agent?.source, "project");
+					assert.equal(agent?.tools, "read");
+				}
+
+				const subagentTool = registeredTools.find(
+					(tool) => tool.name === "subagent",
+				);
+				assert.ok(subagentTool, "expected subagent to be registered");
+				const previousHerdrEnv = process.env.HERDR_ENV;
+				delete process.env.HERDR_ENV;
+				try {
+					for (const agent of [
+						"global-invalid-project-valid",
+						"pack-invalid-project-valid",
+						"invalid-hidden-project-valid",
+					]) {
+						const launch = await subagentTool.execute(
+							"call-1",
+							{ name: "Valid override", task: "Inspect", agent },
+							new AbortController().signal,
+							() => {},
+							{},
+						);
+						assert.equal(launch.details.error, "herdr not available");
+						assert.doesNotMatch(
+							launch.content[0].text,
+							/invalid capability declaration/i,
+						);
+					}
+				} finally {
+					restoreEnvVar("HERDR_ENV", previousHerdrEnv);
+				}
+			},
+		);
+	});
+
 	it("rejects legacy external CLI roles before launch", async () => {
 		await withIsolatedAgentEnv(
 			async ({ globalAgentsDir, projectAgentsDir }) => {
@@ -2449,6 +3254,293 @@ describe("subagent-done.ts", () => {
 			);
 		} finally {
 			restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+		}
+	});
+
+	it("waits for settlement after a transient compaction error", () => {
+		withTempDir((dir) => {
+			const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+			const previousSession = process.env.PI_SUBAGENT_SESSION;
+			const sessionFile = join(dir, "child.jsonl");
+			process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+			process.env.PI_SUBAGENT_SESSION = sessionFile;
+			try {
+				const { api, eventHandlers } = createMockExtensionApi();
+				subagentDoneExtension(api);
+				const agentEnd = eventHandlers.get("agent_end")?.[0];
+				const agentSettled = eventHandlers.get("agent_settled")?.[0];
+				assert.ok(agentEnd);
+				assert.ok(agentSettled);
+
+				let shutdowns = 0;
+				let branch: any[] = [];
+				const ctx = {
+					shutdown: () => shutdowns++,
+					sessionManager: { getBranch: () => branch },
+				};
+				const transientError = {
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: "This operation was aborted",
+				};
+				agentEnd({ messages: [transientError] }, ctx);
+				assert.equal(existsSync(`${sessionFile}.exit`), false);
+				assert.equal(shutdowns, 0);
+
+				const completed = {
+					role: "assistant",
+					stopReason: "stop",
+					content: [{ type: "text", text: "Completed after compaction." }],
+				};
+				branch = [
+					{ type: "message", message: transientError },
+					{ type: "compaction", summary: "Compacted" },
+					{ type: "message", message: completed },
+				];
+				agentEnd({ messages: [completed] }, ctx);
+				assert.equal(existsSync(`${sessionFile}.exit`), false);
+				assert.equal(shutdowns, 0);
+
+				agentSettled({}, ctx);
+				assert.deepEqual(
+					JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")),
+					{
+						type: "done",
+					},
+				);
+				assert.equal(shutdowns, 1);
+				agentSettled({}, ctx);
+				assert.equal(shutdowns, 1);
+			} finally {
+				restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+				restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+			}
+		});
+	});
+
+	it("uses the settled branch instead of a stale agent_end error", () => {
+		withTempDir((dir) => {
+			const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+			const previousSession = process.env.PI_SUBAGENT_SESSION;
+			const sessionFile = join(dir, "child.jsonl");
+			process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+			process.env.PI_SUBAGENT_SESSION = sessionFile;
+			try {
+				const { api, eventHandlers } = createMockExtensionApi();
+				subagentDoneExtension(api);
+				const cachedError = {
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: "This operation was aborted",
+				};
+				let shutdowns = 0;
+				const ctx = {
+					shutdown: () => shutdowns++,
+					sessionManager: {
+						getBranch: () => [
+							{ type: "message", message: cachedError },
+							{
+								type: "message",
+								message: { role: "assistant", stopReason: "stop" },
+							},
+						],
+					},
+				};
+
+				eventHandlers.get("agent_end")?.[0]({ messages: [cachedError] }, ctx);
+				eventHandlers.get("agent_settled")?.[0]({}, ctx);
+				assert.deepEqual(
+					JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")),
+					{ type: "done" },
+				);
+				assert.equal(shutdowns, 1);
+			} finally {
+				restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+				restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+			}
+		});
+	});
+
+	it("reports a provider error that remains after settlement", () => {
+		withTempDir((dir) => {
+			const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+			const previousSession = process.env.PI_SUBAGENT_SESSION;
+			const sessionFile = join(dir, "child.jsonl");
+			process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+			process.env.PI_SUBAGENT_SESSION = sessionFile;
+			try {
+				const { api, eventHandlers } = createMockExtensionApi();
+				subagentDoneExtension(api);
+				const error = {
+					role: "assistant",
+					stopReason: "error",
+					errorMessage: "provider failed",
+				};
+				let shutdowns = 0;
+				const ctx = {
+					shutdown: () => shutdowns++,
+					sessionManager: {
+						getBranch: () => {
+							throw new Error("session branch unavailable");
+						},
+					},
+				};
+
+				eventHandlers.get("agent_end")?.[0]({ messages: [error] }, ctx);
+				assert.equal(existsSync(`${sessionFile}.exit`), false);
+				eventHandlers.get("agent_settled")?.[0]({}, ctx);
+				assert.deepEqual(
+					JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")),
+					{
+						type: "error",
+						errorMessage: "provider failed",
+						stopReason: "error",
+					},
+				);
+				assert.equal(shutdowns, 1);
+			} finally {
+				restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+				restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+			}
+		});
+	});
+
+	it("stays open when the settled assistant turn was aborted", () => {
+		withTempDir((dir) => {
+			const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+			const previousSession = process.env.PI_SUBAGENT_SESSION;
+			const sessionFile = join(dir, "child.jsonl");
+			process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+			process.env.PI_SUBAGENT_SESSION = sessionFile;
+			try {
+				const { api, eventHandlers } = createMockExtensionApi();
+				subagentDoneExtension(api);
+				const aborted = { role: "assistant", stopReason: "aborted" };
+				let shutdowns = 0;
+				const ctx = {
+					shutdown: () => shutdowns++,
+					sessionManager: {
+						getBranch: () => [{ type: "message", message: aborted }],
+					},
+				};
+
+				eventHandlers.get("agent_end")?.[0]({ messages: [aborted] }, ctx);
+				eventHandlers.get("agent_settled")?.[0]({}, ctx);
+				assert.equal(existsSync(`${sessionFile}.exit`), false);
+				assert.equal(shutdowns, 0);
+			} finally {
+				restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+				restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+			}
+		});
+	});
+
+	it("preserves caller_ping completion when the agent later settles", async () => {
+		const dir = createTestDir();
+		const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+		const previousSession = process.env.PI_SUBAGENT_SESSION;
+		const previousName = process.env.PI_SUBAGENT_NAME;
+		const sessionFile = join(dir, "child.jsonl");
+		process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+		process.env.PI_SUBAGENT_SESSION = sessionFile;
+		process.env.PI_SUBAGENT_NAME = "test-child";
+		try {
+			const { api, eventHandlers, registeredTools } = createMockExtensionApi();
+			subagentDoneExtension(api);
+			let shutdowns = 0;
+			const ctx = {
+				shutdown: () => shutdowns++,
+				sessionManager: {
+					getBranch: () => [
+						{
+							type: "message",
+							message: { role: "assistant", stopReason: "stop" },
+						},
+					],
+				},
+			};
+			const callerPing = registeredTools.find(
+				(tool) => tool.name === "caller_ping",
+			);
+			assert.ok(callerPing);
+
+			await callerPing.execute(
+				"call",
+				{ message: "Need input" },
+				null,
+				null,
+				ctx,
+			);
+			eventHandlers.get("agent_end")?.[0](
+				{ messages: [{ role: "assistant", stopReason: "stop" }] },
+				ctx,
+			);
+			eventHandlers.get("agent_settled")?.[0]({}, ctx);
+			assert.deepEqual(
+				JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")),
+				{
+					type: "ping",
+					name: "test-child",
+					message: "Need input",
+				},
+			);
+			assert.equal(shutdowns, 1);
+		} finally {
+			restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+			restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+			restoreEnvVar("PI_SUBAGENT_NAME", previousName);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("leaves non-auto-exit coordinators open until subagent_done", async () => {
+		const dir = createTestDir();
+		const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+		const previousSession = process.env.PI_SUBAGENT_SESSION;
+		const sessionFile = join(dir, "child.jsonl");
+		delete process.env.PI_SUBAGENT_AUTO_EXIT;
+		process.env.PI_SUBAGENT_SESSION = sessionFile;
+		try {
+			const { api, eventHandlers, registeredTools } = createMockExtensionApi();
+			subagentDoneExtension(api);
+			let shutdowns = 0;
+			const ctx = {
+				shutdown: () => shutdowns++,
+				sessionManager: {
+					getBranch: () => [
+						{
+							type: "message",
+							message: { role: "assistant", stopReason: "stop" },
+						},
+					],
+				},
+			};
+
+			eventHandlers.get("agent_end")?.[0](
+				{ messages: [{ role: "assistant", stopReason: "stop" }] },
+				ctx,
+			);
+			eventHandlers.get("agent_settled")?.[0]({}, ctx);
+			assert.equal(existsSync(`${sessionFile}.exit`), false);
+			assert.equal(shutdowns, 0);
+
+			const subagentDone = registeredTools.find(
+				(tool) => tool.name === "subagent_done",
+			);
+			assert.ok(subagentDone);
+			await subagentDone.execute("call", {}, null, null, ctx);
+			eventHandlers.get("agent_settled")?.[0]({}, ctx);
+			assert.deepEqual(
+				JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")),
+				{
+					type: "done",
+				},
+			);
+			assert.equal(shutdowns, 1);
+		} finally {
+			restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
+			restoreEnvVar("PI_SUBAGENT_SESSION", previousSession);
+			rmSync(dir, { recursive: true, force: true });
 		}
 	});
 
@@ -3022,6 +4114,37 @@ describe("completion.ts", () => {
 		assert.deepEqual(result, { reason: "sentinel", exitCode: 17 });
 	});
 
+	it("prefers an error sidecar published during the terminal read", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "completion-sentinel-race-"));
+		const sessionFile = join(dir, "child.jsonl");
+		try {
+			const result = await waitForCompletion(new AbortController().signal, {
+				intervalMs: 1,
+				sessionFile,
+				readTerminalTail: async () => {
+					await Promise.resolve();
+					writeFileSync(
+						`${sessionFile}.exit`,
+						JSON.stringify({
+							type: "error",
+							errorMessage: "account/model rejected",
+							stopReason: "error",
+						}),
+					);
+					return "output\n__SUBAGENT_DONE_1__\n";
+				},
+			});
+			assert.deepEqual(result, {
+				reason: "error",
+				exitCode: 1,
+				errorMessage: "account/model rejected",
+			});
+			assert.equal(existsSync(`${sessionFile}.exit`), false);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("retries transient terminal read failures and reports ticks", async () => {
 		let reads = 0;
 		let ticks = 0;
@@ -3450,7 +4573,7 @@ describe("tool registration", () => {
 		assert.match(subagentTool.description, /retain.*parent review/i);
 	});
 
-	it("warns when an effective bundled role normally uses an ordinary pane", async () => {
+	it("warns only when the resolved role is bundled", async () => {
 		const testApi = subagentsModule.__test__;
 		const worktree = { branch: "review/unneeded-worktree" };
 
@@ -3482,6 +4605,97 @@ describe("tool registration", () => {
 				undefined,
 			);
 		});
+
+		await withIsolatedAgentEnv(
+			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+				const namedRolesDir = join(projectDir, "named-pack", "roles");
+				const namelessRolesDir = join(projectDir, "nameless-pack", "roles");
+				mkdirSync(namedRolesDir, { recursive: true });
+				mkdirSync(namelessRolesDir, { recursive: true });
+				writeFileSync(
+					join(namedRolesDir, "..", "package.json"),
+					JSON.stringify({ name: "@acme/writing-roles" }),
+				);
+				writeAgentFile(
+					namedRolesDir,
+					"scout",
+					"description: Writing scout\ntools: write",
+				);
+				writeAgentFile(
+					namelessRolesDir,
+					"reviewer",
+					"description: Writing reviewer\ntools: write",
+				);
+				writeAgentFile(
+					namelessRolesDir,
+					"adversarial-reviewer",
+					"description: Writing adversarial reviewer\ntools: write",
+				);
+
+				const { api } = createMockExtensionApi();
+				api.events.on(
+					"pi-herdr-subagents:roles:discover:v1",
+					(request: { register(path: string): void }) => {
+						request.register(namedRolesDir);
+						request.register(namelessRolesDir);
+					},
+				);
+				const disabled = { bundled: false };
+				for (const agent of ["scout", "reviewer", "adversarial-reviewer"]) {
+					assert.equal(
+						testApi.resolveWorktreeLaunchWarning(
+							{ agent, worktree },
+							api,
+							disabled,
+						),
+						undefined,
+					);
+				}
+
+				writeAgentFile(
+					globalAgentsDir,
+					"scout",
+					"description: Global writing scout\ntools: write",
+				);
+				writeAgentFile(
+					projectAgentsDir,
+					"reviewer",
+					"description: Project writing reviewer\ntools: write",
+				);
+				assert.equal(
+					testApi.resolveWorktreeLaunchWarning(
+						{ agent: "scout", worktree },
+						api,
+						disabled,
+					),
+					undefined,
+				);
+				assert.equal(
+					testApi.resolveWorktreeLaunchWarning(
+						{ agent: "reviewer", worktree },
+						api,
+						disabled,
+					),
+					undefined,
+				);
+				assert.equal(
+					testApi.resolveWorktreeLaunchWarning(
+						{ agent: "unknown", worktree },
+						api,
+						disabled,
+					),
+					undefined,
+				);
+				assert.equal(
+					testApi.resolveWorktreeLaunchWarning(
+						{ agent: "scout" },
+						api,
+						disabled,
+					),
+					undefined,
+				);
+			},
+		);
 	});
 
 	it("renders partial subagent tool-call args without throwing", () => {
@@ -4166,7 +5380,8 @@ describe("subagent interruption", () => {
 		);
 
 		assert.match(presentation, /Sub-agent "Worker" failed/);
-		assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
+		assert.match(presentation, /provider\/agent error/);
+		assert.doesNotMatch(presentation, /auto-retry exhausted/);
 		assert.match(
 			presentation,
 			/Error: Anthropic 529 Overloaded after 3 retries/,
@@ -4174,6 +5389,134 @@ describe("subagent interruption", () => {
 		assert.match(presentation, /subagent_resume/);
 		assert.match(presentation, /Resume: pi --session/);
 		assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+	});
+
+	it("does not advance fallback for a valid negative task result", () => {
+		const testApi = subagentsModule.__test__;
+		assert.equal(
+			testApi.shouldAdvanceToFallback({ errorMessage: undefined }, 1),
+			false,
+		);
+		assert.equal(
+			testApi.shouldAdvanceToFallback({ errorMessage: "provider failed" }, 1),
+			true,
+		);
+		assert.equal(
+			testApi.shouldAdvanceToFallback({ errorMessage: "provider failed" }, 0),
+			false,
+		);
+	});
+
+	it("preserves raw account/model errors and model evidence without retry claims", () => {
+		const testApi = subagentsModule.__test__;
+		const modelRef = "openai-codex/gpt-5.4";
+		const presentation = testApi.resolveResultPresentation(
+			{
+				exitCode: 1,
+				elapsed: 5,
+				summary: "ignored",
+				sessionFile: "/tmp/subagent.jsonl",
+				errorMessage:
+					"Codex error: The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account.",
+				fallbackAttempts: [modelRef],
+				runtimePlan: {
+					provider: "openai-codex",
+					modelId: "gpt-5.4",
+					model: modelRef,
+					thinking: "medium",
+					modelSource: "request",
+					thinkingSource: "request",
+				},
+			},
+			"Worker",
+		);
+
+		assert.match(presentation, /Requested model: openai-codex\/gpt-5\.4/);
+		assert.match(presentation, /Model used: openai-codex\/gpt-5\.4/);
+		assert.match(
+			presentation,
+			/Error: Codex error: The 'gpt-5\.4' model is not supported.*ChatGPT account/,
+		);
+		assert.match(presentation, /Next action: check the raw provider reason/);
+		assert.doesNotMatch(presentation, /auto-retry exhausted|permanent failure/);
+	});
+
+	it("reports ordered fallback causes, attempted models, and the model used on success", () => {
+		const testApi = subagentsModule.__test__;
+		const presentation = testApi.resolveResultPresentation(
+			{
+				exitCode: 0,
+				elapsed: 6,
+				summary: "Useful result",
+				fallbackAttempts: ["fake/primary", "fake/middle", "fake/secondary"],
+				fallbackFailures: [
+					{ model: "fake/primary", error: "provider rejected fake/primary" },
+					{ model: "fake/middle", error: "provider rejected fake/middle" },
+				],
+				runtimePlan: {
+					provider: "fake",
+					modelId: "secondary",
+					model: "fake/secondary",
+					thinking: "medium",
+					modelSource: "request",
+					thinkingSource: "request",
+				},
+			},
+			"Worker",
+		);
+
+		assert.match(presentation, /Requested model: fake\/primary/);
+		assert.match(
+			presentation,
+			/Models attempted: fake\/primary, fake\/middle, fake\/secondary/,
+		);
+		assert.match(presentation, /Model used: fake\/secondary/);
+		assert.match(
+			presentation,
+			/Model failures .*fake\/primary: provider rejected fake\/primary.*fake\/middle: provider rejected fake\/middle/s,
+		);
+		assert.doesNotMatch(presentation, /auto-retry exhausted/);
+	});
+
+	it("reports every rejected fallback candidate without inventing retry counts", () => {
+		const testApi = subagentsModule.__test__;
+		const presentation = testApi.resolveResultPresentation(
+			{
+				exitCode: 1,
+				elapsed: 7,
+				summary: "ignored",
+				errorMessage: "provider rejected fake/secondary",
+				fallbackAttempts: ["fake/primary", "fake/middle", "fake/secondary"],
+				fallbackFailures: [
+					{ model: "fake/primary", error: "provider rejected fake/primary" },
+					{ model: "fake/middle", error: "provider rejected fake/middle" },
+					{
+						model: "fake/secondary",
+						error: "provider rejected fake/secondary",
+					},
+				],
+				runtimePlan: {
+					provider: "fake",
+					modelId: "secondary",
+					model: "fake/secondary",
+					thinking: "medium",
+					modelSource: "request",
+					thinkingSource: "request",
+				},
+			},
+			"Worker",
+		);
+
+		assert.match(
+			presentation,
+			/Models attempted: fake\/primary, fake\/middle, fake\/secondary/,
+		);
+		assert.match(presentation, /Model used: fake\/secondary/);
+		assert.match(
+			presentation,
+			/Model failures .*fake\/primary: provider rejected fake\/primary.*fake\/middle: provider rejected fake\/middle.*fake\/secondary: provider rejected fake\/secondary/s,
+		);
+		assert.doesNotMatch(presentation, /auto-retry exhausted|after \d+ retries/);
 	});
 
 	it("leaves small completion presentations unchanged", () => {
@@ -4563,6 +5906,45 @@ describe("subagent status renderer", () => {
 
 		assert.match(rendered, /Session: \/tmp\/subagent\.jsonl/);
 		assert.match(rendered, /Resume:\s+pi --session \/tmp\/subagent\.jsonl/);
+	});
+
+	it("recognizes the neutral provider error header when rendering expanded results", () => {
+		const { api, registeredMessageRenderers } = createMockExtensionApi();
+		subagentsModule.default(api);
+		const rendererEntry = registeredMessageRenderers.find(
+			(entry) => entry.name === "subagent_result",
+		);
+		assert.ok(rendererEntry);
+
+		const rendered = rendererEntry
+			.renderer(
+				{
+					customType: "subagent_result",
+					content:
+						'Sub-agent "Worker" failed after 5s (provider/agent error).\n\n' +
+						"Error: account/model rejected\n\n" +
+						"Requested model: openai-codex/gpt-5.4\n" +
+						"Model used: openai-codex/gpt-5.4",
+					details: {
+						name: "Worker",
+						exitCode: 1,
+						errorMessage: "account/model rejected",
+						resultContent:
+							'Sub-agent "Worker" failed after 5s (provider/agent error).\n\n' +
+							"Error: account/model rejected\n\n" +
+							"Requested model: openai-codex/gpt-5.4\n" +
+							"Model used: openai-codex/gpt-5.4",
+					},
+				},
+				{ expanded: true },
+				createTheme(),
+			)
+			.render(120)
+			.join("\n");
+
+		assert.match(rendered, /account\/model rejected/);
+		assert.match(rendered, /Requested model: openai-codex\/gpt-5\.4/);
+		assert.doesNotMatch(rendered, /auto-retry exhausted/);
 	});
 
 	it("renders result details while keeping the custom message context small", () => {
@@ -5026,6 +6408,22 @@ describe("herdr.ts", () => {
 				"current",
 				"--current",
 			]);
+		});
+
+		it("targets an explicit stable parent when splitting without focus", () => {
+			assert.deepEqual(
+				__herdrTest__.buildPaneSplitArgs("parent-pane", "down", "/repo"),
+				[
+					"pane",
+					"split",
+					"parent-pane",
+					"--direction",
+					"down",
+					"--no-focus",
+					"--cwd",
+					"/repo",
+				],
+			);
 		});
 
 		it("targets the current workspace when creating a subagent tab", () => {

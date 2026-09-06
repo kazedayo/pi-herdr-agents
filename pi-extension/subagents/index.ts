@@ -52,6 +52,7 @@ import {
 	type ThinkingLevel,
 } from "./runtime-routing.ts";
 import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
+import { loadRoleConfig, type RoleConfig } from "./role-config.ts";
 import {
 	beginWorkflowCancellation,
 	cancelTerminationResult,
@@ -66,6 +67,7 @@ import {
 	recoverWorkflowStartup,
 	sameWorkflowCandidate,
 	validateWorkflowApproval,
+	type CancelTerminationResult,
 	type PendingWorkflow,
 	type WorkflowReaderCheckout,
 	type WorkflowRole,
@@ -81,6 +83,7 @@ import {
 	findObservedSessionRuntime,
 	getNewEntries,
 	createBtwSessionSnapshot,
+	writeSubagentSessionPolicy,
 } from "./session.ts";
 import {
 	type SubagentStatusState,
@@ -383,15 +386,89 @@ function getBundledAgentsDir(): string {
 	return join(SUBAGENTS_DIR, "../../agents");
 }
 
+function getFrontmatterLines(frontmatter: string, key: string): string[] {
+	const prefix = `${key}:`;
+	return frontmatter
+		.split("\n")
+		.filter((candidate) => candidate.startsWith(prefix));
+}
+
 function getFrontmatterValue(
 	frontmatter: string,
 	key: string,
 ): string | undefined {
-	const prefix = `${key}:`;
-	const line = frontmatter
-		.split("\n")
-		.find((candidate) => candidate.startsWith(prefix));
-	return line?.slice(prefix.length).trim() || undefined;
+	const line = getFrontmatterLines(frontmatter, key)[0];
+	return line?.slice(`${key}:`.length).trim() || undefined;
+}
+
+interface CapabilityDeclarations {
+	canonical: string[];
+	hasNoncanonical: boolean;
+}
+
+function isCapabilityDeclaration(
+	line: string,
+	field: "tools" | "deny-tools" | "spawning",
+): boolean {
+	const trimmed = line.trimStart();
+	const colon = trimmed.indexOf(":");
+	if (colon === -1) return false;
+	const key = trimmed.slice(0, colon).trim();
+	return key === field || key === `"${field}"` || key === `'${field}'`;
+}
+
+function getCapabilityDeclarations(
+	frontmatter: string,
+	field: "tools" | "deny-tools" | "spawning",
+): CapabilityDeclarations {
+	const canonicalPrefix = `${field}:`;
+	const lines = frontmatter.split("\n");
+	return {
+		canonical: lines.filter((line) => line.startsWith(canonicalPrefix)),
+		hasNoncanonical: lines.some(
+			(line) =>
+				isCapabilityDeclaration(line, field) &&
+				!line.startsWith(canonicalPrefix),
+		),
+	};
+}
+
+function validateCapabilityDeclarations(
+	frontmatter: string,
+): string | undefined {
+	for (const field of ["tools", "deny-tools", "spawning"] as const) {
+		const declarations = getCapabilityDeclarations(frontmatter, field);
+		if (declarations.hasNoncanonical) {
+			return `${field} must use an unquoted, unindented key written exactly as ${field}:`;
+		}
+		if (declarations.canonical.length > 1) {
+			return `${field} may be declared only once.`;
+		}
+		if (declarations.canonical.length === 0) continue;
+
+		const value = declarations.canonical[0].slice(`${field}:`.length).trim();
+		if (field === "spawning") {
+			if (value !== "true" && value !== "false") {
+				return "spawning must be true or false.";
+			}
+			continue;
+		}
+
+		if (
+			!value ||
+			value.startsWith("[") ||
+			value.startsWith("{") ||
+			value.startsWith("|") ||
+			value.startsWith(">") ||
+			value.includes("#") ||
+			value.includes('"') ||
+			value.includes("'") ||
+			value.split(",").some((entry) => !entry.trim())
+		) {
+			return `${field} must use a non-empty comma-separated scalar; YAML lists and containers, comments and quotes are unsupported.`;
+		}
+	}
+	return undefined;
 }
 
 function parseOptionalBoolean(value: string | undefined): boolean | undefined {
@@ -454,6 +531,24 @@ function parseAgentDefinition(
 				frontmatter,
 				"disable-model-invocation",
 			)?.toLowerCase() === "true",
+	};
+}
+
+function invalidCapabilityDeclarationDiagnostic(
+	content: string,
+	agentName: string,
+	path: string,
+): AgentDiagnostic | null {
+	const match = content.match(/^---\n([\s\S]*?)\n---/);
+	if (!match) return null;
+	const resolvedAgentName = getFrontmatterValue(match[1], "name") ?? agentName;
+	const error = validateCapabilityDeclarations(match[1]);
+	if (!error) return null;
+	return {
+		code: "invalid-capability-declaration",
+		message: `Role "${resolvedAgentName}" has an invalid capability declaration in ${path}: ${error} Use documented comma-separated tools or deny-tools values, true or false for spawning, or omit the field.`,
+		path,
+		agentName: resolvedAgentName,
 	};
 }
 
@@ -547,7 +642,10 @@ function discoverRolePackPaths(
 	return { paths: [...paths], diagnostics };
 }
 
-function discoverAgentCatalog(pi?: Pick<ExtensionAPI, "events">): AgentCatalog {
+function discoverAgentCatalog(
+	pi?: Pick<ExtensionAPI, "events">,
+	roleConfig: RoleConfig = bundledRoleConfig,
+): AgentCatalog {
 	const agents = new Map<string, ListedAgentDefinition>();
 	const diagnostics: AgentDiagnostic[] = [];
 
@@ -566,13 +664,23 @@ function discoverAgentCatalog(pi?: Pick<ExtensionAPI, "events">): AgentCatalog {
 				agents.delete(legacyDiagnostic.agentName ?? fallbackName);
 				continue;
 			}
+			const capabilityDiagnostic = invalidCapabilityDeclarationDiagnostic(
+				content,
+				fallbackName,
+				filePath,
+			);
+			if (capabilityDiagnostic) {
+				diagnostics.push(capabilityDiagnostic);
+				agents.delete(capabilityDiagnostic.agentName ?? fallbackName);
+				continue;
+			}
 			const parsed = parseAgentDefinition(content, fallbackName);
 			if (parsed)
 				agents.set(parsed.name, { ...parsed, source, path: filePath });
 		}
 	};
 
-	addDirectory(getBundledAgentsDir(), "package");
+	if (roleConfig.bundled) addDirectory(getBundledAgentsDir(), "package");
 
 	const discovered = discoverRolePackPaths(pi);
 	diagnostics.push(...discovered.diagnostics);
@@ -632,6 +740,18 @@ function discoverAgentCatalog(pi?: Pick<ExtensionAPI, "events">): AgentCatalog {
 			);
 			if (legacyDiagnostic) {
 				diagnostics.push({ ...legacyDiagnostic, provider: metadata.provider });
+				continue;
+			}
+			const capabilityDiagnostic = invalidCapabilityDeclarationDiagnostic(
+				content,
+				fallbackName,
+				filePath,
+			);
+			if (capabilityDiagnostic) {
+				diagnostics.push({
+					...capabilityDiagnostic,
+					provider: metadata.provider,
+				});
 				continue;
 			}
 			const parsed = parseAgentDefinition(content, fallbackName);
@@ -824,10 +944,12 @@ function resolveEffectiveInteractive(
 function loadAgentDefaults(
 	agentName: string,
 	pi?: Pick<ExtensionAPI, "events">,
+	roleConfig?: RoleConfig,
 ): ListedAgentDefinition | null {
 	return (
-		discoverAgentCatalog(pi).agents.find((agent) => agent.name === agentName) ??
-		null
+		discoverAgentCatalog(pi, roleConfig).agents.find(
+			(agent) => agent.name === agentName,
+		) ?? null
 	);
 }
 
@@ -917,12 +1039,14 @@ function sessionFileCwd(sessionPath: string): string | undefined {
 function resolveWorktreeLaunchWarning(
 	params: Pick<Static<typeof SubagentParams>, "agent" | "worktree">,
 	pi?: Pick<ExtensionAPI, "events">,
+	roleConfig?: RoleConfig,
 ): string | undefined {
 	if (!params.worktree || !params.agent) return undefined;
 	const warning = Object.entries(BUNDLED_WORKTREE_WARNINGS).find(
 		([agent]) => agent === params.agent,
 	)?.[1];
-	return warning && loadAgentDefaults(params.agent, pi)?.source === "package"
+	const definition = loadAgentDefaults(params.agent, pi, roleConfig);
+	return warning && dirname(definition?.path ?? "") === getBundledAgentsDir()
 		? warning
 		: undefined;
 }
@@ -960,6 +1084,7 @@ function finalizeSubagentSurface(
 
 const statusConfig = loadStatusConfig();
 const modelConfig = loadModelConfig();
+const bundledRoleConfig = loadRoleConfig();
 
 const MAX_RESULT_PRESENTATION_CHARS = 16_000;
 const MAX_SESSION_REFERENCE_CHARS = 10_000;
@@ -1022,6 +1147,11 @@ function resolveUnexpectedErrorPresentation(
 	);
 }
 
+interface ModelFailure {
+	model: string;
+	error: string;
+}
+
 interface SubagentResultDetails {
 	name: string;
 	task?: string;
@@ -1032,6 +1162,7 @@ interface SubagentResultDetails {
 	error?: string;
 	errorMessage?: string;
 	fallbackAttempts?: string[];
+	fallbackFailures?: ModelFailure[];
 	worktree?: WorktreeHandoff;
 	runtimePlan?: ResolvedRuntimePlan;
 }
@@ -1154,6 +1285,8 @@ function resolveResultPresentation(
 		| "sessionFile"
 		| "errorMessage"
 		| "fallbackAttempts"
+		| "fallbackFailures"
+		| "runtimePlan"
 		| "worktree"
 	>,
 	name: string,
@@ -1161,18 +1294,26 @@ function resolveResultPresentation(
 ): string {
 	const sessionRef = formatSessionReference(result.sessionFile);
 	let body: string;
+	const attempted = result.fallbackAttempts ?? [];
+	const requestedModel =
+		attempted[0] ??
+		result.runtimePlan?.requestedModel ??
+		result.runtimePlan?.model;
+	const usedModel =
+		result.runtimePlan?.observed?.model ?? result.runtimePlan?.model;
 
 	if (result.errorMessage) {
-		// Auto-retry exhausted or other agent-loop error. The subagent did not
-		// produce a usable result — surface the underlying provider/network
-		// failure so the orchestrator can decide whether to retry, resume, or
-		// change approach instead of silently treating the run as completed.
+		// Pi owns provider retry policy and exposes the settled error as text. Do
+		// not infer retry counts or permanence from that text; preserve it as-is.
 		body =
 			`Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
-			`(provider/agent error — auto-retry exhausted).\n\n` +
+			`(provider/agent error).\n\n` +
 			`Error: ${result.errorMessage}\n\n` +
-			`The subagent did not produce a result. You can retry by spawning a new ` +
-			`subagent or resume the session with subagent_resume.`;
+			`The subagent did not produce a result. Next action: check the raw ` +
+			`provider reason and verify model access for this account. Spawn a new ` +
+			`subagent with a supported model or configured fallback; use ` +
+			`subagent_resume only after resolving access for this session's stored ` +
+			`model because resume does not select a model.`;
 	} else {
 		body =
 			result.exitCode === 0
@@ -1180,8 +1321,16 @@ function resolveResultPresentation(
 				: `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}`;
 	}
 
-	if (result.fallbackAttempts && result.fallbackAttempts.length > 1) {
-		body += `\n\nModels attempted: ${result.fallbackAttempts.join(", ")}`;
+	if (requestedModel) body += `\n\nRequested model: ${requestedModel}`;
+	if (attempted.length > 1)
+		body += `\nModels attempted: ${attempted.join(", ")}`;
+	if (usedModel) body += `\nModel used: ${usedModel}`;
+	if (result.fallbackFailures?.length) {
+		body +=
+			"\nModel failures (raw errors, in attempt order):" +
+			result.fallbackFailures
+				.map(({ model, error }) => `\n- ${model}: ${error}`)
+				.join("");
 	}
 	if (result.worktree) body += `\n\n${formatWorktreeHandoff(result.worktree)}`;
 	const runtimeWarning = runtimeMismatch
@@ -1201,12 +1350,15 @@ interface SubagentResult {
 	exitCode: number;
 	elapsed: number;
 	error?: string;
-	/** Provider/agent error message when auto-retry exhausted (overload, rate limit, etc.). */
+	/** Settled provider/agent error text from the child, preserved verbatim. */
 	errorMessage?: string;
 	/** Ordered models launched for this run, including failed fallback attempts. */
 	fallbackAttempts?: string[];
+	/** Ordered raw errors associated with failed model attempts. */
+	fallbackFailures?: ModelFailure[];
 	ping?: { name: string; message: string };
 	worktree?: WorktreeHandoff;
+	runtimePlan?: ResolvedRuntimePlan;
 }
 
 /**
@@ -1264,6 +1416,7 @@ interface WorkflowOwner {
 	checkout?: string;
 	journal?: ReturnType<typeof createWorkflowJournal>;
 	cancelPromise?: Promise<WorkflowTerminalOutcome>;
+	termination?: CancelTerminationResult;
 }
 
 interface WorkflowCancelHooks {
@@ -1929,6 +2082,7 @@ export const __test__ = {
 	renderSubagentWidgetLines,
 	loadAgentDefaults,
 	discoverAgentDefinitions,
+	discoverAgentCatalog,
 	resolveEffectiveSessionMode,
 	resolveLaunchBehavior,
 	resolveEffectiveAutoExit,
@@ -1945,6 +2099,7 @@ export const __test__ = {
 	handleSubagentInterrupt,
 	resolveResultPresentation,
 	resolveUnexpectedErrorPresentation,
+	shouldAdvanceToFallback,
 	sendSubagentResult,
 	shouldRetainSubagentSurface,
 	resolveWorktreeLaunchWarning,
@@ -2132,8 +2287,12 @@ async function launchSubagentWithFallbacks(
 	ctx: Parameters<typeof launchSubagent>[1],
 	parentThinking: ThinkingLevel,
 	plans: ResolvedRuntimePlan[],
-): Promise<{ running: RunningSubagent; index: number }> {
-	const failures: string[] = [];
+): Promise<{
+	running: RunningSubagent;
+	index: number;
+	launchFailures: ModelFailure[];
+}> {
+	const launchFailures: ModelFailure[] = [];
 	for (const [index, plan] of plans.entries()) {
 		try {
 			return {
@@ -2141,15 +2300,17 @@ async function launchSubagentWithFallbacks(
 					runtimePlan: plan,
 				}),
 				index,
+				launchFailures,
 			};
 		} catch (error) {
-			failures.push(
-				`${plan.model}: ${error instanceof Error ? error.message : String(error)}`,
-			);
+			launchFailures.push({
+				model: plan.model,
+				error: error instanceof Error ? error.message : String(error),
+			});
 		}
 	}
 	throw new Error(
-		`Subagent could not launch with any configured model. Attempted: ${plans.map((plan) => plan.model).join(", ")}. ${failures.join("; ")}`,
+		`Subagent could not launch with any configured model. Attempted: ${plans.map((plan) => plan.model).join(", ")}. ${launchFailures.map(({ model, error }) => `${model}: ${error}`).join("; ")}`,
 	);
 }
 
@@ -2256,6 +2417,7 @@ async function watchSubagent(
 			exitCode: result.exitCode,
 			elapsed,
 			ping: result.ping,
+			runtimePlan: running.runtimePlan,
 		};
 		if (result.errorMessage) watchResult.errorMessage = result.errorMessage;
 		if (worktreeHandoff) watchResult.worktree = worktreeHandoff;
@@ -2296,6 +2458,13 @@ async function watchSubagent(
 	}
 }
 
+export function shouldAdvanceToFallback(
+	result: Pick<SubagentResult, "errorMessage">,
+	remainingPlans: number,
+): boolean {
+	return !!result.errorMessage && remainingPlans > 0;
+}
+
 async function watchSubagentWithFallbacks(
 	initial: RunningSubagent,
 	initialPlanIndex: number,
@@ -2304,23 +2473,41 @@ async function watchSubagentWithFallbacks(
 	parentThinking: ThinkingLevel,
 	plans: ResolvedRuntimePlan[],
 	signal: AbortSignal,
+	initialLaunchFailures: ModelFailure[] = [],
 ): Promise<{ running: RunningSubagent; result: SubagentResult }> {
 	let running = initial;
 	let nextPlan = initialPlanIndex + 1;
-	const attempts = [running.runtimePlan?.model].filter(
-		(model): model is string => !!model,
-	);
+	const attempts = plans
+		.slice(0, initialPlanIndex + 1)
+		.map((plan) => plan.model);
+	const modelFailures = [...initialLaunchFailures];
 
 	for (;;) {
 		const result = await watchSubagent(running, signal);
-		const shouldRetry = !!result.errorMessage && nextPlan < plans.length;
+		const shouldRetry = shouldAdvanceToFallback(
+			result,
+			plans.length - nextPlan,
+		);
+		if (result.errorMessage) {
+			modelFailures.push({
+				model: running.runtimePlan?.model ?? attempts[attempts.length - 1],
+				error: result.errorMessage,
+			});
+		}
 		if (!shouldRetry) {
-			return { running, result: { ...result, fallbackAttempts: attempts } };
+			return {
+				running,
+				result: {
+					...result,
+					fallbackAttempts: attempts,
+					fallbackFailures: modelFailures,
+				},
+			};
 		}
 
 		runningSubagents.delete(running.id);
 		updateWidget();
-		const launchErrors: string[] = [];
+		const launchFailures: ModelFailure[] = [];
 		let launchedFallback = false;
 		while (nextPlan < plans.length) {
 			const plan = plans[nextPlan++];
@@ -2336,18 +2523,21 @@ async function watchSubagentWithFallbacks(
 				startStatusRefresh(runtime.pi!);
 				break;
 			} catch (error) {
-				launchErrors.push(
-					`${plan.model}: ${error instanceof Error ? error.message : String(error)}`,
-				);
+				launchFailures.push({
+					model: plan.model,
+					error: error instanceof Error ? error.message : String(error),
+				});
 			}
 		}
+		modelFailures.push(...launchFailures);
 		if (!launchedFallback) {
 			return {
 				running,
 				result: {
 					...result,
-					errorMessage: `${result.errorMessage}\n\nFallback launch failures: ${launchErrors.join("; ")}`,
+					errorMessage: `${result.errorMessage}\n\nFallback launch failures: ${launchFailures.map(({ model, error }) => `${model}: ${error}`).join("; ")}`,
 					fallbackAttempts: attempts,
+					fallbackFailures: modelFailures,
 				},
 			};
 		}
@@ -2559,6 +2749,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			if (childController.signal.aborted)
 				return workflowFailure("cancelled", "Workflow cancelled.");
 			mkdirSync(dirname(sessionFile), { recursive: true });
+			writeSubagentSessionPolicy(sessionFile, {
+				owner: "workflow",
+				tools: policy.tools,
+				deniedTools: [
+					"caller_ping",
+					"subagent_done",
+					"subagent",
+					"subagent_interrupt",
+					"subagent_resume",
+					"subagents_list",
+					"herdr_workflow",
+				],
+			});
 			surface = createSubagentPane(`${candidate.runId}: ${nodeId}`);
 			owner.children.set(id, { controller: childController, surface });
 			await waitForShellReady(surface, { signal: childController.signal });
@@ -2742,6 +2945,118 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			runtime.activeWorkflow = undefined;
 		return outcome;
 	};
+	const terminateWorkflowChildren = async (
+		owner: WorkflowOwner,
+		options: WorkflowCancelHooks = {},
+	): Promise<CancelTerminationResult> => {
+		const hooks = { ...runtime.workflowCancelHooks, ...options };
+		const getProcessInfo = hooks.getProcessInfo ?? getPaneProcessInfo;
+		const closeSurface = hooks.closeSurface ?? closePane;
+		const waitAbsence = hooks.waitAbsence ?? waitForPaneAbsence;
+		const waitExit = hooks.waitExit ?? waitForProcessesExit;
+		try {
+			owner.controller.abort();
+			const children = [...owner.children.values()];
+			const captured: Array<{
+				surface?: string;
+				pids: number[];
+				identityUnconfirmed: boolean;
+			}> = [];
+			for (const child of children) {
+				child.controller.abort();
+				const pids: number[] = [];
+				let identityUnconfirmed = false;
+				if (child.surface) {
+					try {
+						const info = getProcessInfo(child.surface);
+						pids.push(...info.pids);
+						owner.journal?.append("cancel_process_info", {
+							surface: child.surface,
+							pids: info.pids,
+						});
+						if (info.pids.length === 0) identityUnconfirmed = true;
+					} catch (error) {
+						identityUnconfirmed = true;
+						owner.journal?.append("cancel_process_info_failed", {
+							surface: child.surface,
+							error: error instanceof Error ? error.message : String(error),
+						});
+					}
+				}
+				captured.push({
+					surface: child.surface,
+					pids,
+					identityUnconfirmed,
+				});
+			}
+			for (const child of captured) {
+				if (!child.surface) continue;
+				try {
+					closeSurface(child.surface);
+				} catch (error) {
+					owner.journal?.append("pane_close_failed", {
+						surface: child.surface,
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+			const surviving: number[] = [];
+			let identityUnconfirmed = false;
+			for (const child of captured) {
+				if (child.identityUnconfirmed) identityUnconfirmed = true;
+				if (child.surface) {
+					const gone = await waitAbsence(child.surface, {
+						timeoutMs: 5_000,
+						intervalMs: 50,
+					});
+					if (!gone) {
+						identityUnconfirmed = true;
+						owner.journal?.append("cancel_pane_still_present", {
+							surface: child.surface,
+						});
+					}
+				}
+				if (child.pids.length > 0) {
+					surviving.push(
+						...(await waitExit(child.pids, {
+							timeoutMs: 5_000,
+							intervalMs: 50,
+						})),
+					);
+				}
+			}
+			const uniqueSurvivors = [...new Set(surviving)];
+			const termination = cancelTerminationResult(
+				uniqueSurvivors,
+				owner.checkout,
+				{ identityUnconfirmed },
+			);
+			if (termination.retainCheckout && owner.checkout) {
+				owner.journal?.append("reader_checkout_retained", {
+					path: owner.checkout,
+					reason: "cancel_termination_failed",
+					survivingPids: uniqueSurvivors,
+					identityUnconfirmed,
+				});
+			}
+			owner.termination = termination;
+			return termination;
+		} catch (error) {
+			const termination = cancelTerminationResult([], owner.checkout, {
+				identityUnconfirmed: true,
+			});
+			termination.outcome.error!.message =
+				error instanceof Error ? error.message : String(error);
+			if (owner.checkout) {
+				owner.journal?.append("reader_checkout_retained", {
+					path: owner.checkout,
+					reason: "cancel_termination_failed",
+				});
+			}
+			owner.termination = termination;
+			return termination;
+		}
+	};
 	const cancelWorkflow = async (
 		owner: WorkflowOwner,
 		options: WorkflowCancelHooks = {},
@@ -2777,127 +3092,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		});
 		owner.cancelPromise = deferred;
 
-		const hooks = { ...runtime.workflowCancelHooks, ...options };
-		const getProcessInfo = hooks.getProcessInfo ?? getPaneProcessInfo;
-		const closeSurface = hooks.closeSurface ?? closePane;
-		const waitAbsence = hooks.waitAbsence ?? waitForPaneAbsence;
-		const waitExit = hooks.waitExit ?? waitForProcessesExit;
 		void (async () => {
-			try {
-				owner.controller.abort();
-				const children = [...owner.children.values()];
-				const captured: Array<{
-					surface?: string;
-					pids: number[];
-					identityUnconfirmed: boolean;
-				}> = [];
-				for (const child of children) {
-					child.controller.abort();
-					const pids: number[] = [];
-					let identityUnconfirmed = false;
-					if (child.surface) {
-						try {
-							const info = getProcessInfo(child.surface);
-							pids.push(...info.pids);
-							owner.journal?.append("cancel_process_info", {
-								surface: child.surface,
-								pids: info.pids,
-								shellPid: info.shellPid,
-								foregroundProcessGroupId: info.foregroundProcessGroupId,
-							});
-							// Active panes with no waitable PIDs lack exit proof.
-							if (info.pids.length === 0) identityUnconfirmed = true;
-						} catch (error) {
-							identityUnconfirmed = true;
-							owner.journal?.append("cancel_process_info_failed", {
-								surface: child.surface,
-								error: error instanceof Error ? error.message : String(error),
-							});
-						}
-					}
-					captured.push({
-						surface: child.surface,
-						pids,
-						identityUnconfirmed,
-					});
-				}
-				for (const child of captured) {
-					if (!child.surface) continue;
-					try {
-						closeSurface(child.surface);
-					} catch (error) {
-						owner.journal?.append("pane_close_failed", {
-							surface: child.surface,
-							error: error instanceof Error ? error.message : String(error),
-						});
-					}
-				}
-				const surviving: number[] = [];
-				let identityUnconfirmed = false;
-				for (const child of captured) {
-					if (child.identityUnconfirmed) identityUnconfirmed = true;
-					if (child.surface) {
-						const gone = await waitAbsence(child.surface, {
-							timeoutMs: 5_000,
-							intervalMs: 50,
-						});
-						if (!gone) {
-							// Pane still present after close: treat as unconfirmed termination.
-							identityUnconfirmed = true;
-							owner.journal?.append("cancel_pane_still_present", {
-								surface: child.surface,
-							});
-						}
-					}
-					if (child.pids.length > 0) {
-						surviving.push(
-							...(await waitExit(child.pids, {
-								timeoutMs: 5_000,
-								intervalMs: 50,
-							})),
-						);
-					}
-				}
-				const uniqueSurvivors = [...new Set(surviving)];
-				const termination = cancelTerminationResult(
-					uniqueSurvivors,
-					owner.checkout,
-					{ identityUnconfirmed },
-				);
-				let checkoutResult: WorkflowReaderCheckout | undefined =
-					termination.checkout;
-				if (termination.retainCheckout) {
-					if (owner.checkout) {
-						owner.journal?.append("reader_checkout_retained", {
-							path: owner.checkout,
-							reason: "cancel_termination_failed",
-							survivingPids: uniqueSurvivors,
-							identityUnconfirmed,
-						});
-					}
-					settle(finalizeWorkflow(owner, termination.outcome, checkoutResult));
-					return;
-				}
-				if (owner.checkout && owner.journal) {
-					checkoutResult = disposeWorkflowReaderCheckout(
-						owner.candidate,
-						owner.checkout,
-						owner.journal,
-					);
-					owner.checkout = undefined;
-				}
+			const termination = await terminateWorkflowChildren(owner, options);
+			let checkoutResult: WorkflowReaderCheckout | undefined =
+				termination.checkout;
+			if (termination.retainCheckout) {
 				settle(finalizeWorkflow(owner, termination.outcome, checkoutResult));
-			} catch (error) {
-				settle(
-					finalizeWorkflow(owner, {
-						state: "failed",
-						error: {
-							code: "cancel_termination_failed",
-							message: error instanceof Error ? error.message : String(error),
-						},
-					}),
-				);
+				return;
 			}
+			if (owner.checkout && owner.journal) {
+				checkoutResult = disposeWorkflowReaderCheckout(
+					owner.candidate,
+					owner.checkout,
+					owner.journal,
+				);
+				owner.checkout = undefined;
+			}
+			settle(finalizeWorkflow(owner, termination.outcome, checkoutResult));
 		})();
 		return deferred;
 	};
@@ -2918,6 +3129,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					owner.worker = worker;
 				},
 				onLog: (message) => journal.append("workflow_log", { message }),
+				onTerminal: async () => {
+					if (owner.gate.phase !== "running") {
+						if (owner.cancelPromise) await owner.cancelPromise;
+						return undefined;
+					}
+					const termination = await terminateWorkflowChildren(owner);
+					return termination.retainCheckout
+						? { state: "failed" as const, error: termination.outcome.error! }
+						: undefined;
+				},
 				onAgent: async (prompt, options) => {
 					const result = await runWorkflowAgent(
 						owner,
@@ -2949,7 +3170,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			if (owner.cancelPromise) await owner.cancelPromise;
 			return;
 		}
-		let checkoutResult: WorkflowReaderCheckout | undefined;
+		let checkoutResult = owner.termination?.checkout;
+		if (owner.termination?.retainCheckout) {
+			finalizeWorkflow(owner, execution, checkoutResult);
+			return;
+		}
 		if (owner.checkout) {
 			checkoutResult = disposeWorkflowReaderCheckout(
 				candidate,
@@ -3279,19 +3504,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					};
 				}
 
-				const legacyRoleDiagnostic = params.agent
-					? discoverAgentCatalog(runtime.pi).diagnostics.find(
-							(candidate) =>
-								candidate.agentName === params.agent &&
-								candidate.code === "external-cli-unsupported",
-						)
+				const catalog = params.agent
+					? discoverAgentCatalog(runtime.pi)
 					: undefined;
-				if (legacyRoleDiagnostic) {
+				const roleDiagnostic =
+					catalog &&
+					!catalog.agents.some((agent) => agent.name === params.agent)
+						? catalog.diagnostics.find(
+								(candidate) =>
+									candidate.agentName === params.agent &&
+									(candidate.code === "external-cli-unsupported" ||
+										candidate.code === "invalid-capability-declaration"),
+							)
+						: undefined;
+				if (roleDiagnostic) {
 					return {
 						content: [
-							{ type: "text", text: `Error: ${legacyRoleDiagnostic.message}` },
+							{ type: "text", text: `Error: ${roleDiagnostic.message}` },
 						],
-						details: { error: legacyRoleDiagnostic.code },
+						details: { error: roleDiagnostic.code },
 					};
 				}
 
@@ -3336,13 +3567,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					params,
 					runtime.pi,
 				);
-				const { running, index: initialPlanIndex } =
-					await launchSubagentWithFallbacks(
-						params,
-						ctx,
-						parentThinking,
-						runtimePlans,
-					);
+				const {
+					running,
+					index: initialPlanIndex,
+					launchFailures: initialLaunchFailures,
+				} = await launchSubagentWithFallbacks(
+					params,
+					ctx,
+					parentThinking,
+					runtimePlans,
+				);
 
 				// Create a separate AbortController for the watcher
 				// (the tool's signal completes when we return)
@@ -3362,6 +3596,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					parentThinking,
 					runtimePlans,
 					watcherAbort.signal,
+					initialLaunchFailures,
 				)
 					.then(({ running: completedRunning, result }) => {
 						if (!shouldDeliverSubagentCompletion(completedRunning)) {
@@ -3424,6 +3659,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 							resultDetails.errorMessage = result.errorMessage;
 						if (result.fallbackAttempts)
 							resultDetails.fallbackAttempts = result.fallbackAttempts;
+						if (result.fallbackFailures)
+							resultDetails.fallbackFailures = result.fallbackFailures;
 						if (result.worktree) resultDetails.worktree = result.worktree;
 						if (completedRunning.runtimePlan)
 							resultDetails.runtimePlan = completedRunning.runtimePlan;
@@ -4253,7 +4490,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					)
 					.replace(
 						new RegExp(
-							`^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
+							`^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error\\)\\.\\n\\n`,
 						),
 						"",
 					);

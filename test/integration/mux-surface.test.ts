@@ -18,7 +18,9 @@ import {
 	createTestEnv,
 	cleanupTestEnv,
 	createTrackedSurface,
+	createSubagentPane,
 	createSubagentWorktree,
+	splitCurrentPane,
 	getFocusedSurface,
 	untrackSurface,
 	runInPane,
@@ -30,8 +32,13 @@ import {
 	trackTempFile,
 	waitForFile,
 	waitForScreen,
+	shellQuote,
 	type TestEnv,
 } from "./harness.ts";
+import {
+	createSubagentPaneFactory,
+	parsePaneConfig,
+} from "../../pi-extension/subagents/pane-config.ts";
 
 const backends = getAvailableBackends();
 
@@ -82,6 +89,56 @@ for (const backend of backends) {
 			assert.equal(getFocusedSurface(backend), focusedPane);
 		});
 
+		it("splits the stable parent without stealing focus or closing it", async () => {
+			const parentPane = createTrackedSurface(env, "split-parent");
+			await waitForPaneReady(parentPane);
+			const focusedPane = getFocusedSurface(backend);
+			const parentBefore = JSON.parse(
+				execFileSync("herdr", ["pane", "get", parentPane], {
+					encoding: "utf8",
+				}),
+			).result.pane;
+			const createConfiguredPane = createSubagentPaneFactory(
+				parsePaneConfig({ panes: { mode: "split", direction: "down" } }),
+				createSubagentPane,
+				splitCurrentPane,
+			);
+			const previousParentPane = process.env.HERDR_PANE_ID;
+			let child: string | undefined;
+			try {
+				process.env.HERDR_PANE_ID = parentPane;
+				child = createConfiguredPane("split-child");
+			} finally {
+				if (previousParentPane === undefined) delete process.env.HERDR_PANE_ID;
+				else process.env.HERDR_PANE_ID = previousParentPane;
+			}
+
+			try {
+				await waitForPaneReady(child);
+				const childInfo = JSON.parse(
+					execFileSync("herdr", ["pane", "get", child], {
+						encoding: "utf8",
+					}),
+				).result.pane;
+				assert.notEqual(childInfo.pane_id, parentPane);
+				assert.equal(childInfo.tab_id, parentBefore.tab_id);
+				assert.equal(getFocusedSurface(backend), focusedPane);
+
+				const marker = uniqueId();
+				runInPane(child, `echo "SPLIT_${marker}"`);
+				await waitForScreen(child, new RegExp(`SPLIT_${marker}`), 20_000, 50);
+			} finally {
+				closePane(child);
+			}
+
+			const parentAfter = JSON.parse(
+				execFileSync("herdr", ["pane", "get", parentPane], {
+					encoding: "utf8",
+				}),
+			).result.pane;
+			assert.equal(parentAfter.pane_id, parentPane);
+		});
+
 		it("creates an isolated worktree workspace without stealing focus", async () => {
 			const focusedPane = getFocusedSurface(backend);
 			const id = uniqueId();
@@ -111,18 +168,20 @@ for (const backend of backends) {
 				branch,
 				baseSha,
 			);
+			const cwdFile = `/tmp/pi-integ-worktree-cwd-${id}.txt`;
+			trackTempFile(env, cwdFile);
 			try {
 				assert.equal(worktree.branch, branch);
 				assert.ok(worktree.path !== env.dir);
 				assert.equal(getFocusedSurface(backend), focusedPane);
 
 				await waitForPaneReady(worktree.paneId);
-				runInPane(worktree.paneId, "pwd");
-				await waitForScreen(
-					worktree.paneId,
-					new RegExp(worktree.path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
-					20_000,
-					50,
+				runInPane(worktree.paneId, `pwd > ${shellQuote(cwdFile)}`);
+				const capturedCwd = await waitForFile(cwdFile, 20_000);
+				assert.equal(
+					capturedCwd.trim(),
+					worktree.path,
+					"The launched worktree shell must start at the returned worktree path",
 				);
 
 				const listed = JSON.parse(

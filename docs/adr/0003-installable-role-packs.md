@@ -29,7 +29,14 @@ roles are listed or launched.
 
 Role packs use the existing agent-definition format. The filename stem is the
 canonical role name; `name` frontmatter is optional and, when present, must
-match the stem. `description` is required for contributed roles.
+match the stem. `description` is required for contributed roles. Capability
+declarations are strict: use the unquoted, unindented keys `tools:`,
+`deny-tools:`, and `spawning:` exactly once when present. `tools` and
+`deny-tools` must each be one non-empty inline comma-separated scalar, and
+`spawning` must be exactly `true` or `false`. YAML lists, containers,
+multiline or empty values, quotes, comments, noncanonical key spelling, and
+duplicate declarations are invalid; omit `tools` to intentionally leave a role
+unrestricted.
 
 ## Why
 
@@ -55,7 +62,7 @@ leaving stale roles.
 
 Listing and exact-name launch use one resolved catalog. Collection order is:
 
-1. bundled package roles;
+1. enabled bundled package roles;
 2. registered role-pack definitions;
 3. global definitions;
 4. project definitions.
@@ -72,20 +79,25 @@ override them.
 
 Within the package layer:
 
-- bundled roles are protected fallbacks;
-- a role pack colliding with a bundled name is rejected;
+- bundled roles are protected fallbacks while enabled;
+- a role pack colliding with an enabled bundled name is rejected;
+- copying `config.json.example` to package-local `config.json` and setting `roles.bundled` to `false` removes only the bundled layer; registered role packs remain package roles and may supply those names;
 - a name contributed by multiple role packs is disabled;
 - collisions never resolve through incidental extension load order.
 
 Invalid registrations do not suppress unrelated roles. Listing surfaces report
 concise diagnostics, and an exact-name launch reports the matching diagnostic
-instead of treating an invalid contribution as a bare agent.
+instead of treating an invalid contribution as a bare agent. An invalid
+capability declaration makes that role name unavailable at its precedence layer
+rather than falling through to a lower-priority role, and launch rejects it
+before Herdr creates a pane or worktree.
 
 ## Reload and security
 
 Role files are read on each list or launch, so editing Markdown does not require
-`/reload`. Installing, removing, updating, or changing a role-pack extension
-uses Pi's normal reload flow. Contributor `session_shutdown` cleanup removes the
+`/reload`. Changing package-local role configuration, installing, removing,
+updating, or changing a role-pack extension uses Pi's normal reload flow.
+Contributor `session_shutdown` cleanup removes the
 old event listener before replacement extensions register. Already-running
 children retain their resolved role and lifecycle.
 

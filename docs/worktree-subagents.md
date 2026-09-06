@@ -137,10 +137,15 @@ If Git inspection fails, SHA/count/state/file fields are reported as unknown rat
 
 For parallel read-only review, prepare one stable existing checkout of the pull request or retained worker result. Do not create one managed worktree per reviewer.
 
-1. The parent records the exact base and head SHAs and makes sure no writer changes the checkout while review runs.
-2. Start each read-only child with `cwd` set to that checkout. Omit `worktree`. If the checkout is a retained Herdr worktree, the child's tab opens in that worktree's workspace.
-3. Give every reviewer the same exact base and head SHAs. Require it to report `git rev-parse HEAD` before its review result.
-4. Before the parent reports or publishes the review, recheck the checkout SHA. If it changed, treat the prior reviews as stale and review the new commit again.
+1. The parent records the canonical repository root, exact comparison base and head SHAs, and exact task/spec evidence. It makes sure no writer changes the checkout while review runs.
+2. Decide explicitly whether staged, unstaged, and untracked files are in scope. For included dirty state, record a bounded inventory and fingerprint; a commit SHA alone cannot pin it.
+3. Start each read-only child in an ordinary pane with `cwd` set to that checkout. Omit `worktree`. If the checkout is a retained Herdr worktree, the child's tab opens in that worktree's workspace.
+4. Give every reviewer the same exact scope. Require it to report the repository root and `git rev-parse HEAD` before its review result.
+5. Before each dependent review wave and before reporting, recheck the head and dirty-state fingerprint. Drift makes prior evidence stale; review the new state again instead of mixing revisions.
+
+A `read,bash` tool allowlist does not enforce read-only behavior because Bash can mutate the checkout. Tell public reviewers to use only safe inspection, avoid artifact-generating verification, and consume supplied mechanical evidence. Public completion reports above 16,000 characters are abbreviated; when a completed report is needed, retrieve its final assistant message once from the supplied session path with bounded output. This is evidence retrieval, not live-session polling.
+
+For a committed candidate, prefer the `/skill:orchestrate` adversarial procedure. Its approved runner creates one detached checkout pinned to the review head. Effective tools are the resolved role allowlist intersected with the runner maximum (`read`, `grep`, `find`, and `ls`) and deny rules; an override can reduce that set. The parent must materialize the changed-file inventory and unified diff, or complete before/after excerpts, because head-checkout reads cannot recover deleted or base-only blobs. Parent dirty and untracked state is absent. Use the `adversarial-reviewer` compatibility coordinator only when its weaker public-child boundary is intentional and project policy permits it.
 
 ```typescript
 subagent({
@@ -181,14 +186,15 @@ The extension never pushes, creates a PR, merges, cherry-picks, or changes the p
 
 ## Failure, help, and restart behavior
 
+- **Ordinary launch failure:** if a fresh launch or `subagent_resume` fails after the extension creates its pane, the extension closes that pane and preserves the original launch error. It does not close a caller-supplied surface.
 - **Creation failure:** the manifest is marked failed. If Herdr created the branch but returned an incomplete response, the extension reconciles a unique branch match through `/worktree list` and records any recovered workspace/path.
 - **Launch failure after creation:** the manifest is marked failed and the workspace, forked session, and path are retained. The destination is not focused unless Pi startup is confirmed.
-- **Worker failure:** summary and available Git state are returned; the workspace remains open.
-- **`caller_ping`:** the child exits with `needs_help`; continue worktree-bound follow-up in the retained workspace. `subagent_resume` can open a tab there, but it does not reattach the managed lifecycle.
+- **Worker failure:** summary and available Git state are returned; the workspace remains open. Auto-exit waits until Pi is fully settled, so a transient provider error followed by automatic compaction or retry does not end the worker early.
+- **`caller_ping`:** the child exits with `needs_help`; continue worktree-bound follow-up in the retained workspace rather than through `subagent_resume`. Public `subagent_resume` rejects managed-worktree child sessions before creating a pane so it cannot silently lose worktree ownership or policy.
 - **Parent `/reload`, `/new`, `/resume`, or `/fork`:** active in-memory watchers transfer to the replacement parent session.
 - **Full process restart or crash:** the worktree remains, but v1 does not automatically rediscover and resume its watcher.
 
-`subagent_resume` resumes a session in a new Herdr tab. If the session cwd sits in a retained worktree, the tab opens in that worktree's workspace (or pass `workspace` explicitly). It does not reattach the managed worktree lifecycle or produce a new worktree handoff. For a fully attached continuation, focus the retained workspace and resume from its shell:
+`subagent_resume` rejects managed-worktree sessions. It does not reattach the managed worktree lifecycle or produce a new worktree handoff. For worktree follow-up, focus the retained workspace and resume manually from its shell:
 
 ```bash
 herdr workspace focus <workspace-id>

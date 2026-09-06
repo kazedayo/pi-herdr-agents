@@ -12,15 +12,20 @@ import { getSubagentActivityFile } from "./activity.ts";
 import { getAgentConfigDir } from "./config-paths.ts";
 import { createLifecycle, type SubagentLifecycle } from "./lifecycle.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
+import { createSubagentPaneFactory, loadPaneConfig } from "./pane-config.ts";
 import { HerdrWorktreeCreateError } from "./herdr.ts";
 import type { JsonObject } from "./type-guards.ts";
 import {
 	createWorktreeSessionFork,
+	readSubagentSessionPolicy,
 	seedSubagentSessionFile,
+	writeSubagentSessionPolicy,
 } from "./session.ts";
 import {
+	closePane,
 	createSubagentPane,
 	createSubagentWorktree,
+	splitCurrentPane,
 	runScriptInPane,
 	shellQuote,
 	waitForPiReady,
@@ -153,6 +158,7 @@ export interface PiLaunchOperations {
 		command: string,
 		options: { scriptPath: string; scriptPreamble: string },
 	): string;
+	closePane(pane: string): void;
 	waitForPiReady?(
 		surface: string,
 		sessionFile: string,
@@ -161,11 +167,18 @@ export interface PiLaunchOperations {
 	focusWorkspace?(workspaceId: string): void;
 }
 
+const paneConfig = loadPaneConfig();
+
 const defaultOperations: PiLaunchOperations = {
-	createPane: createSubagentPane,
+	createPane: createSubagentPaneFactory(
+		paneConfig,
+		createSubagentPane,
+		splitCurrentPane,
+	),
 	createWorktree: createSubagentWorktree,
 	waitForShellReady,
 	runScript: runScriptInPane,
+	closePane,
 	waitForPiReady,
 	focusWorkspace,
 };
@@ -245,9 +258,10 @@ async function launchFreshPiSubagent(
 	operations: PiLaunchOperations,
 ): Promise<PiRunningChild> {
 	const resolved = resolveLaunchRequest(request);
-	const surface = prepareLaunchSurface(resolved, operations);
+	let surface: PreparedSurface | undefined;
 
 	try {
+		surface = prepareLaunchSurface(resolved, operations);
 		const session = prepareChildSession(resolved, surface);
 		const handoffArtifacts = request.handoff
 			? prepareTaskArtifacts(resolved, session)
@@ -277,7 +291,17 @@ async function launchFreshPiSubagent(
 		}
 		return createRunningChild(resolved, artifacts, launchScriptFile);
 	} catch (error) {
-		if (!surface.worktree) throw error;
+		if (!surface) throw error;
+		if (!surface.worktree) {
+			if (!request.surface) {
+				try {
+					operations.closePane(surface.surface);
+				} catch {
+					// The launch error remains authoritative when cleanup also fails.
+				}
+			}
+			throw error;
+		}
 		const handoff = captureWorktreeHandoff(surface.worktree);
 		try {
 			persistWorktreeResult(surface.worktree, "failed", handoff);
@@ -431,6 +455,11 @@ function prepareChildSession(
 		surface.worktree.sessionFile = sessionFile;
 		writeWorktreeManifest(surface.worktree.manifestFile, { sessionFile });
 	}
+	writeSubagentSessionPolicy(sessionFile, {
+		owner: surface.worktree ? "managed-worktree" : "public",
+		tools: resolved.request.behavior.tools,
+		deniedTools: resolved.request.behavior.deniedTools,
+	});
 	const activityFile = getSubagentActivityFile(
 		resolved.artifactDir,
 		resolved.id,
@@ -665,6 +694,13 @@ async function launchResumedPiSubagent(
 	operations: PiLaunchOperations,
 ): Promise<PiRunningChild> {
 	const id = request.id ?? Math.random().toString(16).slice(2, 10);
+	const policy = readSubagentSessionPolicy(request.sessionFile);
+	if (policy.owner !== "public") {
+		throw new Error(
+			`Cannot resume ${policy.owner} session through subagent_resume. ` +
+				"Use its retained workspace or workflow evidence instead.",
+		);
+	}
 	const autoExit = request.behavior?.autoExit ?? true;
 	const interactive = request.behavior?.interactive ?? !autoExit;
 	const startTime = Date.now();
@@ -674,73 +710,90 @@ async function launchResumedPiSubagent(
 		request.parent.sessionId,
 	);
 	const surface = operations.createPane(request.name, request.workspace);
-	await operations.waitForShellReady(surface);
-	const activityFile = getSubagentActivityFile(artifactDir, id);
-	mkdirSync(dirname(activityFile), { recursive: true });
+	try {
+		await operations.waitForShellReady(surface);
+		const activityFile = getSubagentActivityFile(artifactDir, id);
+		mkdirSync(dirname(activityFile), { recursive: true });
 
-	let messageFile: string | undefined;
-	if (request.message) {
-		messageFile = join(
-			artifactDir,
-			"subagent-resume",
-			`${safeName(request.name) || "resume"}-${timestampForFile(false)}.md`,
-		);
-		mkdirSync(dirname(messageFile), { recursive: true });
-		writeFileSync(messageFile, request.message, "utf8");
-	}
-
-	const env = [
-		...(process.env.PI_CODING_AGENT_DIR
-			? [`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`]
-			: []),
-		`PI_SUBAGENT_NAME=${shellQuote(request.name)}`,
-		`PI_SUBAGENT_SESSION=${shellQuote(request.sessionFile)}`,
-		`PI_SUBAGENT_ID=${shellQuote(id)}`,
-		`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
-		`PI_SUBAGENT_AUTO_EXIT=${autoExit ? "1" : "0"}`,
-	];
-	const command = [
-		...env,
-		"pi",
-		"--session",
-		shellQuote(request.sessionFile),
-		"-e",
-		shellQuote(join(SUBAGENTS_DIR, "subagent-done.ts")),
-		...(messageFile ? [shellQuote(`@${messageFile}`)] : []),
-	].join(" ");
-	const launchScriptFile = operations.runScript(
-		surface,
-		`${command}; echo '__SUBAGENT_DONE_'$?'__'`,
-		{
-			scriptPath: join(
+		let messageFile: string | undefined;
+		if (request.message) {
+			messageFile = join(
 				artifactDir,
-				"subagent-scripts",
-				`${safeName(request.name) || "resume"}-resume-${Date.now()}.sh`,
-			),
-			scriptPreamble: [
-				shellComment(`Subagent resume script for ${request.name}`),
-				shellComment(`Generated: ${new Date().toISOString()}`),
-				shellComment(`Session: ${request.sessionFile}`),
-				shellComment(`Surface: ${surface}`),
-				...(messageFile
-					? [shellComment(`Resume message file: ${messageFile}`)]
-					: []),
-			].join("\n"),
-		},
-	);
-	return {
-		id,
-		name: request.name,
-		task: request.message ?? "resumed session",
-		surface,
-		startTime,
-		sessionFile: request.sessionFile,
-		launchScriptFile,
-		activityFile,
-		interactive,
-		runtimePlan: undefined,
-		lifecycle: createLifecycle(startTime),
-	};
+				"subagent-resume",
+				`${safeName(request.name) || "resume"}-${timestampForFile(false)}.md`,
+			);
+			mkdirSync(dirname(messageFile), { recursive: true });
+			writeFileSync(messageFile, request.message, "utf8");
+		}
+
+		const env = [
+			...(process.env.PI_CODING_AGENT_DIR
+				? [`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`]
+				: []),
+			...(policy.deniedTools.length > 0
+				? [`PI_DENY_TOOLS=${shellQuote(policy.deniedTools.join(","))}`]
+				: []),
+			`PI_SUBAGENT_NAME=${shellQuote(request.name)}`,
+			`PI_SUBAGENT_SESSION=${shellQuote(request.sessionFile)}`,
+			`PI_SUBAGENT_ID=${shellQuote(id)}`,
+			`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`,
+			`PI_SUBAGENT_AUTO_EXIT=${autoExit ? "1" : "0"}`,
+		];
+		const toolAllowlist = buildSubagentToolAllowlist(
+			policy.tools?.join(","),
+			autoExit,
+		);
+		const command = [
+			...env,
+			"pi",
+			"--session",
+			shellQuote(request.sessionFile),
+			...(toolAllowlist ? ["--tools", shellQuote(toolAllowlist)] : []),
+			"-e",
+			shellQuote(join(SUBAGENTS_DIR, "subagent-done.ts")),
+			...(messageFile ? [shellQuote(`@${messageFile}`)] : []),
+		].join(" ");
+		const launchScriptFile = operations.runScript(
+			surface,
+			`${command}; echo '__SUBAGENT_DONE_'$?'__'`,
+			{
+				scriptPath: join(
+					artifactDir,
+					"subagent-scripts",
+					`${safeName(request.name) || "resume"}-resume-${Date.now()}.sh`,
+				),
+				scriptPreamble: [
+					shellComment(`Subagent resume script for ${request.name}`),
+					shellComment(`Generated: ${new Date().toISOString()}`),
+					shellComment(`Session: ${request.sessionFile}`),
+					shellComment(`Surface: ${surface}`),
+					...(messageFile
+						? [shellComment(`Resume message file: ${messageFile}`)]
+						: []),
+				].join("\n"),
+			},
+		);
+		return {
+			id,
+			name: request.name,
+			task: request.message ?? "resumed session",
+			surface,
+			startTime,
+			sessionFile: request.sessionFile,
+			launchScriptFile,
+			activityFile,
+			interactive,
+			runtimePlan: undefined,
+			lifecycle: createLifecycle(startTime),
+		};
+	} catch (error) {
+		try {
+			operations.closePane(surface);
+		} catch {
+			// The launch error remains authoritative when cleanup also fails.
+		}
+		throw error;
+	}
 }
 
 export function buildSubagentToolAllowlist(

@@ -4,5 +4,12 @@
   },
   "models": {
     "agents": {}
+  },
+  "roles": {
+    "bundled": true
+  },
+  "panes": {
+    "mode": "tab",
+    "direction": "right"
   }
 }

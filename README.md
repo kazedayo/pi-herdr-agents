@@ -112,7 +112,7 @@ pi install git:github.com/giuseppecrj/pi-herdr-agents@main
 
 Smoke-test delivery with an autonomous subagent instructed to return one exact marker. Success means the marker itself—not only a generic wake-up notice—automatically appears in the parent turn.
 
-Subagent tabs, panes, and worktree workspaces are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent tabs, panes, and worktree workspaces are created without stealing keyboard focus. Launch commands target child panes by explicit ID, so focus and command delivery are independent. If a fresh or resumed launch fails, the extension closes the ordinary pane that it created and preserves the original launch error. It does not close a caller-supplied surface, and managed worktree workspaces remain retained on failure. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
 
@@ -166,8 +166,8 @@ The current workflow inventory is:
 | Iteration | `/iterate` | Opens one interactive full-context Pi fork and returns its completion summary. |
 | Side question | `/btw`, `/btw-close` | Opens one replaceable interactive Pi side session; its answer stays outside the parent transcript. |
 | Worktree handoff | `/worktree <name> [task]`, `/worktree list` | Forks the active conversation into a long-lived interactive Pi process in a new worktree created from committed `HEAD`; retains the parent session. |
-| Approved review runner | `herdr_workflow` (low-level control tool) | Validates and runs exact approved project-local JavaScript with bounded read-only Pi reviewers. The bundled `orchestrate` skill authors this first-flow topology. |
-| Adversarial review | `adversarial-reviewer` | Directly runnable coordinator role that selects eligible authenticated Pi runtimes, launches leaf `reviewer` children in ordinary panes for generic review passes, and uses a fresh reviewer synthesis pass. It does not write artifacts in the reviewed checkout. |
+| Approved review runner | `herdr_workflow` (low-level control tool) | Validates and runs exact approved project-local JavaScript with bounded read-only Pi reviewers. The bundled `orchestrate` skill authors generic and adversarial review topologies. |
+| Adversarial review | `/skill:orchestrate` (preferred), `adversarial-reviewer` (compatibility) | The preferred procedure uses exact approval, a pinned runner-owned checkout, risk-based discovery, candidate-dependent verification, and fresh synthesis. The compatibility coordinator uses public asynchronous children when the hardened prerequisites are unavailable. |
 
 ### Bundled visible definitions
 
@@ -179,7 +179,7 @@ The current workflow inventory is:
 | **reviewer** | Leaf agent role | Config, then parent | Reviews changes for correctness, security, and maintainability. |
 | **visual-tester** | Leaf agent role | Config, then parent | Performs visual QA through the `chrome-cdp` skill. |
 | **poteto** | Coordinator agent role | Config, then parent | Autonomously investigates, edits minimally, delegates independent work, and verifies. |
-| **adversarial-reviewer** | Coordinator agent role | Three distinct eligible authenticated Pi model IDs, preferring provider diversity | Runs evidence-backed Optimizer and Skeptic passes through leaf `reviewer` children in ordinary panes, then a fresh reviewer synthesis pass. |
+| **adversarial-reviewer** | Compatibility coordinator role | Exact eligible authenticated Pi models selected by risk and project policy | Runs two routine or three high-risk discovery reviewers, candidate-dependent cross-family verification, and fresh synthesis through public asynchronous children. |
 
 All subagents execute through Pi. Claude models remain available through normal
 Pi provider/model routing. Legacy role definitions that contain `cli` fail before
@@ -189,7 +189,7 @@ authenticated Pi `provider/model-id`.
 Optional prerequisites fail closed and are not bundled:
 
 - `visual-tester` needs an external `chrome-cdp` skill that provides `scripts/cdp.mjs`.
-- `adversarial-reviewer` needs three distinct exact authenticated Pi model IDs that meet project review constraints; it prefers IDs from different providers when available.
+- Adversarial review needs a resolved standalone `reviewer` role, confirmed human-only authorship or known author model families, and enough distinct exact authenticated Pi models to satisfy project author-family exclusion and cross-family verification. Routine discovery uses two distinct IDs; concrete high-risk surfaces use three distinct lenses. The preferred `orchestrate` procedure fails closed when its pinned committed checkout, complete diff evidence, origin, or runtime prerequisites are unavailable. The compatibility coordinator can use a project-approved reduced topology only when it discloses the omitted coverage.
 - `/plan` uses the bundled scout and planner roles and records ordered tasks in
   `plan.md`; it does not require a researcher role, todo tool, or `write-todos` skill.
 
@@ -306,13 +306,20 @@ cp config.json.example config.json
   },
   "models": {
     "agents": {}
+  },
+  "roles": {
+    "bundled": true
+  },
+  "panes": {
+    "mode": "tab",
+    "direction": "right"
   }
 }
 ```
 
-With no user-level file and no package-root `config.json`, status settings
-fall back to `config.json.example`. Model routing does not read the example:
-no model overrides apply until a real config file exists.
+With no user-level file and no package-root `config.json`, status, role, and
+pane settings fall back to `config.json.example`. Model routing does not read
+the example: no model overrides apply until a real config file exists.
 
 The copyable example is model-neutral, so it works without requiring credentials
 for a specific provider. To configure models, replace the empty section with
@@ -330,6 +337,12 @@ exact IDs from your authenticated model catalog:
 }
 ```
 
+Set `roles.bundled` to `false` to exclude this package's bundled role definitions from listing and exact-name launch. It defaults to `true`. Registered role packs remain available, and global and project definitions keep their existing precedence. A role-pack name collides with a bundled role only while that bundled layer is enabled; when it is disabled, the role pack can supply that name.
+
+Set `panes.mode` to `"split"` to open ordinary public `subagent` and `subagent_resume` launches, including bare forks and `/iterate`, as splits of the stable parent pane. Set `panes.direction` to `"right"` or `"down"`; it defaults to `"right"` and is ignored when mode is `"tab"`. The default `"tab"` mode preserves existing behavior. Managed worktrees still use separate workspaces, while approved workflow readers and `/btw` keep their existing tab behavior.
+
+Run `/reload` after changing role, model, or pane settings.
+
 `models.default` sets the model for subagents that do not specify a model.
 `models.agents` sets per-agent defaults, keyed by the agent name passed to
 `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence,
@@ -337,12 +350,25 @@ followed by agent frontmatter, per-agent config, the global default, and finally
 the parent model. Model values must be exact authenticated `provider/model-id`
 references. A value can contain an ordered comma-separated fallback list, for
 example `provider/preferred, provider/fallback`. The extension validates every
-candidate before launch, retries the preferred model normally, then launches
-later candidates only after a provider/agent request failure. A completed child
-result, including a negative task result, never switches models. Completion
-metadata and the status widget report the model actually used; an exhausted
-list reports every attempted model. Workflow metadata accepts one exact model
-only, to keep approved workflow runtimes deterministic.
+candidate before launch, then launches later candidates only after the selected
+child settles with a provider/agent error. Pi owns any automatic transient
+retrying inside that child; the extension does not infer retry counts or
+permanence from the error text. A completed child result, including a negative
+task result, never switches models. Completion metadata reports the requested
+candidate, every attempted candidate, the model actually used, and each raw
+model failure in attempt order when fallbacks are tried. Workflow metadata accepts one exact
+model only, to keep approved workflow runtimes deterministic.
+
+A catalog-listed model and configured authentication do not prove that the
+active provider account can use that model. Providers may reject an account /
+model combination only when the request is made. The completion preserves each
+raw provider reason with its model and suggests checking account access,
+spawning a new subagent with a supported model, or choosing an appropriate
+configured fallback. `subagent_resume` does not select a model and should be
+used only after the session's stored model is usable. The completion does not
+claim a permanent failure or a retry count that Pi has not exposed. Reliable
+structured permanence and retry counts require an upstream Pi/ExtensionAPI
+diagnostics seam for final provider errors and retry outcomes.
 
 `config.json` is gitignored in the source tree so local overrides are not
 committed from a checkout. On an installed package, prefer the user-level file;
@@ -355,8 +381,8 @@ cp ~/.pi/agent/npm/node_modules/pi-herdr-agents/config.json \
 
 Adjust the source path for git installs or a custom `PI_CODING_AGENT_DIR`.
 
-Run `/reload` after changing the config; status and model configuration are
-loaded when the extension starts.
+Run `/reload` after changing the config; status, model, role, and pane
+configuration are loaded when the extension starts.
 
 ---
 
@@ -417,7 +443,7 @@ prompts, handoffs, and results.
 
 Use one worktree per parallel independent writing task; a single or sequential writer can work in the parent checkout, and read-only agents use ordinary panes. `cwd` selects the source Git repository, `branch` must be unique, and `base` is resolved to an exact commit before creation. If `base` is omitted, the source checkout's committed `HEAD` is used. Parent-checkout changes that have not been committed are not copied.
 
-A launch with `worktree` and an effective bundled `scout`, `reviewer`, or `adversarial-reviewer` returns a non-blocking warning. Scouts and reviewers normally need an ordinary pane; the adversarial reviewer is a coordinator that uses an ordinary pane for its child reviewers. To inspect or review an existing worker result, start an ordinary child in that retained worktree path. Project or global role overrides do not receive these bundled-role warnings.
+A launch with `worktree` and an effective bundled `scout`, `reviewer`, or `adversarial-reviewer` returns a non-blocking warning. Scouts and reviewers normally need an ordinary pane; the adversarial reviewer is a compatibility coordinator that uses an ordinary pane for its child reviewers. To inspect or review an existing worker result, start an ordinary child in that retained worktree path. Project or global role overrides do not receive these bundled-role warnings. A `read,bash` allowlist is not an enforced read-only boundary because shell commands can mutate files; report-only roles must restrict Bash to safe inspection and avoid artifact-generating verification in the reviewed checkout.
 
 The child starts at the returned worktree root. Tell writing agents to test and commit when you want a commit-based handoff, and tell them not to push, merge, switch branches, or remove the worktree. The parent owns review and integration.
 
@@ -483,13 +509,21 @@ Parameters:
 - If process identity cannot be captured for an active pane, the pane remains present after close, or any captured process still lives after the bounded wait, the checkout is retained and the run ends `failed` with `cancel_termination_failed`. Successful cancellation is not reported in that case.
 - A successful cancel writes one `cancelled` terminal journal event and one result-free delivery. Repeated cancel is idempotent and returns the authoritative terminal outcome (including a prior fail-closed result).
 
+Every terminal path—normal completion, early script return, script or Worker failure, deadline, interruption, and explicit cancellation—stops queued work and accounts for active workflow children before checkout disposal or final delivery. If active-child exit cannot be confirmed, the checkout is retained and the authoritative outcome is `failed` with `cancel_termination_failed`.
+
 There is no list, status, resume, or history action in v1. Workflow ownership and the Worker survive `/reload` in the same Pi process, and the latest parent API receives one final delivery. A full process restart reconciles interruption without replay: startup marks only the last known running journal event as `interrupted`, leaves sessions, journals, and reader checkouts in place, and requires a new approved run.
 
 ### Bundled `orchestrate` skill
 
-The package bundles the native `/skill:orchestrate` procedure. It accepts local paths, URLs, tickets, or combinations that the parent can already access. The parent performs read-only preflight discovery and materializes exact remote or tracker evidence before writing one unique `.pi/plans/<run>/workflow.js` at a committed base. The skill authors distinct fresh read-only review nodes in bounded parallel and one fresh synthesis node; nodes can share a review role, and a retry keeps the same node and runtime only for an explicit `retryable: true` failure. It does not use public `subagent()` for workflow nodes and does not author writers, commits, external effects, nested workflows, replay, or a fixed task schema.
+The package bundles the native `/skill:orchestrate` procedure. It accepts local paths, URLs, tickets, or combinations that the parent can already access. The parent performs read-only preflight discovery; pins exact repository, comparison base, checkout head, author origin, and task/spec evidence; and materializes the changed-file inventory plus unified diff or complete before/after excerpts before writing one unique `.pi/plans/<run>/workflow.js`. Deleted and base-only content must be included because head-checkout reads cannot recover it. If complete evidence cannot fit runner limits, preparation stops for narrower scope instead of silently losing evidence. The skill authors distinct fresh standalone review nodes in bounded parallel and one fresh synthesis node. Every child assignment treats code, PR text, reports, and command output as untrusted data. It does not use public `subagent()` for workflow nodes and does not author writers, commits, external effects, nested workflows, replay, or a fixed runtime-wide task schema.
 
-The parent calls `herdr_workflow prepare`, presents its packet unchanged, and waits for the exact `APPROVE <8-character lowercase hash prefix>` reply before calling `start`. After start, one final delivery is sent without polling. Cancellation is fail-closed and retains evidence when process exit cannot be confirmed. Same-process `/reload` preserves ownership; full restart records interruption without replay, restart, cleanup, or history. Workflow JavaScript runs in a Worker-hosted `vm` for event-loop availability only; neither the Worker nor `vm` is a security boundary, and worktrees do not provide process or security isolation.
+Its adversarial branch uses two distinct eligible exact model IDs for routine risk or three distinct lenses for concrete high-risk surfaces, then only candidate-dependent P0/P1 or high-risk verification and one fresh synthesis. Finding records use stable IDs, claimed P0–P3 severity, nullable confirmed severity, separate provenance, and reproduced, trace-backed, or unverified evidence rather than confidence or vote counts. An unresolved serious candidate and any valid child `INCOMPLETE` propagate task-level `INCOMPLETE` even through `ok: true`. Request-local validators reject malformed records; this schema is not a runner contract. Verifiers exclude the family that authored the report they inspect. Required author-family exclusion stops when model origin is unknown unless the evidence is confirmed human-only. Synthesis prefers another family and discloses permitted reuse.
+
+The script and journal retain every original child envelope. Synthesis receives every outcome through an anonymous projection: canonical validated report fields for success, or failure code, retryable flag, and bounded error evidence scrubbed of known identity tokens. Session paths, child/runtime/provider names, and the separate auditable alias map are omitted from the synthesis prompt. This presentation reduces identity and order cues but is not a security boundary or proof against bias.
+
+The runner-owned checkout contains only the pinned commit. Parent staged, unstaged, and untracked state is not review evidence. Effective child tools are the resolved role allowlist intersected with the runner maximum (`read`, `grep`, `find`, and `ls`) and deny rules. Public `subagent` results can be abbreviated above 16,000 characters, but workflow scripts receive complete child reports within their explicit bounds. Operational failures are preserved without silent fallback; recovery is a new exact approved run.
+
+The parent calls `herdr_workflow prepare`, presents its packet unchanged, and waits for the exact `APPROVE <8-character lowercase hash prefix>` reply before calling `start`. After start, one final delivery is sent without polling. Every terminal path is fail-closed: it accounts for queued and active children before checkout disposal and delivery, retaining evidence when process exit cannot be confirmed. Same-process `/reload` preserves ownership; full restart records interruption without replay, restart, cleanup, or history. Workflow JavaScript runs in a Worker-hosted `vm` for event-loop availability only; neither the Worker nor `vm` is a security boundary, and worktrees do not provide process or security isolation.
 
 ---
 
@@ -506,8 +540,10 @@ The `caller_ping` tool lets a Pi-backed subagent request help from its parent ag
 - `sessionPath` (required): Path to the child session `.jsonl` file
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
 - `message` (optional): Follow-up prompt to send after resuming
-- `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
+- `autoExit` (optional): Whether the resumed session should auto-exit after its next response fully settles. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
 - `workspace` (optional): Herdr workspace ID to open the resumed tab in. Defaults to the current space, or the retained worktree space when the session cwd sits in one.
+
+Each public child stores a session-adjacent versioned launch-policy sidecar. Public resume restores its resolved tool allowlist and denied subagent tools rather than looking up the current role, so later role changes cannot widen a child. An intentionally unrestricted launch remains unrestricted (no `--tools` argument); a restricted launch restores its exact allowlist. The `autoExit` override still controls whether `subagent_done` is available, while `caller_ping` remains available. Missing, malformed, or unsupported policy fails closed before a pane is created with recovery guidance. Public resume also rejects workflow-owned and managed-worktree child sessions; use their retained workflow evidence or workspace instead.
 
 **Interaction flow:**
 
@@ -632,8 +668,11 @@ specific exact authenticated `provider/model-id`.
 
 `tools` is passed to Pi's `--tools` allowlist and may name any registered
 built-in, extension, or custom tool. Listing a tool does not install its
-extension. Likewise, `skills` names must already be discoverable by Pi; this
-package does not install role prerequisites.
+extension. Use one non-empty inline comma-separated scalar, such as
+`tools: read, grep`; do not use YAML lists, containers, quotes, or comments.
+Omitting `tools` intentionally leaves the role unrestricted. Likewise, `skills`
+names must already be discoverable by Pi; this package does not install role
+prerequisites.
 
 ### 3. Verify and launch
 
@@ -718,9 +757,9 @@ the files, derives package name/version from the nearest `package.json`, and
 reports invalid paths, missing descriptions, filename/name mismatches, and
 package-layer collisions in the listing surfaces.
 
-Role packs cannot replace bundled roles, and duplicate role names from multiple
-role packs are disabled rather than resolved by extension load order. Use a
-global or project definition for an intentional override.
+Role packs cannot replace an enabled bundled role, and duplicate role names
+from multiple role packs are disabled rather than resolved by extension load
+order. Use a global or project definition for an intentional override.
 
 See [ADR-0003](docs/adr/0003-installable-role-packs.md) for the registration seam,
 collision rules, and rejected alternatives.
@@ -736,9 +775,17 @@ collision rules, and rejected alternatives.
 - Generic roles omit `model` unless a particular runtime is functionally required.
 - `/subagent list` shows the expected source and a smoke launch succeeds.
 
-The current parser is permissive: unsupported or unknown frontmatter may be
-ignored rather than rejected. Compare definitions against the reference below
-and verify them with `/subagent list` plus a smoke launch.
+Capability declarations are strict: use the unquoted, unindented keys
+`tools:`, `deny-tools:`, and `spawning:` exactly once when present. Declare
+`tools` and `deny-tools` as non-empty inline comma-separated scalars, and
+`spawning` as exactly `true` or `false`. YAML lists, containers, multiline
+values, quotes, comments, empty values, duplicates, noncanonical key spelling,
+and invalid booleans are rejected. A role with an invalid capability declaration
+is excluded from discovery, and an exact-name launch reports the diagnostic
+before creating a Herdr pane or worktree. Other unsupported or unknown
+frontmatter may still be ignored.
+Compare definitions against the reference below and verify them with
+`/subagent list` plus a smoke launch.
 
 ### Frontmatter Reference
 
@@ -749,12 +796,12 @@ and verify them with `/subagent list` plus a smoke launch.
 | `model`       | string  | Optional exact authenticated Pi model default or ordered comma-separated fallback list; omit to use per-agent config, global config, then the parent                                                                                                                       |
 | `thinking`    | string  | Optional Pi thinking default (`off` through `max`); omit to inherit the parent                                                                                                                                   |
 | `system-prompt` | string | `append` passes the agent body through Pi's appended system prompt; `replace` replaces Pi's default system prompt. Without this field, the body is included in the task wrapper                                                                                                                                                                                                                                 |
-| `tools`       | string  | Comma-separated Pi `--tools` allowlist; may contain any registered built-in, extension, or custom tool name                                                                                                                                                                 |
+| `tools`       | string  | One non-empty inline comma-separated Pi `--tools` allowlist under the exact unquoted key `tools:`; may contain any registered built-in, extension, or custom tool name. Omit to leave unrestricted. YAML lists, containers, multiline values, quotes, comments, noncanonical keys, and duplicates are rejected. |
 | `skills`      | string  | Comma-separated installed skill names to auto-load. Use this plural form for new definitions; legacy project/global definitions using singular `skill` remain compatible. |
 | `session-mode` | string | Default child-session mode: `standalone`, `lineage-only`, or `fork` |
-| `spawning`    | boolean | Set `false` to deny all subagent-spawning tools                                                                                                                                                                                                                             |
-| `deny-tools`  | string  | Comma-separated `pi-herdr-agents` tool names to suppress; this is not a universal cross-extension deny list                                                                                                                                                                  |
-| `auto-exit`   | boolean | Auto-shutdown when the latest assistant turn does not end with `stopReason: "aborted"` — no `subagent_done` call needed. User input does not permanently disable auto-exit. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
+| `spawning`    | boolean | Set exactly `false` to deny all subagent-spawning tools under the exact unquoted key `spawning:`. Only one `true` or `false` declaration is accepted. |
+| `deny-tools`  | string  | One non-empty inline comma-separated `pi-herdr-agents` tool list to suppress under the exact unquoted key `deny-tools:`; this is not a universal cross-extension deny list. YAML lists, containers, multiline values, quotes, comments, noncanonical keys, and duplicates are rejected. |
+| `auto-exit`   | boolean | Auto-shutdown after Pi fully settles when the latest assistant turn does not end with `stopReason: "aborted"` — no `subagent_done` call needed. User input does not permanently disable auto-exit. Recommended for autonomous agents (scout, worker); not for interactive ones (planner). Also determines the default value of `interactive` (see below). |
 | `interactive` | boolean | Override whether stall/recovery transitions wake the parent session. Defaults to the inverse of `auto-exit`: autonomous agents (`auto-exit: true`) are non-interactive and get stall pings; agents without `auto-exit` are interactive and stay quiet. Explicit values take precedence. |
 | `cwd`         | string  | Default working directory. Absolute paths are unambiguous; relative agent-frontmatter paths resolve from Pi's agent config directory (`PI_CODING_AGENT_DIR` or `~/.pi/agent`), not the project root                                                                                                                                                                                                            |
 | `disable-model-invocation` | boolean | Hide a role from discovery surfaces like `subagents_list`. The definition remains directly invocable by exact name via `subagent({ agent: "name", ... })`. |
@@ -784,12 +831,13 @@ session-mode: lineage-only
 
 ### `auto-exit`
 
-When set to `true`, the agent session shuts down on `agent_end` unless the latest assistant message has `stopReason: "aborted"` — no explicit `subagent_done` call is needed.
+When set to `true`, the agent session shuts down on Pi's `agent_settled` event unless the latest assistant message has `stopReason: "aborted"` — no explicit `subagent_done` call is needed.
 
 **Behavior:**
 
-- The session closes on `agent_end` when the latest assistant turn does not have `stopReason: "aborted"`; a normal or error stop exits, while an aborted stop stays open.
-- User input does not permanently disable auto-exit; the latest assistant stop reason determines whether the session exits.
+- Low-level `agent_end` events do not close the session because Pi may still retry, compact and retry, or process a queued continuation.
+- After `agent_settled`, a normal or error stop exits, while an aborted stop stays open.
+- User input does not permanently disable auto-exit; the latest settled assistant stop reason determines whether the session exits.
 - The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
 
 **When to use:**
@@ -864,7 +912,7 @@ deny-tools: subagent
 | --- | --- | --- |
 | planner | *(default)* | Can spawn scouts for investigation. |
 | poteto | `true` | Delegates independent work. |
-| adversarial-reviewer | `true` | Launches leaf reviewer passes and synthesis. |
+| adversarial-reviewer | `true` | Compatibility coordinator; launches bounded discovery, conditional verification, and synthesis children. It sets `auto-exit: false` so automatic child-result steers can drive every wave, then calls `subagent_done`. |
 | worker | `false` | Implements bounded tasks. |
 | reviewer | `false` | Reviews without delegation. |
 | scout | `false` | Gathers context without delegation. |

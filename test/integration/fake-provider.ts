@@ -56,9 +56,12 @@ export const TEST_MODEL = "pi-integration/test";
 export interface ProviderRequest {
 	model?: string;
 	status: number;
+	tools?: string[];
+	lastUser?: string;
 }
 
 const providerRequests: ProviderRequest[] = [];
+const resumeRestrictionStates = new Map<string, "launched" | "resumed">();
 
 export function getProviderRequests(): readonly ProviderRequest[] {
 	return providerRequests;
@@ -66,6 +69,7 @@ export function getProviderRequests(): readonly ProviderRequest[] {
 
 export function resetProviderRequests(): void {
 	providerRequests.length = 0;
+	resumeRestrictionStates.clear();
 }
 
 async function readJson(request: IncomingMessage): Promise<ChatRequest> {
@@ -198,11 +202,139 @@ function btwText(source: string): string | undefined {
 	return undefined;
 }
 
+function resumeRestrictionResponse(request: ChatRequest): ResponsePlan | null {
+	const names = toolNames(request);
+	const source = requestText(request);
+	const user = lastUserText(request);
+	const id = source.match(
+		/INTEGRATION_RESUME_RESTRICTIONS:([A-Za-z0-9_-]+)/,
+	)?.[1];
+	if (!id) return null;
+
+	if (!names.has("subagent") && !names.has("subagent_resume")) {
+		if (user.includes(`RESUME_RESTRICTED_${id}`)) {
+			return names.has("read") &&
+				!names.has("subagent") &&
+				!names.has("subagent_resume")
+				? { text: `RESTRICTED_RESUME_${id}` }
+				: { text: `RESTRICTED_TOOL_LEAK_${id}` };
+		}
+		return { text: `RESTRICTED_FIRST_${id}` };
+	}
+
+	const state = resumeRestrictionStates.get(id);
+	if (state === "resumed") {
+		return { text: `RESUME_RESTRICTIONS_COMPLETE_${id}` };
+	}
+	if (state === "launched") {
+		const sessionPath = source.match(/Session:\s*(\S+\.jsonl)/)?.[1];
+		if (source.includes(`RESTRICTED_FIRST_${id}`) && sessionPath) {
+			resumeRestrictionStates.set(id, "resumed");
+			return {
+				toolCalls: [
+					{
+						name: "subagent_resume",
+						arguments: {
+							sessionPath,
+							name: `Restricted-${id}`,
+							message: `RESUME_RESTRICTED_${id}`,
+						},
+					},
+				],
+			};
+		}
+		return { text: `WAITING_FOR_RESTRICTED_RESULT_${id}` };
+	}
+	resumeRestrictionStates.set(id, "launched");
+	return {
+		toolCalls: [
+			{
+				name: "subagent",
+				arguments: {
+					name: `Restricted-${id}`,
+					agent: "test-restricted",
+					task: `INTEGRATION_RESUME_RESTRICTIONS:${id} Return exactly RESTRICTED_FIRST_${id}`,
+				},
+			},
+		],
+	};
+}
+
+function multiWaveCoordinatorResponse(
+	request: ChatRequest,
+): ResponsePlan | null {
+	const names = toolNames(request);
+	const source = requestText(request);
+	const user = lastUserText(request);
+	const id = source.match(
+		/INTEGRATION_MULTI_WAVE_COORDINATOR:([A-Za-z0-9_-]+)/,
+	)?.[1];
+	if (!names.has("subagent") || !names.has("caller_ping") || !id) {
+		return null;
+	}
+	const discoveryName = `${id}-review-1`;
+	const synthesisName = `${id}-review-2`;
+	const discoveryResult = `DISCOVERY_RESULT_${id}`;
+	const synthesisResult = `SYNTHESIS_RESULT_${id}`;
+	const discoveryLaunched = source.includes(
+		`Sub-agent "${discoveryName}" launched`,
+	);
+	const synthesisLaunched = source.includes(
+		`Sub-agent "${synthesisName}" launched`,
+	);
+
+	if (user.includes(synthesisResult)) {
+		if (source.includes("Shutting down subagent session.")) {
+			return { text: `FINAL_MULTI_WAVE_${id}` };
+		}
+		return {
+			text: `FINAL_MULTI_WAVE_${id}`,
+			toolCalls: [{ name: "subagent_done", arguments: {} }],
+		};
+	}
+	if (user.includes(discoveryResult) && !synthesisLaunched) {
+		return {
+			toolCalls: [
+				{
+					name: "subagent",
+					arguments: {
+						name: synthesisName,
+						agent: "test-echo",
+						model: TEST_MODEL,
+						task: `Alias S1. Return exactly ${synthesisResult}`,
+					},
+				},
+			],
+		};
+	}
+	if (synthesisLaunched) return { text: `WAITING_FOR_SYNTHESIS_${id}` };
+	if (discoveryLaunched) return { text: `WAITING_FOR_DISCOVERY_${id}` };
+	return {
+		toolCalls: [
+			{
+				name: "subagent",
+				arguments: {
+					name: discoveryName,
+					agent: "test-echo",
+					model: TEST_MODEL,
+					task: `Alias R1. Return exactly ${discoveryResult}`,
+				},
+			},
+		],
+	};
+}
+
 async function planResponse(request: ChatRequest): Promise<ResponsePlan> {
 	const names = toolNames(request);
 	const source = requestText(request);
 	const user = lastUserText(request);
 	const lastRole = request.messages?.at(-1)?.role;
+
+	const resumeRestriction = resumeRestrictionResponse(request);
+	if (resumeRestriction) return resumeRestriction;
+
+	const multiWave = multiWaveCoordinatorResponse(request);
+	if (multiWave) return multiWave;
 
 	const resumed = !/Call the subagent_resume tool/i.test(user)
 		? user.match(/RESUME_FOLLOWUP_INPUT:\s*([a-z0-9]+)/i)?.[1]
@@ -215,7 +347,7 @@ async function planResponse(request: ChatRequest): Promise<ResponsePlan> {
 	// prompt actually asks for a help ping (test-ping), not for ordinary tasks.
 	if (
 		names.has("caller_ping") &&
-		/caller_ping|ONLY call caller_ping|call the caller_ping tool/i.test(source)
+		/caller_ping|ONLY call caller_ping|call the caller_ping tool/i.test(user)
 	) {
 		return {
 			toolCalls: [
@@ -311,6 +443,14 @@ async function planResponse(request: ChatRequest): Promise<ResponsePlan> {
 		if (resumeCall) return { toolCalls: [resumeCall] };
 	}
 
+	// A fork retains the parent's launch instruction and can also expose subagent.
+	// Route its current explicit shell task before scanning inherited launch text.
+	if (names.has("bash") && /^Run this bash command:/i.test(user.trim())) {
+		const command = bashCommand(user);
+		if (command)
+			return { toolCalls: [{ name: "bash", arguments: { command } }] };
+	}
+
 	if (names.has("subagent")) {
 		if (
 			/Sub-agent "[^"]+" launched and is now running in the background/.test(
@@ -388,23 +528,20 @@ function writeResponse(
 	});
 
 	if (plan.toolCalls && plan.toolCalls.length > 0) {
-		writeEvent(
-			response,
-			request,
-			{
-				role: "assistant",
-				tool_calls: plan.toolCalls.map((toolCall, index) => ({
-					index,
-					id: `call_${Date.now()}_${index}`,
-					type: "function",
-					function: {
-						name: toolCall.name,
-						arguments: JSON.stringify(toolCall.arguments),
-					},
-				})),
-			},
-			null,
-		);
+		const delta: ChatDelta = {
+			role: "assistant",
+			tool_calls: plan.toolCalls.map((toolCall, index) => ({
+				index,
+				id: `call_${Date.now()}_${index}`,
+				type: "function",
+				function: {
+					name: toolCall.name,
+					arguments: JSON.stringify(toolCall.arguments),
+				},
+			})),
+		};
+		if (plan.text) delta.content = plan.text;
+		writeEvent(response, request, delta, null);
 		writeEvent(response, request, {}, "tool_calls");
 	} else {
 		writeEvent(
@@ -428,6 +565,19 @@ const server = createServer(async (request, response) => {
 	}
 	try {
 		const chatRequest = await readJson(request);
+		if (chatRequest.model === "account-rejected") {
+			providerRequests.push({ model: chatRequest.model, status: 400 });
+			response.writeHead(400, { "content-type": "application/json" });
+			response.end(
+				JSON.stringify({
+					error: {
+						message:
+							"The 'account-rejected' model is not supported when using this account.",
+					},
+				}),
+			);
+			return;
+		}
 		if (
 			chatRequest.model === "fallback-primary" ||
 			chatRequest.model === "fallback-fail"
@@ -441,7 +591,12 @@ const server = createServer(async (request, response) => {
 			);
 			return;
 		}
-		providerRequests.push({ model: chatRequest.model, status: 200 });
+		providerRequests.push({
+			model: chatRequest.model,
+			status: 200,
+			tools: [...toolNames(chatRequest)].sort(),
+			lastUser: lastUserText(chatRequest),
+		});
 		writeResponse(response, chatRequest, await planResponse(chatRequest));
 	} catch (error) {
 		providerRequests.push({ status: 500 });

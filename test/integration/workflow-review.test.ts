@@ -27,6 +27,7 @@ import {
 	TEST_MODEL,
 } from "./harness.ts";
 import { isString } from "../../pi-extension/subagents/type-guards.ts";
+import { readSubagentSessionPolicy } from "../../pi-extension/subagents/session.ts";
 
 const backends = getAvailableBackends();
 
@@ -267,13 +268,24 @@ for (const backend of backends) {
 				const results = events
 					.filter((event) => event.type === "agent_result")
 					.map((event) => event.result);
-				const startRoles = starts.map((event) => event.role);
-				assert.deepEqual(startRoles.slice(0, 3).sort(), [
-					"architecture",
-					"skeptic",
-					"standards",
-				]);
-				assert.equal(startRoles[3], "synthesizer");
+				assert.deepEqual(
+					starts
+						.slice(0, 3)
+						.map((event) => event.role)
+						.sort(),
+					["architecture", "skeptic", "standards"],
+					"parallel reviewers may start in any order",
+				);
+				assert.equal(starts.length, 4);
+				assert.equal(starts[3].role, "synthesizer");
+				assert.equal(
+					starts.every(
+						(event) =>
+							readSubagentSessionPolicy(event.sessionFile).owner === "workflow",
+					),
+					true,
+					"workflow child sessions are marked before public resume can create a pane",
+				);
 				assert.equal(
 					events.findIndex((event) => event.type === "agent_completed"),
 					6,

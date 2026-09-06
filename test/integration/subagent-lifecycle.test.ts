@@ -18,7 +18,13 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { getProviderRequests, resetProviderRequests } from "./fake-provider.ts";
 import {
@@ -47,7 +53,10 @@ import {
 const backends = getAvailableBackends();
 
 function getWorkspaceActiveTab(workspaceId: string): string | null {
-	const workspaces = JSON.parse(
+	const workspaces: Array<{
+		workspace_id: string;
+		active_tab_id?: string;
+	}> = JSON.parse(
 		execFileSync("herdr", ["workspace", "list"], { encoding: "utf8" }),
 	).result.workspaces;
 	return (
@@ -67,7 +76,7 @@ function getPaneTab(paneId: string): string | null {
 }
 
 function listBtwPanes(workspaceId: string): string[] {
-	const tabs = JSON.parse(
+	const tabs: Array<{ label: string; tab_id: string }> = JSON.parse(
 		execFileSync("herdr", ["tab", "list", "--workspace", workspaceId], {
 			encoding: "utf8",
 		}),
@@ -75,7 +84,7 @@ function listBtwPanes(workspaceId: string): string[] {
 	const btwTabIds = new Set(
 		tabs.filter((tab) => tab.label === "BTW").map((tab) => tab.tab_id),
 	);
-	const panes = JSON.parse(
+	const panes: Array<{ pane_id: string; tab_id: string }> = JSON.parse(
 		execFileSync("herdr", ["pane", "list", "--workspace", workspaceId], {
 			encoding: "utf8",
 		}),
@@ -347,6 +356,92 @@ for (const backend of backends) {
 			);
 		});
 
+		it("runs a non-auto-exit coordinator through discovery and synthesis waves", async () => {
+			const id = uniqueId();
+			const coordinatorName = `nested-${id}`;
+			const marker = `INTEGRATION_MULTI_WAVE_COORDINATOR:${id}`;
+			const parentSession = join(env.dir, `multi-wave-parent-${id}.jsonl`);
+			const surface = createTrackedSurface(env, `multi-wave-${id}`);
+			await waitForPaneReady(surface);
+
+			startPi(
+				surface,
+				env.dir,
+				[
+					"Call the subagent tool with these EXACT parameters:",
+					`  name: "${coordinatorName}"`,
+					'  agent: "adversarial-reviewer"',
+					`  task: "${marker}"`,
+					"Do not do anything else. Just call the subagent tool once.",
+					`After completion, say PARENT_MULTI_WAVE_${id}.`,
+				].join("\n"),
+				{ extraArgs: `--session ${shellQuote(parentSession)}` },
+			);
+
+			let entries: any[] = [];
+			let completion: any;
+			const deadline = Date.now() + Math.min(PI_TIMEOUT, 60_000);
+			while (!completion && Date.now() < deadline) {
+				if (existsSync(parentSession)) {
+					entries = readFileSync(parentSession, "utf8")
+						.trim()
+						.split("\n")
+						.filter(Boolean)
+						.map((line) => JSON.parse(line));
+					completion = entries.find(
+						(entry) =>
+							entry.type === "custom_message" &&
+							entry.customType === "subagent_result" &&
+							entry.details?.name === coordinatorName,
+					);
+				}
+				if (!completion) await sleep(50);
+			}
+
+			assert.ok(completion, readPane(surface, 300));
+			assert.match(completion.details.resultContent, /completed/i);
+			assert.match(
+				completion.details.resultContent,
+				new RegExp(`FINAL_MULTI_WAVE_${id}`),
+			);
+			assert.equal(
+				entries.filter(
+					(entry) =>
+						entry.type === "custom_message" &&
+						entry.customType === "subagent_result" &&
+						entry.details?.name === coordinatorName,
+				).length,
+				1,
+				"coordinator must deliver exactly one final parent result",
+			);
+
+			const coordinatorSession = completion.details.sessionFile;
+			assert.ok(coordinatorSession, "coordinator session must be retained");
+			assert.equal(existsSync(coordinatorSession), true);
+			const coordinatorEntries = readFileSync(coordinatorSession, "utf8")
+				.trim()
+				.split("\n")
+				.filter(Boolean)
+				.map((line) => JSON.parse(line));
+			const transcript = JSON.stringify(coordinatorEntries);
+			assert.match(transcript, new RegExp(`DISCOVERY_RESULT_${id}`));
+			assert.match(transcript, new RegExp(`SYNTHESIS_RESULT_${id}`));
+			assert.equal(
+				coordinatorEntries.some((entry) => {
+					if (entry.type !== "message" || entry.message?.role !== "assistant") {
+						return false;
+					}
+					const turn = JSON.stringify(entry.message.content);
+					return (
+						turn.includes(`FINAL_MULTI_WAVE_${id}`) &&
+						turn.includes("subagent_done")
+					);
+				}),
+				true,
+				"final report text and subagent_done must occur in the same coordinator turn",
+			);
+		});
+
 		it("runs a writing subagent in a retained Herdr worktree", async () => {
 			const id = uniqueId();
 			const branch = `integration/ticket-${id}`;
@@ -466,13 +561,43 @@ for (const backend of backends) {
 		});
 
 		it("delivers completion after the parent starts a new session", async () => {
+			type SessionEntry = {
+				type?: string;
+				customType?: string;
+				details?: {
+					name?: string;
+					exitCode?: number;
+					resultContent?: string;
+				};
+				message?: { role?: string };
+			};
+
 			const id = uniqueId();
 			const startFile = `/tmp/pi-integ-switch-start-${id}.txt`;
 			const markerFile = `/tmp/pi-integ-switch-done-${id}.txt`;
 			const childDir = join(env.dir, "sibling-project");
+			const sessionDir = join(env.dir, `switch-sessions-${id}`);
+			const originalSession = join(sessionDir, "original.jsonl");
 			mkdirSync(childDir);
+			mkdirSync(sessionDir);
 			trackTempFile(env, startFile);
 			trackTempFile(env, markerFile);
+
+			const readSession = (path: string): SessionEntry[] => {
+				try {
+					return readFileSync(path, "utf8")
+						.trim()
+						.split("\n")
+						.filter(Boolean)
+						.map((line) => JSON.parse(line));
+				} catch {
+					return [];
+				}
+			};
+			const isMatchingReceipt = (entry: SessionEntry): boolean =>
+				entry.type === "custom_message" &&
+				entry.customType === "subagent_result" &&
+				entry.details?.name === `Switch-${id}`;
 
 			const surface = createTrackedSurface(env, `switch-${id}`);
 			await waitForPaneReady(surface);
@@ -486,8 +611,14 @@ for (const backend of backends) {
 				`Do not do anything else. Just call the subagent tool once.`,
 			].join("\n");
 
-			startPi(surface, env.dir, task);
+			startPi(surface, env.dir, task, {
+				extraArgs: [
+					`--session ${shellQuote(originalSession)}`,
+					`--session-dir ${shellQuote(sessionDir)}`,
+				].join(" "),
+			});
 			await waitForFile(startFile, PI_TIMEOUT, /START_/);
+			assert.equal(existsSync(originalSession), true);
 
 			runInPane(surface, "/new");
 
@@ -497,13 +628,54 @@ for (const backend of backends) {
 				"Subagent should finish after the parent session switch",
 			);
 
-			const screen = await waitForScreen(
-				surface,
-				new RegExp(`Switch-${id}.*completed|Sub-agent.*Switch-${id}`, "i"),
-				PI_TIMEOUT,
-				300,
+			let replacementSession: string | undefined;
+			const deadline = Date.now() + PI_TIMEOUT;
+			while (!replacementSession && Date.now() < deadline) {
+				for (const file of readdirSync(sessionDir).filter((name) =>
+					name.endsWith(".jsonl"),
+				)) {
+					const path = join(sessionDir, file);
+					if (path === originalSession) continue;
+					const entries = readSession(path);
+					const receiptIndex = entries.findIndex(isMatchingReceipt);
+					const settled =
+						receiptIndex >= 0 &&
+						entries
+							.slice(receiptIndex + 1)
+							.some(
+								(entry) =>
+									entry.type === "message" &&
+									entry.message?.role === "assistant",
+							);
+					if (entries.filter(isMatchingReceipt).length === 1 && settled) {
+						replacementSession = path;
+						break;
+					}
+				}
+				if (!replacementSession) await sleep(50);
+			}
+
+			const replacementPath = replacementSession;
+			assert.ok(
+				replacementPath,
+				`Expected a settled replacement session receipt. Parent screen:\n${readPane(surface, 300)}`,
 			);
-			assert.match(screen, new RegExp(`Switch-${id}`, "i"));
+			assert.notEqual(replacementPath, originalSession);
+			const replacementResults =
+				readSession(replacementPath).filter(isMatchingReceipt);
+			assert.equal(replacementResults.length, 1);
+			const receipt = replacementResults[0];
+			assert.equal(receipt.type, "custom_message");
+			assert.equal(receipt.customType, "subagent_result");
+			assert.ok(receipt.details, "Receipt must include structured details");
+			assert.equal(receipt.details?.name, `Switch-${id}`);
+			assert.equal(receipt.details?.exitCode, 0);
+			assert.match(receipt.details?.resultContent ?? "", /.+/);
+			assert.equal(
+				readSession(originalSession).filter(isMatchingReceipt).length,
+				0,
+				"Completion must not be delivered into the original parent session",
+			);
 		});
 
 		// ── In-progress activity snapshots ──
@@ -715,7 +887,7 @@ for (const backend of backends) {
 			);
 		});
 
-		it("resumes a Pi session and delivers its new result to the parent", async () => {
+		it("rejects public resume of a legacy Pi session without a saved policy", async () => {
 			const id = uniqueId();
 			const sessionFile = join(env.dir, `resume-child-${id}.jsonl`);
 			const seedSurface = createTrackedSurface(env, `resume-seed-${id}`);
@@ -727,9 +899,18 @@ for (const backend of backends) {
 			assert.equal(await waitForPiExit(seedSurface), 0);
 			assert.equal(existsSync(sessionFile), true);
 
-			const resultMarker = `RESUME_RESULT_${id}`;
+			const parentSession = join(env.dir, `resume-parent-${id}.jsonl`);
 			const parentSurface = createTrackedSurface(env, `resume-parent-${id}`);
 			await waitForPaneReady(parentSurface);
+			const panesBefore = JSON.parse(
+				execFileSync(
+					"herdr",
+					["pane", "list", "--workspace", env.workspaceId],
+					{ encoding: "utf8" },
+				),
+			)
+				.result.panes.map((pane: { pane_id: string }) => pane.pane_id)
+				.sort();
 			startPi(
 				parentSurface,
 				env.dir,
@@ -739,16 +920,79 @@ for (const backend of backends) {
 					`  name: "Resume-${id}"`,
 					`  message: "RESUME_FOLLOWUP_INPUT: ${id}"`,
 					"  autoExit: true",
-					"Call the tool once and wait for its asynchronous result.",
+					"Call the tool once and report its result.",
 				].join("\n"),
+				{ extraArgs: `--session ${shellQuote(parentSession)}` },
 			);
 
-			const screen = await waitForScreen(
-				parentSurface,
-				new RegExp(resultMarker),
+			const transcript = await waitForFile(
+				parentSession,
 				PI_TIMEOUT,
+				/saved launch policy is missing/,
 			);
-			assert.match(screen, new RegExp(resultMarker));
+			assert.match(transcript, /Cannot safely resume/);
+			const panesAfter = JSON.parse(
+				execFileSync(
+					"herdr",
+					["pane", "list", "--workspace", env.workspaceId],
+					{ encoding: "utf8" },
+				),
+			)
+				.result.panes.map((pane: { pane_id: string }) => pane.pane_id)
+				.sort();
+			assert.deepEqual(panesAfter, panesBefore);
+		});
+
+		it("preserves restricted child tools and spawning denial across public resume", async () => {
+			const id = uniqueId();
+			const parentSession = join(
+				env.dir,
+				`resume-restricted-parent-${id}.jsonl`,
+			);
+			const surface = createTrackedSurface(env, `resume-restricted-${id}`);
+			await waitForPaneReady(surface);
+			startPi(surface, env.dir, `INTEGRATION_RESUME_RESTRICTIONS:${id}`, {
+				extraArgs: `--session ${shellQuote(parentSession)}`,
+			});
+
+			await waitForFile(
+				parentSession,
+				PI_TIMEOUT,
+				new RegExp(`RESUME_RESTRICTIONS_COMPLETE_${id}`),
+			);
+			const deadline = Date.now() + PI_TIMEOUT;
+			let results: Array<{ content: string }> = [];
+			while (Date.now() < deadline) {
+				const entries = readFileSync(parentSession, "utf8")
+					.trim()
+					.split("\n")
+					.map((line) => JSON.parse(line));
+				results = entries.filter(
+					(entry) =>
+						entry.type === "custom_message" &&
+						entry.customType === "subagent_result",
+				);
+				if (results.length === 2) break;
+				await sleep(50);
+			}
+			assert.equal(results.length, 2, "each child run delivers one result");
+			assert.match(results[1].content, new RegExp(`RESTRICTED_RESUME_${id}`));
+			assert.doesNotMatch(
+				JSON.stringify(results),
+				new RegExp(`RESTRICTED_TOOL_LEAK_${id}`),
+			);
+			const restrictedRequests = getProviderRequests().filter(
+				(request) =>
+					request.tools?.includes("caller_ping") &&
+					request.tools.includes("read"),
+			);
+			assert.ok(
+				restrictedRequests.length >= 2,
+				"fresh and resumed children both reached the deterministic provider",
+			);
+			for (const request of restrictedRequests) {
+				assert.deepEqual(request.tools, ["caller_ping", "read"]);
+			}
 		});
 
 		// ── Agent discovery ──
@@ -866,6 +1110,98 @@ for (const backend of backends) {
 				result.details.runtimePlan.model,
 				"pi-integration/fallback-secondary",
 			);
+			assert.equal(result.details.fallbackFailures.length, 1);
+			assert.equal(
+				result.details.fallbackFailures[0].model,
+				"pi-integration/fallback-primary",
+			);
+			assert.match(
+				result.details.fallbackFailures[0].error,
+				/deterministic fallback provider failure/,
+			);
+			assert.match(
+				result.content,
+				/Requested model: pi-integration\/fallback-primary/,
+			);
+			assert.match(
+				result.content,
+				/Model used: pi-integration\/fallback-secondary/,
+			);
+		});
+
+		it("advances after an account-style HTTP rejection without repeating that model", async () => {
+			const id = uniqueId();
+			const markerFile = `/tmp/pi-integ-account-fallback-${id}.txt`;
+			const parentSession = join(
+				env.dir,
+				`account-fallback-parent-${id}.jsonl`,
+			);
+			trackTempFile(env, markerFile);
+			const surface = createTrackedSurface(env, `account-fallback-${id}`);
+			await waitForPaneReady(surface);
+			startPi(
+				surface,
+				env.dir,
+				[
+					`Call subagent once with name: "AccountFallback-${id}".`,
+					'agent: "test-echo".',
+					`model: "pi-integration/account-rejected, pi-integration/fallback-secondary".`,
+					`task: "Run: echo 'ACCOUNT_FALLBACK_${id}' > '${markerFile}'".`,
+				].join("\n"),
+				{ extraArgs: `--session ${shellQuote(parentSession)}` },
+			);
+
+			assert.match(
+				await waitForFile(markerFile, PI_TIMEOUT),
+				new RegExp(`ACCOUNT_FALLBACK_${id}`),
+			);
+			await waitForFile(
+				parentSession,
+				PI_TIMEOUT,
+				/"customType":"subagent_result"/,
+			);
+			const entries = readFileSync(parentSession, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line));
+			const results = entries.filter(
+				(entry) =>
+					entry.type === "custom_message" &&
+					entry.customType === "subagent_result",
+			);
+			assert.equal(results.length, 1, "parent must receive one completion");
+			const result = results[0];
+			assert.deepEqual(result.details.fallbackAttempts, [
+				"pi-integration/account-rejected",
+				"pi-integration/fallback-secondary",
+			]);
+			assert.equal(
+				result.details.runtimePlan.model,
+				"pi-integration/fallback-secondary",
+			);
+			assert.equal(result.details.fallbackFailures.length, 1);
+			assert.equal(
+				result.details.fallbackFailures[0].model,
+				"pi-integration/account-rejected",
+			);
+			assert.match(
+				result.details.fallbackFailures[0].error,
+				/account-rejected.*not supported.*account/i,
+			);
+			assert.match(
+				result.content,
+				/Models attempted: pi-integration\/account-rejected, pi-integration\/fallback-secondary/,
+			);
+			assert.match(
+				result.content,
+				/Model used: pi-integration\/fallback-secondary/,
+			);
+			assert.doesNotMatch(result.content, /auto-retry exhausted/);
+			const rejectedRequests = getProviderRequests().filter(
+				(request) => request.model === "account-rejected",
+			);
+			assert.equal(rejectedRequests.length, 1);
+			assert.equal(rejectedRequests[0].status, 400);
 		});
 
 		it("reports every attempted model when all fallbacks fail", async () => {
@@ -913,6 +1249,26 @@ for (const backend of backends) {
 				failedRequests.every((request) => request.status === 503),
 				true,
 			);
+			assert.equal(result.details.fallbackFailures.length, 2);
+			assert.deepEqual(
+				result.details.fallbackFailures.map(
+					(failure: { model: string }) => failure.model,
+				),
+				["pi-integration/fallback-primary", "pi-integration/fallback-fail"],
+			);
+			assert.match(
+				result.details.fallbackFailures[0].error,
+				/deterministic fallback provider failure/,
+			);
+			assert.match(
+				result.details.fallbackFailures[1].error,
+				/deterministic fallback provider failure/,
+			);
+			assert.match(
+				result.content,
+				/Models attempted: pi-integration\/fallback-primary, pi-integration\/fallback-fail/,
+			);
+			assert.doesNotMatch(result.content, /auto-retry exhausted/);
 		});
 	});
 }

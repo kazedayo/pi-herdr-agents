@@ -18,6 +18,11 @@ import {
 	type PiLaunchOperations,
 	type ResumePiLaunchRequest,
 } from "../pi-extension/subagents/launch.ts";
+import { createSubagentPaneFactory } from "../pi-extension/subagents/pane-config.ts";
+import {
+	readSubagentSessionPolicy,
+	writeSubagentSessionPolicy,
+} from "../pi-extension/subagents/session.ts";
 
 function fixture() {
 	const root = mkdtempSync(join(tmpdir(), "subagent-launch-test-"));
@@ -76,6 +81,14 @@ function withFixture(
 	});
 }
 
+function writePublicResumePolicy(sessionFile: string): void {
+	writeSubagentSessionPolicy(sessionFile, {
+		owner: "public",
+		tools: "read,bash",
+		deniedTools: ["subagent", "subagent_resume"],
+	});
+}
+
 describe("Pi launch", () => {
 	it("launches an ordinary child through one transaction", async () => {
 		await withFixture(async ({ request, project, agentDir }) => {
@@ -83,6 +96,7 @@ describe("Pi launch", () => {
 			const projectAgentDir = join(project, ".pi", "agent");
 			mkdirSync(projectAgentDir, { recursive: true });
 			const events: string[] = [];
+			const closed: string[] = [];
 			let command = "";
 			let scriptPath = "";
 			const operations: PiLaunchOperations = {
@@ -106,15 +120,25 @@ describe("Pi launch", () => {
 					scriptPath = options.scriptPath;
 					return options.scriptPath;
 				},
+				closePane(surface) {
+					closed.push(surface);
+				},
 			};
 
 			const running = await launchPiSubagent(request, operations);
 
 			assert.deepEqual(events, ["create", "ready", "run"]);
+			assert.deepEqual(closed, []);
 			assert.equal(running.id, "child-1");
 			assert.equal(running.surface, "pane-1");
 			assert.equal(running.launchScriptFile, scriptPath);
 			assert.ok(running.sessionFile.startsWith(join(agentDir, "sessions")));
+			assert.deepEqual(readSubagentSessionPolicy(running.sessionFile), {
+				version: 1,
+				owner: "public",
+				tools: ["read", "bash"],
+				deniedTools: ["subagent", "subagent_resume"],
+			});
 			assert.equal(command.includes(projectAgentDir), false);
 			assert.match(command, new RegExp(`^cd '${project}' && `));
 			assert.match(command, /--model 'fake\/worker'/);
@@ -142,6 +166,212 @@ describe("Pi launch", () => {
 		});
 	});
 
+	for (const kind of ["fresh", "resume"] as const) {
+		for (const failurePoint of ["readiness", "command delivery"] as const) {
+			it(`closes its ${kind} pane once when ${failurePoint} fails`, async () => {
+				await withFixture(async ({ request, root, sessionDir }) => {
+					const pane = `pane-${kind}`;
+					const closed: string[] = [];
+					const sessionFile = join(root, "resumed.jsonl");
+					writeFileSync(sessionFile, "existing session\n");
+					if (kind === "resume") writePublicResumePolicy(sessionFile);
+					const launchRequest: FreshPiLaunchRequest | ResumePiLaunchRequest =
+						kind === "fresh"
+							? request
+							: {
+									kind: "resume",
+									id: "resume-failure",
+									name: "Resume worker",
+									sessionFile,
+									parent: { sessionId: "parent", sessionDir },
+								};
+					const expectedError = `${kind} ${failurePoint} failed`;
+					const operations: PiLaunchOperations = {
+						createPane: () => pane,
+						createWorktree: () => {
+							throw new Error("unexpected worktree creation");
+						},
+						waitForShellReady: async () => {
+							if (failurePoint === "readiness") throw new Error(expectedError);
+						},
+						runScript: (_surface, _command, options) => {
+							if (failurePoint === "command delivery")
+								throw new Error(expectedError);
+							return options.scriptPath;
+						},
+						closePane(surface) {
+							closed.push(surface);
+						},
+					};
+
+					await assert.rejects(
+						launchPiSubagent(launchRequest, operations),
+						new RegExp(expectedError),
+					);
+					assert.deepEqual(closed, [pane]);
+				});
+			});
+		}
+	}
+
+	it("closes an owned split child rather than its stable parent on launch failure", async () => {
+		await withFixture(async ({ request }) => {
+			const parentPane = "parent-pane";
+			const childPane = "split-child-pane";
+			const closed: string[] = [];
+			const operations: PiLaunchOperations = {
+				createPane: createSubagentPaneFactory(
+					{ mode: "split", direction: "down" },
+					() => {
+						throw new Error("must not create a tab");
+					},
+					(name, direction) => {
+						assert.equal(name, "Worker");
+						assert.equal(direction, "down");
+						return childPane;
+					},
+				),
+				createWorktree: () => {
+					throw new Error("unexpected worktree creation");
+				},
+				waitForShellReady: async () => {
+					throw new Error("split readiness failed");
+				},
+				runScript: () => {
+					throw new Error("must not run");
+				},
+				closePane(surface) {
+					closed.push(surface);
+				},
+			};
+
+			await assert.rejects(
+				launchPiSubagent(request, operations),
+				/split readiness failed/,
+			);
+			assert.deepEqual(closed, [childPane]);
+			assert.equal(closed.includes(parentPane), false);
+		});
+	});
+
+	it("closes its fresh pane when artifact preparation fails", async () => {
+		await withFixture(async ({ request, root }) => {
+			const blockedSessionDir = join(root, "blocked-session-dir");
+			writeFileSync(blockedSessionDir, "not a directory\n");
+			const closed: string[] = [];
+			const operations: PiLaunchOperations = {
+				createPane: () => "pane-artifact-failure",
+				createWorktree: () => {
+					throw new Error("unexpected worktree creation");
+				},
+				waitForShellReady: async () => {},
+				runScript: () => {
+					throw new Error("must not run");
+				},
+				closePane(surface) {
+					closed.push(surface);
+				},
+			};
+
+			await assert.rejects(
+				launchPiSubagent(
+					{
+						...request,
+						parent: { ...request.parent, sessionDir: blockedSessionDir },
+					},
+					operations,
+				),
+			);
+			assert.deepEqual(closed, ["pane-artifact-failure"]);
+		});
+	});
+
+	it("does not invent pane ownership when creation fails", async () => {
+		await withFixture(async ({ request }) => {
+			const closed: string[] = [];
+			const operations: PiLaunchOperations = {
+				createPane: () => {
+					throw new Error("pane creation failed");
+				},
+				createWorktree: () => {
+					throw new Error("unexpected worktree creation");
+				},
+				waitForShellReady: async () => {
+					throw new Error("must not wait");
+				},
+				runScript: () => {
+					throw new Error("must not run");
+				},
+				closePane(surface) {
+					closed.push(surface);
+				},
+			};
+
+			await assert.rejects(
+				launchPiSubagent(request, operations),
+				/pane creation failed/,
+			);
+			assert.deepEqual(closed, []);
+		});
+	});
+
+	it("preserves the launch error when ordinary pane cleanup fails", async () => {
+		await withFixture(async ({ request }) => {
+			let cleanupAttempts = 0;
+			const operations: PiLaunchOperations = {
+				createPane: () => "pane-cleanup-error",
+				createWorktree: () => {
+					throw new Error("unexpected worktree creation");
+				},
+				waitForShellReady: async () => {
+					throw new Error("original launch error");
+				},
+				runScript: () => {
+					throw new Error("must not run");
+				},
+				closePane: () => {
+					cleanupAttempts++;
+					throw new Error("cleanup error");
+				},
+			};
+
+			await assert.rejects(
+				launchPiSubagent(request, operations),
+				(error: Error) => error.message === "original launch error",
+			);
+			assert.equal(cleanupAttempts, 1);
+		});
+	});
+
+	it("does not close a caller-supplied surface when launch fails", async () => {
+		await withFixture(async ({ request }) => {
+			const closed: string[] = [];
+			const operations: PiLaunchOperations = {
+				createPane: () => {
+					throw new Error("must not create a pane");
+				},
+				createWorktree: () => {
+					throw new Error("unexpected worktree creation");
+				},
+				waitForShellReady: async () => {
+					throw new Error("supplied surface readiness failed");
+				},
+				runScript: () => {
+					throw new Error("must not run");
+				},
+				closePane(surface) {
+					closed.push(surface);
+				},
+			};
+
+			await assert.rejects(
+				launchPiSubagent({ ...request, surface: "caller-pane" }, operations),
+				/supplied surface readiness failed/,
+			);
+			assert.deepEqual(closed, []);
+		});
+	});
+
 	it("keeps untrusted launch metadata inside shell comments", async () => {
 		await withFixture(async ({ request, root, sessionDir }) => {
 			const preambles: string[] = [];
@@ -156,6 +386,7 @@ describe("Pi launch", () => {
 					preambles.push(options.scriptPreamble);
 					return options.scriptPath;
 				},
+				closePane: () => {},
 			};
 			const injectedName =
 				"Worker\nprintf fresh-injection\rprintf carriage-return\u2028printf line-separator\u2029printf paragraph-separator";
@@ -164,6 +395,7 @@ describe("Pi launch", () => {
 
 			const resumedSession = join(root, "resumed.jsonl");
 			writeFileSync(resumedSession, "existing session\n");
+			writePublicResumePolicy(resumedSession);
 			await launchPiSubagent(
 				{
 					kind: "resume",
@@ -207,6 +439,7 @@ describe("Pi launch", () => {
 						command = value;
 						return options.scriptPath;
 					},
+					closePane: () => {},
 				},
 			);
 
@@ -215,14 +448,60 @@ describe("Pi launch", () => {
 		});
 	});
 
+	it("keeps an autonomous multi-wave coordinator open for completion steers", async () => {
+		await withFixture(async ({ request }) => {
+			let command = "";
+			const running = await launchPiSubagent(
+				{
+					...request,
+					name: "Adversarial review",
+					agent: "adversarial-reviewer",
+					behavior: {
+						...request.behavior,
+						tools: "read,bash,grep,find,ls",
+						autoExit: false,
+						interactive: false,
+					},
+				},
+				{
+					createPane: () => "pane-coordinator",
+					createWorktree: () => {
+						throw new Error("unexpected worktree creation");
+					},
+					waitForShellReady: async () => {},
+					runScript: (_surface, value, options) => {
+						command = value;
+						return options.scriptPath;
+					},
+					closePane: () => {},
+				},
+			);
+
+			assert.equal(running.interactive, false);
+			assert.match(command, /PI_SUBAGENT_AUTO_EXIT=0/);
+			assert.match(
+				command,
+				/--tools 'read,bash,grep,find,ls,caller_ping,subagent_done'/,
+			);
+			const taskPath = command.match(/'@([^']+\.md)'/)?.[1];
+			assert.ok(taskPath, "expected artifact-backed coordinator task");
+			assert.match(
+				readFileSync(taskPath, "utf8"),
+				/call the subagent_done tool/i,
+			);
+		});
+	});
+
 	it("resumes a session through the launch transaction", async () => {
 		await withFixture(async ({ root, sessionDir }) => {
 			const sessionFile = join(root, "child.jsonl");
 			writeFileSync(sessionFile, "existing session\n");
+			writePublicResumePolicy(sessionFile);
 			const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 			process.env.PI_CODING_AGENT_DIR = join(root, "isolated-agent");
 			try {
 				const events: string[] = [];
+				const closed: string[] = [];
 				let command = "";
 				let scriptPath = "";
 				let scriptPreamble = "";
@@ -257,11 +536,15 @@ describe("Pi launch", () => {
 						scriptPreamble = options.scriptPreamble;
 						return options.scriptPath;
 					},
+					closePane(surface) {
+						closed.push(surface);
+					},
 				};
 
 				const running = await launchPiSubagent(request, operations);
 
 				assert.deepEqual(events, ["create", "ready", "run"]);
+				assert.deepEqual(closed, []);
 				assert.equal(running.id, "resume-1");
 				assert.equal(running.name, "Resume worker");
 				assert.equal(running.task, "Use the approved schema.");
@@ -277,7 +560,12 @@ describe("Pi launch", () => {
 						`^PI_CODING_AGENT_DIR='${process.env.PI_CODING_AGENT_DIR}' `,
 					),
 				);
-				assert.match(command, new RegExp(`pi --session '${sessionFile}' -e `));
+				assert.match(
+					command,
+					new RegExp(
+						`pi --session '${sessionFile}' --tools 'read,bash,caller_ping' -e `,
+					),
+				);
 				assert.match(command, /PI_SUBAGENT_NAME='Resume worker'/);
 				assert.match(
 					command,
@@ -286,6 +574,7 @@ describe("Pi launch", () => {
 				assert.match(command, /PI_SUBAGENT_ID='resume-1'/);
 				assert.match(command, /PI_SUBAGENT_ACTIVITY_FILE='/);
 				assert.match(command, /PI_SUBAGENT_AUTO_EXIT=1/);
+				assert.match(command, /PI_DENY_TOOLS='subagent,subagent_resume'/);
 				assert.doesNotMatch(command, /--model|--thinking|^cd /);
 				const messagePath = command.match(/'@([^']+\.md)'/)?.[1];
 				assert.ok(messagePath, "expected artifact-backed follow-up message");
@@ -313,6 +602,7 @@ describe("Pi launch", () => {
 		await withFixture(async ({ root, sessionDir }) => {
 			const sessionFile = join(root, "interactive.jsonl");
 			writeFileSync(sessionFile, "existing session\n");
+			writePublicResumePolicy(sessionFile);
 			const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
 			process.env.PI_SUBAGENT_AUTO_EXIT = "1";
 			try {
@@ -336,6 +626,7 @@ describe("Pi launch", () => {
 							command = value;
 							return options.scriptPath;
 						},
+						closePane: () => {},
 					},
 				);
 
@@ -420,6 +711,9 @@ describe("Pi launch", () => {
 					command = value;
 					return options.scriptPath;
 				},
+				closePane: () => {
+					throw new Error("must retain the worktree workspace");
+				},
 			};
 
 			const running = await launchPiSubagent(worktreeRequest, operations);
@@ -428,6 +722,10 @@ describe("Pi launch", () => {
 			assert.equal(running.worktree?.baseSha, baseSha);
 			assert.equal(running.worktree?.path, worktreePath);
 			assert.equal(running.worktree?.sessionFile, running.sessionFile);
+			assert.equal(
+				readSubagentSessionPolicy(running.sessionFile).owner,
+				"managed-worktree",
+			);
 			assert.match(command, new RegExp(`^cd '${worktreePath}' && `));
 			const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
 			assert.equal(manifest.state, "running");
@@ -539,6 +837,9 @@ describe("Pi launch", () => {
 					assert.equal(workspaceId, "workspace-handoff");
 					events.push("focus");
 				},
+				closePane: () => {
+					throw new Error("must retain the worktree workspace");
+				},
 			};
 
 			const result = await launchPiWorktreeHandoff(
@@ -626,6 +927,7 @@ describe("Pi launch", () => {
 					.join("\n") + "\n",
 			);
 			const worktreePath = join(root, "shell-timeout-tree");
+			const closed: string[] = [];
 			const manifestFile = join(
 				sessionDir,
 				"artifacts",
@@ -667,10 +969,14 @@ describe("Pi launch", () => {
 						focusWorkspace: () => {
 							throw new Error("must not focus");
 						},
+						closePane: (surface) => {
+							closed.push(surface);
+						},
 					},
 				),
 				/shell timeout/i,
 			);
+			assert.deepEqual(closed, []);
 			const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
 			assert.equal(manifest.state, "failed");
 			assert.equal(existsSync(manifest.sessionFile), true);
@@ -768,6 +1074,9 @@ describe("Pi launch", () => {
 						focusWorkspace: () => {
 							focused = true;
 						},
+						closePane: () => {
+							throw new Error("must retain the worktree workspace");
+						},
 					},
 				),
 				/worktree retained.*pi exited before startup/i,
@@ -860,6 +1169,9 @@ describe("Pi launch", () => {
 				},
 				focusWorkspace() {
 					throw new Error("focus must not run after launch failure");
+				},
+				closePane() {
+					throw new Error("must retain the worktree workspace");
 				},
 			};
 

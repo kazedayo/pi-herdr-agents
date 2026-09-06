@@ -164,7 +164,8 @@ export default function (pi: ExtensionAPI) {
 
 	let userTookOver = false;
 	let agentStarted = false;
-	let lastRunMessages: any[] | undefined;
+	let latestAgentMessages: any[] | undefined;
+	let completionFinalized = false;
 
 	// Re-read the live active set and re-render only when it changed.
 	// Extensions like pi-fff register/activate tools inside their own
@@ -205,55 +206,50 @@ export default function (pi: ExtensionAPI) {
 		recorder.agentStart();
 	});
 
-	// agent_end fires for every low-level run, but Pi may still auto-retry or
-	// auto-compact-and-retry after it. Exiting here would publish the .exit
-	// sidecar while the run is still recoverable: the parent watcher consumes
-	// it once, reports failure, and drops the subagent from its list, so the
-	// recovered retry would run untracked. Only capture the messages.
 	pi.on("agent_end", (event) => {
-		// SAFETY: agent_end events always carry the finished run's messages, but
-		// the ExtensionAPI event type does not declare them for this hook.
-		lastRunMessages = (event as { messages?: any[] }).messages;
-	});
-
-	// agent_settled fires only when no automatic retry, compaction, or queued
-	// continuation will run — the run is terminal and safe to hand to the parent.
-	pi.on("agent_settled", (_event, ctx) => {
-		if (!agentStarted) return;
-		const messages = lastRunMessages;
-		const shouldExit =
-			autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
-
-		if (shouldExit) {
-			// Surface stopReason: "error" turns (auto-retry exhausted, provider
-			// overload, etc.) to the parent via the .exit sidecar so the watcher
-			// can report a clear failure with the underlying error message.
-			// Without this the parent would only see exit code 0 and a stale
-			// assistant message, mistaking the crash for a successful completion.
-			const sessionFile = process.env.PI_SUBAGENT_SESSION;
-			if (sessionFile) {
-				try {
-					writeFileSync(
-						`${sessionFile}.exit`,
-						JSON.stringify(buildCompletionSidecar(messages)),
-					);
-				} catch {
-					// Best effort — the watcher can still detect the terminal sentinel
-					// after shutdown if the completion sidecar cannot be written.
-				}
-			}
-
-			recorder.agentEndDone();
-			ctx.shutdown();
-			return;
-		}
-
+		latestAgentMessages = event.messages;
 		recorder.agentEndWaiting();
 		if (autoExit) {
 			// Reset any recorded manual input marker. Auto-exit is decided by whether
 			// the latest agent turn completed normally, not by who initiated it.
 			userTookOver = false;
 		}
+	});
+
+	pi.on("agent_settled", (_event, ctx) => {
+		if (!autoExit || completionFinalized) return;
+
+		let messages = latestAgentMessages;
+		try {
+			const branchMessages = ctx.sessionManager
+				.getBranch()
+				.flatMap((entry) => (entry.type === "message" ? [entry.message] : []));
+			if (branchMessages.length > 0) messages = branchMessages;
+		} catch {
+			// Fall back to the latest low-level run when session evidence is unavailable.
+		}
+
+		if (!shouldAutoExitOnAgentEnd(userTookOver, messages)) return;
+		completionFinalized = true;
+
+		// Surface a settled stopReason: "error" to the parent via the .exit
+		// sidecar. Transient errors followed by retry or compaction never reach
+		// this point as the latest assistant message.
+		const sessionFile = process.env.PI_SUBAGENT_SESSION;
+		if (sessionFile) {
+			try {
+				writeFileSync(
+					`${sessionFile}.exit`,
+					JSON.stringify(buildCompletionSidecar(messages)),
+				);
+			} catch {
+				// Best effort — the watcher can still detect the terminal sentinel
+				// after shutdown if the completion sidecar cannot be written.
+			}
+		}
+
+		recorder.agentEndDone();
+		ctx.shutdown();
 	});
 
 	pi.on("turn_start", (event) => {
@@ -335,6 +331,7 @@ export default function (pi: ExtensionAPI) {
 				message: params.message,
 			};
 			writeFileSync(`${sessionFile}.exit`, JSON.stringify(exitData));
+			completionFinalized = true;
 
 			ctx.shutdown();
 			return {
@@ -365,6 +362,7 @@ export default function (pi: ExtensionAPI) {
 			if (sessionFile) {
 				writeFileSync(`${sessionFile}.exit`, JSON.stringify({ type: "done" }));
 			}
+			completionFinalized = true;
 			ctx.shutdown();
 			return {
 				content: [{ type: "text", text: "Shutting down subagent session." }],
