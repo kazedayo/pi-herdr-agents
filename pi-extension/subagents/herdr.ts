@@ -291,7 +291,24 @@ export function parseHerdrWorktreeList(output: string): HerdrWorktreeInfo[] {
 	});
 }
 
+function isInsideGitWorkTree(cwd: string): boolean {
+	try {
+		return (
+			execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "ignore"],
+			}).trim() === "true"
+		);
+	} catch {
+		return false;
+	}
+}
+
 export function listHerdrWorktrees(cwd?: string): HerdrWorktreeInfo[] {
+	const target = cwd ?? process.cwd();
+	// Ask git first. Herdr's worktree CLI writes not_git_worktree JSON into the
+	// originating pane's input even when the Node caller catches the failure.
+	if (!isInsideGitWorkTree(target)) return [];
 	const args = ["worktree", "list"];
 	if (cwd) args.push("--cwd", cwd);
 	return parseHerdrWorktreeList(herdrExec(args));
@@ -340,6 +357,11 @@ export function createHerdrWorktree(
 	branch: string,
 	base: string,
 ): HerdrWorktreeSurface {
+	if (!isInsideGitWorkTree(cwd)) {
+		throw new Error(
+			`Cannot create a Herdr worktree: ${cwd} is not inside a Git work tree`,
+		);
+	}
 	const output = herdrExec(buildWorktreeCreateArgs(name, cwd, branch, base));
 	try {
 		return extractHerdrWorktree(output);
@@ -761,4 +783,5 @@ export const __herdrTest__ = {
 	parsePaneProcessInfo,
 	isHerdrShellReady,
 	isExpectedPiProcess,
+	isInsideGitWorkTree,
 };

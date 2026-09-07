@@ -47,6 +47,7 @@ import {
 
 import {
 	isHerdrAvailable,
+	listHerdrWorktrees,
 	waitForProcessesExit,
 	__herdrTest__,
 } from "../pi-extension/subagents/herdr.ts";
@@ -6344,6 +6345,16 @@ describe("herdr.ts", () => {
 		it("returns boolean based on HERDR_ENV", () => {
 			const result = isHerdrAvailable();
 			assert.ok(result === true || result === false);
+		});
+	});
+
+	describe("git work tree guard", () => {
+		it("does not treat a non-git path as a work tree", () => {
+			assert.equal(__herdrTest__.isInsideGitWorkTree(tmpdir()), false);
+		});
+
+		it("skips herdr worktree list outside a git work tree", () => {
+			assert.deepEqual(listHerdrWorktrees(tmpdir()), []);
 		});
 	});
 
