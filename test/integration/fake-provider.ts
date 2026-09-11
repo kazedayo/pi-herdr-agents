@@ -4,8 +4,7 @@ import {
 	type ServerResponse,
 } from "node:http";
 import { once } from "node:events";
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync } from "node:fs";
 import {
 	isPlainObject,
 	isString,
@@ -35,6 +34,8 @@ interface ToolCallArguments {
 	message?: string;
 	autoExit?: boolean;
 	action?: string;
+	id?: string;
+	persistent?: boolean;
 	runId?: string;
 	path?: string;
 	command?: string;
@@ -62,6 +63,16 @@ export interface ProviderRequest {
 
 const providerRequests: ProviderRequest[] = [];
 const resumeRestrictionStates = new Map<string, "launched" | "resumed">();
+const persistentSpecialistStates = new Map<
+	string,
+	{
+		busySent: boolean;
+		listSent: boolean;
+		taskTwoSent: boolean;
+		stopSent: boolean;
+		finalListSent: boolean;
+	}
+>();
 
 export function getProviderRequests(): readonly ProviderRequest[] {
 	return providerRequests;
@@ -70,6 +81,7 @@ export function getProviderRequests(): readonly ProviderRequest[] {
 export function resetProviderRequests(): void {
 	providerRequests.length = 0;
 	resumeRestrictionStates.clear();
+	persistentSpecialistStates.clear();
 }
 
 async function readJson(request: IncomingMessage): Promise<ChatRequest> {
@@ -140,9 +152,142 @@ function subagentCalls(source: string): ToolCall[] {
 		if (cwd) args.cwd = cwd;
 		if (systemPrompt) args.systemPrompt = systemPrompt;
 		if (section.includes("fork: true")) args.fork = true;
+		if (section.includes("persistent: true")) args.persistent = true;
 		if (branch) args.worktree = { branch };
 		return [{ name: "subagent", arguments: args }];
 	});
+}
+
+function subagentSendCall(name: string, message: string): ToolCall {
+	return {
+		name: "subagent_send",
+		arguments: { name, message },
+	};
+}
+
+function subagentStopCall(name: string): ToolCall {
+	return { name: "subagent_stop", arguments: { name } };
+}
+
+async function persistentSpecialistResponse(
+	request: ChatRequest,
+): Promise<ResponsePlan | null> {
+	const names = toolNames(request);
+	const source = requestText(request);
+	const user = lastUserText(request);
+	const match = source.match(
+		/INTEGRATION_PERSISTENT_SPECIALIST:([A-Za-z0-9_-]+)/,
+	);
+	const childMatch = source.match(/PERSISTENT_TASK_[12]_([A-Za-z0-9_-]+)/);
+	if (!match && !childMatch) return null;
+	const id = match?.[1] ?? childMatch?.[1];
+	if (!id) return null;
+	const specialistName = `Persistent-${id}`;
+	const taskOne = `PERSISTENT_TASK_1_${id}`;
+	const taskTwo = `PERSISTENT_TASK_2_${id}`;
+
+	// The child is deliberately multi-turn: task 1 performs a visible delay,
+	// then both task completions are ordinary assistant turns with no
+	// subagent_done call. The inbox poller supplies task 2 later.
+	if (!names.has("subagent") && names.has("bash")) {
+		if (user.includes(taskOne) && request.messages?.at(-1)?.role !== "tool") {
+			const marker = user.match(/PERSISTENT_START_FILE:\s*(\S+)/)?.[1];
+			if (marker) {
+				return {
+					toolCalls: [
+						{
+							name: "bash",
+							arguments: {
+								command: `echo 'PERSISTENT_START_${id}' > '${marker}'; sleep 5; echo 'PERSISTENT_DONE_${id}' >> '${marker}'`,
+							},
+						},
+					],
+				};
+			}
+		}
+		if (user.includes(taskOne) && request.messages?.at(-1)?.role === "tool") {
+			return { text: `PERSISTENT_TASK_1_RESULT_${id}` };
+		}
+		if (user.includes(taskTwo)) {
+			return { text: `PERSISTENT_TASK_2_RESULT_${id}` };
+		}
+	}
+
+	if (!names.has("subagent")) return null;
+	const state = persistentSpecialistStates.get(id) ?? {
+		busySent: false,
+		listSent: false,
+		taskTwoSent: false,
+		stopSent: false,
+		finalListSent: false,
+	};
+	persistentSpecialistStates.set(id, state);
+	const launched = source.includes(
+		`Sub-agent "${specialistName}" launched and is now running in the background`,
+	);
+	if (!launched) {
+		return {
+			toolCalls: [
+				{
+					name: "subagent",
+					arguments: {
+						name: specialistName,
+						agent: "test-echo",
+						persistent: true,
+						task: `${taskOne} PERSISTENT_START_FILE: ${source.match(/PERSISTENT_START_FILE:\s*(\S+)/)?.[1] ?? ""}`,
+					},
+				},
+			],
+		};
+	}
+	if (!state.busySent) {
+		state.busySent = true;
+		return {
+			toolCalls: [
+				subagentSendCall(
+					specialistName,
+					`REJECTED_TASK_${id} must never execute`,
+				),
+			],
+		};
+	}
+	if (!state.listSent && /1 tasks completed/.test(source)) {
+		state.listSent = true;
+		return { toolCalls: [{ name: "subagents_list", arguments: {} }] };
+	}
+	if (
+		state.listSent &&
+		!state.taskTwoSent &&
+		/1 tasks completed/.test(source)
+	) {
+		state.taskTwoSent = true;
+		// Allow the extension's one-second lifecycle poll to observe idle before
+		// the parent attempts the follow-up dispatch.
+		await new Promise((resolve) => setTimeout(resolve, 2_000));
+		return {
+			toolCalls: [
+				subagentSendCall(
+					specialistName,
+					`${taskTwo} execute the follow-up task`,
+				),
+			],
+		};
+	}
+	if (!state.stopSent && /2 tasks completed/.test(source)) {
+		state.stopSent = true;
+		return { toolCalls: [subagentStopCall(specialistName)] };
+	}
+	if (
+		state.stopSent &&
+		!state.finalListSent &&
+		source.includes("Persistent specialist stopped.")
+	) {
+		state.finalListSent = true;
+		return { toolCalls: [{ name: "subagents_list", arguments: {} }] };
+	}
+	if (state.finalListSent)
+		return { text: `PERSISTENT_LIFECYCLE_COMPLETE_${id}` };
+	return { text: `WAITING_FOR_PERSISTENT_SPECIALIST_${id}` };
 }
 
 function subagentResumeCall(source: string): ToolCall | null {
@@ -333,6 +478,9 @@ async function planResponse(request: ChatRequest): Promise<ResponsePlan> {
 	const resumeRestriction = resumeRestrictionResponse(request);
 	if (resumeRestriction) return resumeRestriction;
 
+	const persistentSpecialist = await persistentSpecialistResponse(request);
+	if (persistentSpecialist) return persistentSpecialist;
+
 	const multiWave = multiWaveCoordinatorResponse(request);
 	if (multiWave) return multiWave;
 
@@ -356,84 +504,9 @@ async function planResponse(request: ChatRequest): Promise<ResponsePlan> {
 		};
 	}
 
-	const workflowPrompt =
-		names.has("herdr_workflow") &&
-		/herdr_workflow|prepare this workflow|start with this run ID|cancel(?: with)? this run ID/i.test(
-			source,
-		);
-
 	await waitForIntegrationGate(source);
 
-	if (lastRole === "tool") {
-		if (workflowPrompt) {
-			const runId =
-				source.match(
-					/(?:start with this run ID|cancel(?: with)? this run ID):\s*([\w-]+)/i,
-				)?.[1] ?? source.match(/run ID:\s*([\w-]+)/i)?.[1];
-			const toolText = (request.messages ?? [])
-				.filter((message) => message.role === "tool")
-				.map((message) => messageText(message.content))
-				.join("\n");
-			const started = /started in the background/i.test(toolText);
-			const cancelled = /cancelled\.|ended as /i.test(toolText);
-			if (
-				started &&
-				!cancelled &&
-				runId &&
-				/cancel(?: with)? this run ID/i.test(source)
-			) {
-				// Wait for observed journal evidence that a reviewer started so cancel
-				// claims the gate after at least one active child, not after a fixed sleep.
-				const journalPath =
-					source.match(/journal path:\s*([^\s]+)/i)?.[1] ??
-					join(process.cwd(), ".pi", "plans", runId, "run.jsonl");
-				const deadline = Date.now() + 30_000;
-				while (Date.now() < deadline) {
-					if (existsSync(journalPath)) {
-						const body = readFileSync(journalPath, "utf8");
-						if (body.includes('"type":"agent_started"')) break;
-					}
-					await new Promise((resolve) => setTimeout(resolve, 50));
-				}
-				return {
-					toolCalls: [
-						{ name: "herdr_workflow", arguments: { action: "cancel", runId } },
-					],
-				};
-			}
-			return {
-				text:
-					/\bAPPROVE\s+[a-f0-9]{8}\b/i.test(user) || cancelled
-						? "WORKFLOW_PARENT_COMPLETE"
-						: // Keep runId on the final assistant line so viewport waits still match
-							// after a long approval packet scrolls the tool result off-screen.
-							runId
-							? `Prepared workflow ${runId}`
-							: "Prepared workflow",
-			};
-		}
-		return { text: "completed" };
-	}
-
-	if (workflowPrompt) {
-		if (/\bAPPROVE\s+[a-f0-9]{8}\b/i.test(user)) {
-			const runId = source.match(/start with this run ID:\s*([\w-]+)/i)?.[1];
-			if (runId)
-				return {
-					toolCalls: [
-						{ name: "herdr_workflow", arguments: { action: "start", runId } },
-					],
-				};
-		}
-		const path = source.match(/prepare this workflow:\s*([^\s]+)/i)?.[1];
-		if (path)
-			return {
-				toolCalls: [
-					{ name: "herdr_workflow", arguments: { action: "prepare", path } },
-				],
-			};
-		return { text: "WORKFLOW_PARENT_COMPLETE" };
-	}
+	if (lastRole === "tool") return { text: "completed" };
 
 	if (
 		names.has("subagent_resume") &&

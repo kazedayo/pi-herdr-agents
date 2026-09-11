@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import {
 	closeHerdrSurface,
 	createHerdrSurface,
+	createHerdrGroupedSurface,
 	createHerdrSurfaceSplit,
 	createHerdrWorktree,
 	focusHerdrWorkspace,
@@ -15,6 +16,7 @@ import {
 	readHerdrScreen,
 	readHerdrScreenAsync,
 	inspectHerdrPane,
+	listHerdrPanes,
 	renameHerdrTab,
 	renameHerdrWorkspace,
 	sendHerdrCommand,
@@ -48,9 +50,20 @@ export function shellQuote(value: string): string {
 }
 
 /** Create a new herdr tab and return its root pane ID. */
-export function createSubagentPane(name: string, workspaceId?: string): PaneId {
+export function createSubagentPane(name: string, cwd?: string): PaneId {
 	assertTerminalAvailable();
-	return createHerdrSurface(name, workspaceId);
+	return createHerdrSurface(name, cwd);
+}
+
+/** Place a child in an owned Agents tab in the target checkout's workspace. */
+export function createGroupedSubagentPane(
+	name: string,
+	cwd: string,
+	maxPerTab: number,
+	direction: SplitDirection,
+): PaneId {
+	assertTerminalAvailable();
+	return createHerdrGroupedSurface(name, cwd, maxPerTab, direction);
 }
 
 /** Create a Git worktree in its own herdr workspace and return its root surface. */
@@ -68,9 +81,10 @@ export function createSubagentWorktree(
 export function splitCurrentPane(
 	name: string,
 	direction: SplitDirection,
+	cwd?: string,
 ): PaneId {
 	assertTerminalAvailable();
-	return createHerdrSurfaceSplit(name, direction);
+	return createHerdrSurfaceSplit(name, direction, cwd);
 }
 
 export function renameCurrentTab(title: string): void {
@@ -136,6 +150,13 @@ export async function readPaneAsync(
 }
 
 export type { PaneInspection, HerdrAgentStatus } from "./lifecycle.ts";
+
+export async function listPanes(): Promise<
+	import("./herdr.ts").HerdrPaneListEntry[] | null
+> {
+	assertTerminalAvailable();
+	return listHerdrPanes();
+}
 
 export async function inspectPane(
 	paneId: PaneId,

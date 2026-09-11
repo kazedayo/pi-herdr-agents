@@ -7,16 +7,17 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { getSubagentActivityFile } from "./activity.ts";
-import { getAgentConfigDir } from "./config-paths.ts";
 import { createLifecycle, type SubagentLifecycle } from "./lifecycle.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 import { createSubagentPaneFactory, loadPaneConfig } from "./pane-config.ts";
 import { HerdrWorktreeCreateError } from "./herdr.ts";
-import type { JsonObject } from "./type-guards.ts";
+import { isNonEmptyString, type JsonObject } from "./type-guards.ts";
 import {
 	createWorktreeSessionFork,
+	getNewEntries,
 	readSubagentSessionPolicy,
 	seedSubagentSessionFile,
 	writeSubagentSessionPolicy,
@@ -24,6 +25,7 @@ import {
 import {
 	closePane,
 	createSubagentPane,
+	createGroupedSubagentPane,
 	createSubagentWorktree,
 	splitCurrentPane,
 	runScriptInPane,
@@ -86,7 +88,6 @@ export interface FreshPiLaunchRequest {
 	fork?: boolean;
 	handoff?: { leafId: string };
 	surface?: string;
-	workspace?: string;
 	parent: {
 		cwd: string;
 		invocationCwd?: string;
@@ -102,6 +103,10 @@ export interface FreshPiLaunchRequest {
 		deniedTools: readonly string[];
 		autoExit: boolean;
 		interactive: boolean;
+		persistent?: boolean;
+		logicalId?: string;
+		generationId?: string;
+		taskId?: string;
 		identity?: string;
 		systemPromptMode?: "append" | "replace";
 		sessionMode: SubagentSessionMode;
@@ -115,7 +120,6 @@ export interface ResumePiLaunchRequest {
 	name: string;
 	sessionFile: string;
 	message?: string;
-	workspace?: string;
 	parent: {
 		sessionId: string;
 		sessionDir: string;
@@ -142,10 +146,23 @@ export interface PiRunningChild {
 	runtimePlan: ResolvedRuntimePlan | undefined;
 	worktree?: WorktreeLaunch;
 	lifecycle: SubagentLifecycle;
+	persistent?: boolean;
+	logicalId?: string;
+	generationId?: string;
+	policyHash?: string;
+	policyTools?: string[] | null;
+	policyDeniedTools?: string[];
+	tasksCompleted?: number;
+	taskId?: string;
+	inboxSequence?: number;
+	observedTaskEvents?: number;
+	stopState?: "requested" | "pending" | "failed";
+	stopFailure?: string;
+	crashNotified?: boolean;
 }
 
 export interface PiLaunchOperations {
-	createPane(name: string, workspaceId?: string): string;
+	createPane(name: string, cwd?: string): string;
 	createWorktree(
 		name: string,
 		cwd: string,
@@ -174,6 +191,7 @@ const defaultOperations: PiLaunchOperations = {
 		paneConfig,
 		createSubagentPane,
 		splitCurrentPane,
+		createGroupedSubagentPane,
 	),
 	createWorktree: createSubagentWorktree,
 	waitForShellReady,
@@ -317,7 +335,10 @@ async function launchFreshPiSubagent(
 
 function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
 	const id = request.id ?? Math.random().toString(16).slice(2, 10);
-	const agentDir = request.parent.agentDir ?? getAgentConfigDir();
+	const agentDir =
+		request.parent.agentDir ??
+		process.env.PI_CODING_AGENT_DIR ??
+		join(homedir(), ".pi", "agent");
 	const rawCwd = request.cwd ?? request.behavior.cwd;
 	const cwdBase =
 		request.cwd == null && request.behavior.cwd != null
@@ -357,7 +378,7 @@ function prepareLaunchSurface(
 		return {
 			surface:
 				request.surface ??
-				operations.createPane(request.name, request.workspace),
+				operations.createPane(request.name, resolved.sourceCwd),
 			targetCwd: resolved.sourceCwd,
 			effectiveAgentDir: resolved.localAgentDir ?? resolved.agentDir,
 			localAgentDir: resolved.localAgentDir,
@@ -459,6 +480,17 @@ function prepareChildSession(
 		owner: surface.worktree ? "managed-worktree" : "public",
 		tools: resolved.request.behavior.tools,
 		deniedTools: resolved.request.behavior.deniedTools,
+		persistent: resolved.request.behavior.persistent,
+		logicalId: resolved.request.behavior.logicalId ?? resolved.id,
+		generationId: resolved.request.behavior.generationId,
+		worktree: surface.worktree
+			? {
+					path: surface.worktree.path,
+					workspaceId: surface.worktree.workspaceId,
+					branch: surface.worktree.branch,
+					baseSha: surface.worktree.baseSha,
+				}
+			: undefined,
 	});
 	const activityFile = getSubagentActivityFile(
 		resolved.artifactDir,
@@ -628,6 +660,15 @@ function buildPiCommand(
 		if (request.agent)
 			env.push(`PI_SUBAGENT_AGENT=${shellQuote(request.agent)}`);
 		env.push(`PI_SUBAGENT_AUTO_EXIT=${request.behavior.autoExit ? "1" : "0"}`);
+		if (request.behavior.persistent) {
+			env.push("PI_SUBAGENT_PERSISTENT=1");
+			env.push(
+				`PI_SUBAGENT_GENERATION_ID=${shellQuote(request.behavior.generationId ?? "")}`,
+			);
+			env.push(
+				`PI_SUBAGENT_TASK_ID=${shellQuote(request.behavior.taskId ?? "")}`,
+			);
+		}
 		env.push(`PI_SUBAGENT_SESSION=${shellQuote(artifacts.sessionFile)}`);
 		env.push(`PI_SUBAGENT_ID=${shellQuote(resolved.id)}`);
 		env.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(artifacts.activityFile)}`);
@@ -698,7 +739,12 @@ async function launchResumedPiSubagent(
 	if (policy.owner !== "public") {
 		throw new Error(
 			`Cannot resume ${policy.owner} session through subagent_resume. ` +
-				"Use its retained workspace or workflow evidence instead.",
+				"Use its retained managed-worktree workspace instead.",
+		);
+	}
+	if (policy.persistent) {
+		throw new Error(
+			`Cannot resume persistent specialist ${request.sessionFile}. Spawn a new specialist instead; persistent sessions retain their evidence but do not revive in v1.`,
 		);
 	}
 	const autoExit = request.behavior?.autoExit ?? true;
@@ -709,7 +755,11 @@ async function launchResumedPiSubagent(
 		"artifacts",
 		request.parent.sessionId,
 	);
-	const surface = operations.createPane(request.name, request.workspace);
+	const header = getNewEntries(request.sessionFile, 0).find(
+		(entry) => entry.type === "session",
+	);
+	const cwd = isNonEmptyString(header?.cwd) ? header.cwd : process.cwd();
+	const surface = operations.createPane(request.name, cwd);
 	try {
 		await operations.waitForShellReady(surface);
 		const activityFile = getSubagentActivityFile(artifactDir, id);

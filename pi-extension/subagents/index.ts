@@ -15,16 +15,14 @@ import {
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { getAgentConfigDir } from "./config-paths.ts";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
 import {
 	readdirSync,
 	readFileSync,
-	realpathSync,
 	existsSync,
-	mkdirSync,
 	rmSync,
 	statSync,
 } from "node:fs";
+import { randomUUID } from "node:crypto";
 import {
 	isTerminalAvailable,
 	terminalSetupHint,
@@ -35,12 +33,15 @@ import {
 	shellQuote,
 	readPaneAsync,
 	inspectPane,
-	getPaneProcessInfo,
+	listPanes,
 	waitForShellReady,
-	waitForPaneAbsence,
-	waitForProcessesExit,
 } from "./terminal.ts";
 import { waitForCompletion } from "./completion.ts";
+import {
+	SupervisionCoordinator,
+	type SupervisionRegistration,
+} from "./supervision.ts";
+import { loadSupervisionConfig } from "./supervision-config.ts";
 import {
 	buildAuthenticatedModelCatalog,
 	resolveRuntimePlan,
@@ -54,36 +55,22 @@ import {
 import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
 import { loadRoleConfig, type RoleConfig } from "./role-config.ts";
 import {
-	beginWorkflowCancellation,
-	cancelTerminationResult,
-	claimWorkflowTerminal,
-	createWorkflowJournal,
-	createWorkflowReaderCheckout,
-	createWorkflowTerminalGate,
-	disposeWorkflowReaderCheckout,
-	executeWorkflow,
-	formatApprovalPacket,
-	prepareWorkflow,
-	recoverWorkflowStartup,
-	sameWorkflowCandidate,
-	validateWorkflowApproval,
-	type CancelTerminationResult,
-	type PendingWorkflow,
-	type WorkflowReaderCheckout,
-	type WorkflowRole,
-	type WorkflowRolePolicy,
-	type WorkflowTerminalGate,
-	type WorkflowTerminalOutcome,
-	type WorkflowTerminalState,
-} from "./workflow.ts";
-
+	loadPersistentConfig,
+	type PersistentConfig,
+} from "./persistent-config.ts";
 import {
+	appendPersistentDeliveryLedger,
 	findLastAssistantMessage,
-	inspectFinalAssistantMessage,
 	findObservedSessionRuntime,
+	inspectNoProgressSessionTail,
+	type NoProgressClassification,
+	type NoProgressSessionTail,
 	getNewEntries,
 	createBtwSessionSnapshot,
-	writeSubagentSessionPolicy,
+	readPersistentDeliveryLedger,
+	readPersistentTaskEvents,
+	readSubagentSessionPolicy,
+	writePersistentTaskInbox,
 } from "./session.ts";
 import {
 	type SubagentStatusState,
@@ -99,13 +86,7 @@ import {
 	type ActivityReadResult,
 	type SubagentActivityState,
 } from "./activity.ts";
-import {
-	isFiniteNumber,
-	isPlainObject,
-	isString,
-	type JsonObject,
-	type JsonValue,
-} from "./type-guards.ts";
+import { isFiniteNumber, isPlainObject, isString } from "./type-guards.ts";
 import {
 	createLifecycle,
 	formatLifecycleTransitionLine,
@@ -279,16 +260,16 @@ const SubagentParams = Type.Object({
 			),
 		}),
 	),
-	workspace: Type.Optional(
-		Type.String({
-			description:
-				"Herdr workspace ID to open the subagent's tab in (e.g. a retained worktree's workspace, from a prior worktree handoff or `herdr worktree list`). Defaults to the current space. Cannot be combined with worktree.",
-		}),
-	),
 	fork: Type.Optional(
 		Type.Boolean({
 			description:
 				"Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+		}),
+	),
+	persistent: Type.Optional(
+		Type.Boolean({
+			description:
+				"Keep this stable specialist session alive between turn-based tasks. Persistent agents accept follow-up work only through subagent_send.",
 		}),
 	),
 	interactive: Type.Optional(
@@ -308,6 +289,7 @@ interface AgentDefaults {
 	thinking?: ThinkingLevel;
 	denyTools?: string;
 	spawning?: boolean;
+	persistent?: boolean;
 	autoExit?: boolean;
 	interactive?: boolean;
 	systemPromptMode?: "append" | "replace";
@@ -353,6 +335,8 @@ const SPAWNING_TOOLS = new Set([
 	"subagent_interrupt",
 	"subagents_list",
 	"subagent_resume",
+	"subagent_send",
+	"subagent_stop",
 ]);
 
 /**
@@ -408,7 +392,7 @@ interface CapabilityDeclarations {
 
 function isCapabilityDeclaration(
 	line: string,
-	field: "tools" | "deny-tools" | "spawning",
+	field: "tools" | "deny-tools" | "spawning" | "persistent",
 ): boolean {
 	const trimmed = line.trimStart();
 	const colon = trimmed.indexOf(":");
@@ -419,7 +403,7 @@ function isCapabilityDeclaration(
 
 function getCapabilityDeclarations(
 	frontmatter: string,
-	field: "tools" | "deny-tools" | "spawning",
+	field: "tools" | "deny-tools" | "spawning" | "persistent",
 ): CapabilityDeclarations {
 	const canonicalPrefix = `${field}:`;
 	const lines = frontmatter.split("\n");
@@ -436,7 +420,12 @@ function getCapabilityDeclarations(
 function validateCapabilityDeclarations(
 	frontmatter: string,
 ): string | undefined {
-	for (const field of ["tools", "deny-tools", "spawning"] as const) {
+	for (const field of [
+		"tools",
+		"deny-tools",
+		"spawning",
+		"persistent",
+	] as const) {
 		const declarations = getCapabilityDeclarations(frontmatter, field);
 		if (declarations.hasNoncanonical) {
 			return `${field} must use an unquoted, unindented key written exactly as ${field}:`;
@@ -447,9 +436,9 @@ function validateCapabilityDeclarations(
 		if (declarations.canonical.length === 0) continue;
 
 		const value = declarations.canonical[0].slice(`${field}:`.length).trim();
-		if (field === "spawning") {
+		if (field === "spawning" || field === "persistent") {
 			if (value !== "true" && value !== "false") {
-				return "spawning must be true or false.";
+				return `${field} must be true or false.`;
 			}
 			continue;
 		}
@@ -514,6 +503,9 @@ function parseAgentDefinition(
 		denyTools: getFrontmatterValue(frontmatter, "deny-tools"),
 		spawning: parseOptionalBoolean(
 			getFrontmatterValue(frontmatter, "spawning"),
+		),
+		persistent: parseOptionalBoolean(
+			getFrontmatterValue(frontmatter, "persistent"),
 		),
 		autoExit: parseOptionalBoolean(
 			getFrontmatterValue(frontmatter, "auto-exit"),
@@ -832,26 +824,6 @@ function discoverAgentDefinitions(
 	return discoverAgentCatalog(pi).agents;
 }
 
-function workflowRoles(catalog: AgentCatalog): WorkflowRole[] {
-	return catalog.agents.map((agent) => ({
-		name: agent.name,
-		source: agent.source,
-		path: agent.path,
-		body: agent.body,
-		model: agent.model,
-		thinking: agent.thinking,
-		tools: agent.tools,
-		skills: agent.skills,
-		denyTools: agent.denyTools,
-		spawning: agent.spawning,
-		autoExit: agent.autoExit,
-		interactive: agent.interactive,
-		sessionMode: agent.sessionMode,
-		cwd: agent.cwd,
-		disableModelInvocation: agent.disableModelInvocation,
-	}));
-}
-
 function formatAgentSource(agent: ListedAgentDefinition): string {
 	return agent.source === "package" && agent.provider
 		? `package:${agent.provider}`
@@ -869,6 +841,30 @@ function formatVisibleAgentDefinitions(
 			const model = agent.model ? ` [${agent.model}]` : "";
 			return `• ${agent.name}${badge}${model}${desc}`;
 		});
+}
+
+function formatLivePersistentSpecialists(): string[] {
+	const specialists = Array.from(runningSubagents.values()).filter(
+		(running) => running.persistent,
+	);
+	if (specialists.length === 0) return [];
+	return [
+		"Live persistent specialists:",
+		...specialists.map((running) => {
+			const allowlist = running.policyTools?.join(",") ?? "unrestricted";
+			return `• ${running.name} | ${running.logicalId} | ${running.generationId} | ${running.agent ?? "bare"} | ${persistentSpecialistState(running)} | ${running.tasksCompleted ?? 0} completed | tools: ${allowlist}; denied: ${running.policyDeniedTools?.join(",") || "none"}; persistent: true`;
+		}),
+	];
+}
+
+function formatSupervisionDiagnostics(): string[] {
+	const diagnostics = runtime.supervision?.diagnostics() ?? {
+		mode: supervisionConfig.forcePolling ? "polling(forced)" : "wake+batch",
+		watcherCount: 0,
+	};
+	return [
+		`Supervision: ${diagnostics.mode}; ${diagnostics.watcherCount} watcher${diagnostics.watcherCount === 1 ? "" : "s"}`,
+	];
 }
 
 function formatAgentDiagnostics(diagnostics: AgentDiagnostic[]): string[] {
@@ -920,10 +916,18 @@ function resolveLaunchBehavior(
  * typical for `/iterate` with `fork: true`), `autoExit` is undefined and the
  * subagent is treated as interactive — matching the intent of iterate.
  */
+function resolveEffectivePersistent(
+	params: Static<typeof SubagentParams>,
+	agentDefs: AgentDefaults | null,
+): boolean {
+	return params.persistent ?? agentDefs?.persistent ?? false;
+}
+
 function resolveEffectiveAutoExit(
 	params: Static<typeof SubagentParams>,
 	agentDefs: AgentDefaults | null,
 ): boolean {
+	if (resolveEffectivePersistent(params, agentDefs)) return false;
 	// Named agents preserve their declared behavior. Bare tool calls are
 	// autonomous by default, including full-context forks: `fork` controls
 	// context inheritance, not whether the child should remain open. Interactive
@@ -937,6 +941,7 @@ function resolveEffectiveInteractive(
 	agentDefs: AgentDefaults | null,
 ): boolean {
 	if (params.interactive != null) return params.interactive;
+	if (resolveEffectivePersistent(params, agentDefs)) return false;
 	if (agentDefs?.interactive != null) return agentDefs.interactive;
 	return !resolveEffectiveAutoExit(params, agentDefs);
 }
@@ -1003,39 +1008,6 @@ const BUNDLED_WORKTREE_WARNINGS = {
 		"Herdr worktree workspaces persist until explicitly removed.",
 } satisfies Readonly<Record<string, string>>;
 
-// Spawns whose cwd sits inside a retained herdr worktree open in that
-// worktree's space, so callers don't have to pass `workspace` explicitly.
-function autoWorktreeWorkspace(
-	cwd: string,
-	hasWorktree: boolean,
-): string | undefined {
-	if (hasWorktree) return undefined;
-	try {
-		return listHerdrWorktrees(cwd)
-			.filter(
-				(w) =>
-					w.isLinkedWorktree &&
-					w.workspaceId &&
-					(cwd === w.path || cwd.startsWith(w.path + "/")),
-			)
-			.sort((a, b) => b.path.length - a.path.length)[0]?.workspaceId;
-	} catch {
-		return undefined;
-	}
-}
-
-// cwd recorded on the first line of a pi session file, for workspace routing.
-function sessionFileCwd(sessionPath: string): string | undefined {
-	try {
-		const line = readFileSync(sessionPath, "utf8").split("\n", 1)[0];
-		const parsed: unknown = JSON.parse(line);
-		const cwd = isPlainObject(parsed) ? parsed.cwd : undefined;
-		return isString(cwd) && cwd.startsWith("/") ? cwd : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
 function resolveWorktreeLaunchWarning(
 	params: Pick<Static<typeof SubagentParams>, "agent" | "worktree">,
 	pi?: Pick<ExtensionAPI, "events">,
@@ -1051,10 +1023,9 @@ function resolveWorktreeLaunchWarning(
 		: undefined;
 }
 
-function finalizeSubagentSurface(
+function finalizeSubagentWorktree(
 	running: RunningSubagent,
 	state: "ready_for_review" | "failed" | "needs_help",
-	ignoreCloseError = false,
 ): WorktreeHandoff | undefined {
 	if (running.worktree) {
 		let handoff = captureWorktreeHandoff(running.worktree);
@@ -1074,17 +1045,24 @@ function finalizeSubagentSurface(
 		return handoff;
 	}
 
-	try {
-		closePane(running.surface);
-	} catch (error) {
-		if (!ignoreCloseError) throw error;
-	}
 	return undefined;
+}
+
+function closeCompletedPanes(panes: Iterable<string>): void {
+	for (const pane of panes) {
+		try {
+			closePane(pane);
+		} catch {
+			/* Result delivery remains authoritative. */
+		}
+	}
 }
 
 const statusConfig = loadStatusConfig();
 const modelConfig = loadModelConfig();
 const bundledRoleConfig = loadRoleConfig();
+const persistentConfig = loadPersistentConfig();
+const supervisionConfig = loadSupervisionConfig();
 
 const MAX_RESULT_PRESENTATION_CHARS = 16_000;
 const MAX_SESSION_REFERENCE_CHARS = 10_000;
@@ -1159,32 +1137,15 @@ interface SubagentResultDetails {
 	exitCode?: number;
 	elapsed?: number;
 	sessionFile?: string;
+	logicalId?: string;
+	generationId?: string;
+	policyHash?: string;
 	error?: string;
 	errorMessage?: string;
 	fallbackAttempts?: string[];
 	fallbackFailures?: ModelFailure[];
 	worktree?: WorktreeHandoff;
 	runtimePlan?: ResolvedRuntimePlan;
-}
-
-interface WorkflowAgentCompletedDetails extends JsonObject {
-	id: string;
-	node: string;
-	role: string;
-	sessionFile: string;
-	sessionExists: boolean;
-	exitCode: number;
-	finalAssistantContentLength: number;
-	errorMessage?: string;
-	finalAssistantStopReason?: string;
-}
-
-interface WorkflowResultEnvelope extends JsonObject {
-	runId: string;
-	state: WorkflowTerminalState;
-	result?: JsonValue;
-	error?: { code: string; message: string };
-	checkout?: JsonObject;
 }
 
 interface SubagentPingDetails {
@@ -1389,6 +1350,14 @@ interface RunningSubagent {
 	lifecycle: SubagentLifecycle;
 	/** Last projected kind used to detect stalled/recovered transitions. */
 	lastProjectedKind?: LifecycleProjection["kind"];
+	/** One active no-progress warning episode, reset when durable progress resumes. */
+	noProgressEpisode?: {
+		active: true;
+		progressAt: number;
+		idleMs: number;
+		classification: NoProgressClassification;
+		lastEntryKind: NoProgressSessionTail["lastEntryKind"];
+	};
 	/**
 	 * When true, status transitions (stalled/recovered) do not wake the parent
 	 * session via a steer message. The widget still updates locally. Used for
@@ -1399,40 +1368,27 @@ interface RunningSubagent {
 	/** Parent-resolved model/thinking selection and provenance. */
 	runtimePlan: ResolvedRuntimePlan | undefined;
 	worktree?: WorktreeLaunch;
-}
-
-interface WorkflowChildHandle {
-	controller: AbortController;
-	surface?: string;
-}
-
-interface WorkflowOwner {
-	runId: string;
-	candidate: PendingWorkflow;
-	children: Map<string, WorkflowChildHandle>;
-	controller: AbortController;
-	worker?: { terminate(): Promise<number> };
-	gate: WorkflowTerminalGate;
-	checkout?: string;
-	journal?: ReturnType<typeof createWorkflowJournal>;
-	cancelPromise?: Promise<WorkflowTerminalOutcome>;
-	termination?: CancelTerminationResult;
-}
-
-interface WorkflowCancelHooks {
-	getProcessInfo?: typeof getPaneProcessInfo;
-	closeSurface?: typeof closePane;
-	waitAbsence?: typeof waitForPaneAbsence;
-	waitExit?: typeof waitForProcessesExit;
+	persistent?: boolean;
+	logicalId?: string;
+	generationId?: string;
+	policyHash?: string;
+	policyTools?: string[] | null;
+	policyDeniedTools?: string[];
+	tasksCompleted?: number;
+	taskId?: string;
+	inboxSequence?: number;
+	observedTaskEvents?: number;
+	stopState?: "requested" | "pending" | "failed";
+	stopFailure?: string;
+	stopTimeout?: ReturnType<typeof setTimeout>;
+	stopTimeoutMs?: number;
+	crashNotified?: boolean;
+	supervisionRegistration?: SupervisionRegistration;
 }
 
 interface SubagentRuntime {
 	runningSubagents: Map<string, RunningSubagent>;
-	pendingWorkflow?: PendingWorkflow;
-	activeWorkflow?: WorkflowOwner;
-	workflowOutcomes: Map<string, WorkflowTerminalOutcome>;
-	workflowStartupScanned: boolean;
-	workflowCancelHooks?: WorkflowCancelHooks;
+	supervision?: SupervisionCoordinator;
 	pi?: ExtensionAPI;
 	latestCtx?: ExtensionContext;
 	modelCatalog?: string;
@@ -1441,8 +1397,6 @@ interface SubagentRuntime {
 function createSubagentRuntime(): SubagentRuntime {
 	return {
 		runningSubagents: new Map<string, RunningSubagent>(),
-		workflowOutcomes: new Map<string, WorkflowTerminalOutcome>(),
-		workflowStartupScanned: false,
 	};
 }
 
@@ -1450,12 +1404,6 @@ function createSubagentRuntime(): SubagentRuntime {
 const runtime: SubagentRuntime =
 	readGlobalSlot<SubagentRuntime>(RUNTIME_KEY) ?? createSubagentRuntime();
 writeGlobalSlot(RUNTIME_KEY, runtime);
-if (!runtime.workflowOutcomes) {
-	runtime.workflowOutcomes = new Map<string, WorkflowTerminalOutcome>();
-}
-if (runtime.workflowStartupScanned === undefined) {
-	runtime.workflowStartupScanned = false;
-}
 const runningSubagents = runtime.runningSubagents;
 
 export function shouldPreserveSubagentsOnShutdown(
@@ -1808,6 +1756,108 @@ function observeRunningSubagent(
 	);
 }
 
+type NoProgressAdvisoryEvent =
+	| {
+			kind: "warning";
+			idleMs: number;
+			classification: NoProgressClassification;
+			lastEntryKind: NoProgressSessionTail["lastEntryKind"];
+			notify: boolean;
+	  }
+	| {
+			kind: "recovered";
+			idleMs: number;
+			classification: NoProgressClassification;
+			lastEntryKind: NoProgressSessionTail["lastEntryKind"];
+			notify: boolean;
+	  };
+
+function evaluateNoProgressAdvisory(
+	running: RunningSubagent,
+	projection: LifecycleProjection,
+	now: number,
+	hangWarningMinutes: number,
+): NoProgressAdvisoryEvent | undefined {
+	if (hangWarningMinutes === 0) {
+		delete running.noProgressEpisode;
+		return;
+	}
+	if (projection.kind !== "active" && projection.kind !== "blocked") {
+		delete running.noProgressEpisode;
+		return;
+	}
+
+	let sessionMtime: number;
+	try {
+		sessionMtime = statSync(running.sessionFile).mtimeMs;
+	} catch {
+		// Session evidence is unavailable; do not turn that I/O problem into a hang.
+		return;
+	}
+	const progressAt = Math.min(
+		now,
+		Math.max(
+			sessionMtime,
+			running.activity?.updatedAt ?? Number.NEGATIVE_INFINITY,
+		),
+	);
+	const idleMs = Math.max(0, now - progressAt);
+	if (idleMs <= hangWarningMinutes * 60_000) {
+		const previous = running.noProgressEpisode;
+		delete running.noProgressEpisode;
+		return previous
+			? {
+					kind: "recovered",
+					idleMs: Math.max(0, now - previous.progressAt),
+					classification: previous.classification,
+					lastEntryKind: previous.lastEntryKind,
+					notify: !running.interactive,
+				}
+			: undefined;
+	}
+	if (running.noProgressEpisode) return;
+
+	let tail: NoProgressSessionTail = {
+		classification: "generic-no-progress",
+		lastEntryKind: "other",
+	};
+	try {
+		// The bounded reader is deliberately cold-path only: mtime/snapshot checks
+		// above run on every refresh, but JSONL parsing happens once per episode.
+		tail = inspectNoProgressSessionTail(running.sessionFile);
+	} catch {
+		// A session can disappear between stat and read; preserve a facts-only
+		// generic advisory rather than failing the status loop.
+	}
+	running.noProgressEpisode = { active: true, progressAt, idleMs, ...tail };
+	return { kind: "warning", idleMs, ...tail, notify: !running.interactive };
+}
+
+function formatNoProgressAdvisoryLine(
+	running: RunningSubagent,
+	event: NoProgressAdvisoryEvent,
+): string {
+	const name = normalizeStatusName(running.name);
+	const persistentIds = running.persistent
+		? ` Logical ID: ${running.logicalId ?? "unknown"}; generation ID: ${running.generationId ?? "unknown"}.`
+		: "";
+	if (event.kind === "recovered") {
+		return `${name} no-progress advisory recovered after ${formatElapsedDuration(event.idleMs)}.${persistentIds}`;
+	}
+	const classification =
+		event.classification === "blocked-tool"
+			? "blocked-tool; the outstanding tool may still complete"
+			: event.classification === "truncated-turn"
+				? "truncated-turn; observed toolUse stop with no tool call; cause unknown"
+				: "generic no-progress";
+	const options = running.worktree
+		? "interrupt, or retain the workspace and continue there after confirming the previous process exited"
+		: running.persistent
+			? "interrupt, or use subagent_stop then replace with a new persistent specialist"
+			: "interrupt, or after manual termination use subagent_resume or a new spawn";
+	return `${name} no-progress advisory: ${formatElapsedDuration(event.idleMs)} idle while active. Classification: ${classification}. Last entry: ${event.lastEntryKind}. Session: ${running.sessionFile}. Recovery options: ${options}.${persistentIds}`;
+}
+
 function resolveInterruptTarget(params: {
 	id?: string;
 	name?: string;
@@ -1838,6 +1888,289 @@ function resolveInterruptTarget(params: {
 		.join(", ");
 	return {
 		error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}`,
+	};
+}
+
+function resolvePersistentTarget(params: { id?: string; name?: string }) {
+	const resolved = resolveInterruptTarget(params);
+	if ("error" in resolved) return resolved;
+	if (!resolved.running.persistent) {
+		return { error: `Subagent "${resolved.running.name}" is not persistent.` };
+	}
+	return resolved;
+}
+
+function persistentSpecialistState(
+	running: RunningSubagent,
+): "idle" | "working" | "stalled" | "stopped" {
+	const projection = projectLifecycle(
+		ensureLifecycle(running),
+		Date.now(),
+	).kind;
+	if (running.stopState === "failed") return "stalled";
+	if (running.stopState)
+		return projection === "stalled" ? "stalled" : "working";
+	if (running.taskId) return projection === "stalled" ? "stalled" : "working";
+	// Persistent task completion is authoritative for logical specialist state.
+	// Herdr can continue reporting the long-lived Pi pane as working while the
+	// process remains open between turns.
+	if (running.persistent && running.tasksCompleted != null) return "idle";
+	if (projection === "stalled") return "stalled";
+	if (
+		projection === "active" ||
+		projection === "blocked" ||
+		projection === "starting" ||
+		projection === "running"
+	)
+		return "working";
+	if (
+		projection === "completed" ||
+		projection === "failed" ||
+		projection === "finalizing"
+	)
+		return "stopped";
+	return "idle";
+}
+
+interface SubagentSendDetails {
+	error?: string;
+	id?: string;
+	task?: string;
+	inbox?: string;
+	outcome?: "dispatched" | "rejected-busy";
+}
+
+interface PersistentSpecialistFacts {
+	logicalId: string;
+	generationId: string;
+	policyHash: string;
+	tasks: Array<{ task: string; outcome: string }>;
+	sessionFile: string;
+	worktree?: WorktreeHandoff;
+	lastObservedPhase: string;
+}
+
+function persistentSpecialistFacts(
+	running: RunningSubagent,
+): PersistentSpecialistFacts {
+	const facts: PersistentSpecialistFacts = {
+		logicalId: running.logicalId!,
+		generationId: running.generationId!,
+		policyHash: running.policyHash!,
+		tasks: readPersistentDeliveryLedger(running.sessionFile).map((entry) => ({
+			task: entry.task,
+			outcome: entry.outcome,
+		})),
+		sessionFile: running.sessionFile,
+		lastObservedPhase: projectLifecycle(ensureLifecycle(running), Date.now())
+			.kind,
+	};
+	if (running.worktree)
+		facts.worktree = captureWorktreeHandoff(running.worktree);
+	return facts;
+}
+
+function formatPersistentSpecialistFacts(
+	facts: PersistentSpecialistFacts,
+): string {
+	const lines = [
+		`Logical ID: ${facts.logicalId}`,
+		`Generation ID: ${facts.generationId}`,
+		`Policy hash: ${facts.policyHash}`,
+		`Task outcomes: ${facts.tasks.map((task) => `${task.task}=${task.outcome}`).join(", ") || "none"}`,
+		`Session: ${facts.sessionFile}`,
+		`Last observed phase: ${facts.lastObservedPhase}`,
+	];
+	if (facts.worktree)
+		lines.push(
+			`Worktree Git state: ${facts.worktree.gitError ? "unknown" : facts.worktree.conflicted ? "conflicted" : facts.worktree.clean ? "clean" : "dirty"}`,
+		);
+	return lines.join("\n");
+}
+
+function persistentCapacityError(
+	config: PersistentConfig = persistentConfig,
+): string | undefined {
+	const specialists = Array.from(runningSubagents.values()).filter(
+		(running) => running.persistent,
+	);
+	if (specialists.length < config.maxAgents) return undefined;
+	return `Persistent specialist cap (${config.maxAgents}) reached. Current specialists: ${specialists.map((running) => `${running.name} (${persistentSpecialistState(running)}, ${running.tasksCompleted ?? 0} completed)`).join(", ")}.`;
+}
+
+function sendPersistentStopFailure(
+	api: Pick<ExtensionAPI, "sendMessage">,
+	running: RunningSubagent,
+): void {
+	const facts = persistentSpecialistFacts(running);
+	api.sendMessage(
+		{
+			customType: "subagent_stop",
+			content: `Persistent specialist stop failed: process exit was not confirmed. Evidence is retained.\n\n${formatPersistentSpecialistFacts(facts)}`,
+			display: true,
+			details: { status: "failed", facts },
+		},
+		{ triggerTurn: true, deliverAs: "steer" },
+	);
+}
+
+function startPersistentStopTimeout(
+	running: RunningSubagent,
+	api: Pick<ExtensionAPI, "sendMessage">,
+	stopTimeoutMs = 15_000,
+): void {
+	if (
+		running.stopTimeout ||
+		(running.stopState !== "requested" && running.stopState !== "pending")
+	)
+		return;
+	running.stopTimeout = setTimeout(() => {
+		running.stopTimeout = undefined;
+		if (!runningSubagents.has(running.id)) return;
+		if (running.stopState === "requested" || running.stopState === "pending") {
+			running.stopState = "failed";
+			running.stopFailure =
+				"process exit was not confirmed within the bounded stop wait";
+			sendPersistentStopFailure(api, running);
+		}
+	}, stopTimeoutMs);
+	running.stopTimeout.unref();
+}
+
+interface SubagentStopDetails {
+	error?: string;
+	id?: string;
+	name?: string;
+	status?: "stop_requested" | "stop_pending";
+}
+
+function handleSubagentStop(
+	params: { id?: string; name?: string },
+	api: Pick<ExtensionAPI, "sendMessage">,
+	stopTimeoutMs = 15_000,
+): AgentToolResult<SubagentStopDetails> {
+	const resolved = resolvePersistentTarget(params);
+	if ("error" in resolved) {
+		return {
+			content: [{ type: "text", text: resolved.error }],
+			details: { error: resolved.error },
+		};
+	}
+	const running = resolved.running;
+	if (running.stopState === "requested" || running.stopState === "pending") {
+		const error = `Stop is already requested for persistent specialist "${running.name}".`;
+		return {
+			content: [{ type: "text", text: error }],
+			details: { error, id: running.id, name: running.name },
+		};
+	}
+	const state = persistentSpecialistState(running);
+	if (state === "stopped") {
+		const error = `Persistent specialist "${running.name}" is already stopped.`;
+		return {
+			content: [{ type: "text", text: error }],
+			details: { error, id: running.id, name: running.name },
+		};
+	}
+	const task = running.taskId ?? "stop";
+	const pending = running.taskId != null;
+	running.stopState = pending ? "pending" : "requested";
+	running.stopTimeoutMs = stopTimeoutMs;
+	if (pending) {
+		appendPersistentDeliveryLedger(running.sessionFile, {
+			task,
+			outcome: "stop-pending",
+			generation: running.generationId!,
+			logicalId: running.logicalId!,
+			policyHash: running.policyHash!,
+		});
+	}
+	writePersistentTaskInbox(
+		running.sessionFile,
+		(running.inboxSequence = (running.inboxSequence ?? 0) + 1),
+		{ type: "stop", task, message: "" },
+	);
+	if (!pending) startPersistentStopTimeout(running, api, stopTimeoutMs);
+	return {
+		content: [
+			{
+				type: "text",
+				text: pending
+					? `Stop pending for persistent specialist "${running.name}"; its active task will settle first.`
+					: `Stop requested for persistent specialist "${running.name}".`,
+			},
+		],
+		details: {
+			id: running.id,
+			name: running.name,
+			status: pending ? "stop_pending" : "stop_requested",
+		},
+	};
+}
+
+function handleSubagentSend(params: {
+	id?: string;
+	name?: string;
+	message: string;
+}): AgentToolResult<SubagentSendDetails> {
+	const resolved = resolvePersistentTarget(params);
+	if ("error" in resolved)
+		return {
+			content: [{ type: "text", text: resolved.error }],
+			details: { error: resolved.error },
+		};
+	const running = resolved.running;
+	const task = randomUUID();
+	if (running.stopState === "failed") {
+		appendPersistentDeliveryLedger(running.sessionFile, {
+			task,
+			outcome: "rejected-busy",
+			generation: running.generationId!,
+			logicalId: running.logicalId!,
+			policyHash: running.policyHash!,
+		});
+		const error = `Persistent specialist "${running.name}" is in an unconfirmed-stop state; task ${task} was rejected-busy. Process exit is unconfirmed and evidence is retained at session ${running.sessionFile}. Request subagent_stop again or spawn a new specialist.`;
+		return {
+			content: [{ type: "text", text: error }],
+			details: { error, task, outcome: "rejected-busy" },
+		};
+	}
+	const state = persistentSpecialistState(running);
+	if (state !== "idle") {
+		appendPersistentDeliveryLedger(running.sessionFile, {
+			task,
+			outcome: "rejected-busy",
+			generation: running.generationId!,
+			logicalId: running.logicalId!,
+			policyHash: running.policyHash!,
+		});
+		const error = `Persistent specialist "${running.name}" is ${state}; task ${task} was rejected-busy. Resend after the pending result.`;
+		return {
+			content: [{ type: "text", text: error }],
+			details: { error, task, outcome: "rejected-busy" },
+		};
+	}
+	const inbox = writePersistentTaskInbox(
+		running.sessionFile,
+		(running.inboxSequence = (running.inboxSequence ?? 0) + 1),
+		{ task, message: params.message },
+	);
+	running.taskId = task;
+	appendPersistentDeliveryLedger(running.sessionFile, {
+		task,
+		outcome: "dispatched",
+		generation: running.generationId!,
+		logicalId: running.logicalId!,
+		policyHash: running.policyHash!,
+	});
+	return {
+		content: [
+			{
+				type: "text",
+				text: `Task ${task} dispatched to persistent specialist "${running.name}".`,
+			},
+		],
+		details: { id: running.id, task, inbox, outcome: "dispatched" },
 	};
 }
 
@@ -1959,6 +2292,16 @@ function startStatusRefresh(pi: ExtensionAPI) {
 					),
 				);
 			}
+
+			const noProgress = evaluateNoProgressAdvisory(
+				running,
+				projection,
+				now,
+				supervisionConfig.hangWarningMinutes,
+			);
+			if (noProgress?.notify) {
+				transitionLines.push(formatNoProgressAdvisoryLine(running, noProgress));
+			}
 		}
 
 		if (shouldRefreshWidget) updateWidget();
@@ -2008,75 +2351,6 @@ function buildBtwLaunchCommand(params: {
 	return `cd ${shellQuote(params.cwd)} && ${envPrefix}${parts.join(" ")}`;
 }
 
-function buildWorkflowChildCommand(params: {
-	checkout: string;
-	sessionFile: string;
-	id: string;
-	name: string;
-	model: string;
-	thinking: ThinkingLevel;
-	tools: string[];
-	rolePrompt?: string;
-	task: string;
-}): string {
-	const parts = [
-		"pi",
-		"--no-extensions",
-		"--no-skills",
-		"--no-prompt-templates",
-		"--no-context-files",
-		"--no-approve",
-		"--session",
-		shellQuote(params.sessionFile),
-		"-e",
-		shellQuote(join(SUBAGENTS_DIR, "subagent-done.ts")),
-		"--model",
-		shellQuote(params.model),
-		"--thinking",
-		shellQuote(params.thinking),
-		"--tools",
-		shellQuote(params.tools.join(",")),
-	];
-	if (params.rolePrompt)
-		parts.push("--system-prompt", shellQuote(params.rolePrompt));
-	parts.push(shellQuote(params.task));
-	const denied =
-		"caller_ping,subagent_done,subagent,subagent_interrupt,subagent_resume,subagents_list,herdr_workflow";
-	const env = [
-		`PI_DENY_TOOLS=${shellQuote(denied)}`,
-		`PI_SUBAGENT_AUTO_EXIT=1`,
-		`PI_SUBAGENT_NAME=${shellQuote(params.name)}`,
-		`PI_SUBAGENT_ID=${shellQuote(params.id)}`,
-		`PI_SUBAGENT_SESSION=${shellQuote(params.sessionFile)}`,
-		// Inherit the parent agent dir so workflow children resolve the same
-		// deterministic/test provider configuration as the approving parent.
-		...(process.env.PI_CODING_AGENT_DIR
-			? [`PI_CODING_AGENT_DIR=${shellQuote(process.env.PI_CODING_AGENT_DIR)}`]
-			: []),
-	].join(" ");
-	return `cd ${shellQuote(params.checkout)} && ${env} ${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
-}
-
-function resolveWorkflowReviewNode(
-	rolePolicies: WorkflowRolePolicy[],
-	node: string | undefined,
-	legacyRole: string | undefined,
-): { policy: WorkflowRolePolicy } | { error: string } {
-	const target = node ?? legacyRole ?? "";
-	const matches = rolePolicies.filter((value) =>
-		node === undefined ? value.role === legacyRole : value.id === node,
-	);
-	if (matches.length === 1) return { policy: matches[0] };
-	if (node === undefined && matches.length > 1) {
-		return {
-			error: `Workflow role ${JSON.stringify(legacyRole)} is ambiguous; use a review node ID.`,
-		};
-	}
-	return {
-		error: `Workflow review node ${JSON.stringify(target)} is unavailable.`,
-	};
-}
-
 export const __test__ = {
 	borderLine,
 	renderSubagentWidgetLines,
@@ -2090,36 +2364,32 @@ export const __test__ = {
 	buildSubagentToolAllowlist,
 	buildPiPromptArgs,
 	buildBtwLaunchCommand,
-	buildWorkflowChildCommand,
-	resolveWorkflowReviewNode,
+	resolveEffectivePersistent,
 	observeRunningSubagent,
+	evaluateNoProgressAdvisory,
+	formatNoProgressAdvisoryLine,
 	resolveDenyTools,
 	resolveInterruptTarget,
 	requestSubagentInterrupt,
 	handleSubagentInterrupt,
+	handleSubagentSend,
+	handleSubagentStop,
+	persistentSpecialistState,
+	persistentCapacityError,
 	resolveResultPresentation,
 	resolveUnexpectedErrorPresentation,
 	shouldAdvanceToFallback,
+	deliverPersistentTaskEvent,
+	notifyPersistentCrash,
 	sendSubagentResult,
 	shouldRetainSubagentSurface,
 	resolveWorktreeLaunchWarning,
+	formatLivePersistentSpecialists,
 	captureWorktreeHandoff,
 	runSubagentScript,
 	writeWorktreeManifest,
 	runningSubagents,
 	formatElapsed,
-	setWorkflowCancelHooks(hooks: WorkflowCancelHooks | undefined) {
-		runtime.workflowCancelHooks = hooks;
-	},
-	getActiveWorkflow() {
-		return runtime.activeWorkflow;
-	},
-	getPendingWorkflow() {
-		return runtime.pendingWorkflow;
-	},
-	setPendingWorkflowForTest(pending: PendingWorkflow | undefined) {
-		runtime.pendingWorkflow = pending;
-	},
 };
 
 function startWidgetRefresh() {
@@ -2161,8 +2431,6 @@ async function launchSubagent(
 		id?: string;
 	},
 ): Promise<RunningSubagent> {
-	const id = options?.id ?? Math.random().toString(16).slice(2, 10);
-
 	const agentDefs = params.agent
 		? loadAgentDefaults(params.agent, runtime.pi)
 		: null;
@@ -2174,8 +2442,6 @@ async function launchSubagent(
 			diagnostic?.message ?? `Agent "${params.agent}" was not found.`,
 		);
 	}
-	if (params.worktree && params.workspace)
-		throw new Error("workspace cannot be combined with worktree.");
 	if (!ctx.model)
 		throw new Error("Subagent launch requires a resolved parent model");
 	const runtimePlan =
@@ -2195,14 +2461,18 @@ async function launchSubagent(
 		);
 	const effectiveTools = params.tools ?? agentDefs?.tools;
 	const effectiveSkills = params.skills ?? agentDefs?.skills;
+	const persistent = resolveEffectivePersistent(params, agentDefs);
 	const effectiveAutoExit = resolveEffectiveAutoExit(params, agentDefs);
 	const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
+	const logicalId = options?.id ?? randomUUID();
+	const generationId = randomUUID();
+	const taskId = randomUUID();
 	const parentSessionFile = ctx.sessionManager.getSessionFile();
 	if (!parentSessionFile) throw new Error("No session file");
 
 	const running = await launchPiSubagent({
 		kind: "fresh",
-		id,
+		id: logicalId,
 		name: params.name,
 		task: params.task,
 		agent: params.agent,
@@ -2210,9 +2480,6 @@ async function launchSubagent(
 		worktree: params.worktree,
 		fork: params.fork,
 		surface: options?.surface,
-		workspace:
-			params.workspace ??
-			autoWorktreeWorkspace(params.cwd ?? ctx.cwd, !!params.worktree),
 		parent: {
 			cwd: ctx.cwd,
 			invocationCwd: process.cwd(),
@@ -2228,20 +2495,46 @@ async function launchSubagent(
 			deniedTools: [...resolveDenyTools(agentDefs)],
 			autoExit: effectiveAutoExit,
 			interactive: effectiveInteractive,
+			persistent,
+			logicalId,
+			generationId,
+			taskId,
 			identity: agentDefs?.body ?? params.systemPrompt,
 			systemPromptMode: agentDefs?.systemPromptMode,
 			sessionMode: resolveEffectiveSessionMode(params, agentDefs),
 			cwd: agentDefs?.cwd,
 		},
 	});
-	runningSubagents.set(id, running);
+	if (persistent) {
+		const policy = readSubagentSessionPolicy(running.sessionFile);
+		if (policy.version !== 2)
+			throw new Error("Persistent launch policy was not written as v2.");
+		running.persistent = true;
+		running.logicalId = policy.logicalId;
+		running.generationId = policy.generationId;
+		running.policyHash = policy.policyHash;
+		running.policyTools = policy.tools;
+		running.policyDeniedTools = policy.deniedTools;
+		running.tasksCompleted = 0;
+		running.taskId = taskId;
+		running.inboxSequence = 0;
+		running.observedTaskEvents = 0;
+		appendPersistentDeliveryLedger(running.sessionFile, {
+			task: taskId,
+			outcome: "dispatched",
+			generation: policy.generationId,
+			logicalId: policy.logicalId,
+			policyHash: policy.policyHash,
+		});
+	}
+	runningSubagents.set(logicalId, running);
 	return running;
 }
 
 /**
  * Watch a launched subagent until it exits. Polls for completion, extracts
- * the summary from the session file, and closes ordinary panes. Worktree
- * workspaces are retained for parent review.
+ * the summary from the session file. Temporary panes close only after parent
+ * delivery; worktree workspaces remain retained for review.
  */
 function resolveSubagentRuntimePlans(
 	params: typeof SubagentParams.static,
@@ -2314,18 +2607,171 @@ async function launchSubagentWithFallbacks(
 	);
 }
 
+const inFlightPersistentTaskDeliveries = new Set<string>();
+
+function deliverPersistentTaskEvent(
+	running: RunningSubagent,
+	event: ReturnType<typeof readPersistentTaskEvents>[number],
+	api: Pick<ExtensionAPI, "sendMessage">,
+): void {
+	if (!running.persistent || event.generation !== running.generationId) return;
+	const deliveryKey = `${running.id}:${event.type}:${event.task}`;
+	if (inFlightPersistentTaskDeliveries.has(deliveryKey)) return;
+	const ledger = readPersistentDeliveryLedger(running.sessionFile);
+	if (event.type === "help-request") {
+		if (
+			ledger.some(
+				(entry) =>
+					entry.task === event.task && entry.outcome === "help-requested",
+			)
+		)
+			return;
+		inFlightPersistentTaskDeliveries.add(deliveryKey);
+		try {
+			api.sendMessage(
+				{
+					customType: "subagent_ping",
+					content: `Persistent specialist "${running.name}" requests help for task ${event.task}:\n\n${event.message ?? ""}\n\nReply with subagent_send to ${running.name}.`,
+					display: true,
+					details: {
+						name: running.name,
+						task: event.task,
+						sessionFile: running.sessionFile,
+					},
+				},
+				{ triggerTurn: true, deliverAs: "steer" },
+			);
+			appendPersistentDeliveryLedger(running.sessionFile, {
+				task: event.task,
+				outcome: "help-requested",
+				generation: running.generationId!,
+				logicalId: running.logicalId!,
+				policyHash: running.policyHash!,
+			});
+			if (running.taskId === event.task) running.taskId = undefined;
+		} finally {
+			inFlightPersistentTaskDeliveries.delete(deliveryKey);
+		}
+		return;
+	}
+	if (
+		ledger.some(
+			(entry) => entry.task === event.task && entry.outcome === "delivered",
+		)
+	)
+		return;
+	inFlightPersistentTaskDeliveries.add(deliveryKey);
+	try {
+		const completed = (running.tasksCompleted ?? 0) + 1;
+		const summary = existsSync(running.sessionFile)
+			? (findLastAssistantMessage(getNewEntries(running.sessionFile, 0)) ??
+				"Persistent specialist completed without output.")
+			: "Persistent specialist session is unavailable.";
+		sendSubagentResult(
+			api,
+			`Persistent specialist "${running.name}" completed task ${event.task} (${completed} tasks completed) and is idle and accepting subagent_send.\n\n${summary}`,
+			{
+				name: running.name,
+				task: event.task,
+				agent: running.agent,
+				sessionFile: running.sessionFile,
+				logicalId: running.logicalId!,
+				generationId: running.generationId!,
+				policyHash: running.policyHash!,
+			},
+		);
+		appendPersistentDeliveryLedger(running.sessionFile, {
+			task: event.task,
+			outcome: "delivered",
+			generation: running.generationId!,
+			logicalId: running.logicalId!,
+			policyHash: running.policyHash!,
+		});
+		running.tasksCompleted = completed;
+		if (running.taskId === event.task) running.taskId = undefined;
+		if (running.stopState === "pending")
+			startPersistentStopTimeout(running, api, running.stopTimeoutMs);
+	} finally {
+		inFlightPersistentTaskDeliveries.delete(deliveryKey);
+	}
+}
+
+function drainPersistentTaskEvents(
+	running: RunningSubagent,
+	api: Pick<ExtensionAPI, "sendMessage">,
+): void {
+	const events = readPersistentTaskEvents(running.sessionFile);
+	for (const event of events.slice(running.observedTaskEvents ?? 0)) {
+		deliverPersistentTaskEvent(
+			running,
+			event,
+			selectCompletionApi(api, runtime.pi),
+		);
+	}
+	running.observedTaskEvents = events.length;
+}
+
+function notifyPersistentCrash(
+	running: RunningSubagent,
+	api: Pick<ExtensionAPI, "sendMessage">,
+): void {
+	drainPersistentTaskEvents(running, api);
+	if (running.crashNotified) return;
+	running.crashNotified = true;
+	const facts = persistentSpecialistFacts(running);
+	api.sendMessage(
+		{
+			customType: "subagent_result",
+			content: `Persistent specialist crashed. Evidence is retained. Persistent sessions cannot be resumed in v1; spawn a new specialist.\n\n${formatPersistentSpecialistFacts(facts)}`,
+			display: true,
+			details: { error: "persistent-crash", facts },
+		},
+		{ triggerTurn: true, deliverAs: "steer" },
+	);
+}
+
+function getSupervisionCoordinator(): SupervisionCoordinator {
+	if (runtime.supervision) return runtime.supervision;
+	runtime.supervision = new SupervisionCoordinator(
+		async () => {
+			const panes = await listPanes();
+			if (!panes) return { complete: false, panes: [] };
+			return { complete: true, panes };
+		},
+		inspectPane,
+		supervisionConfig.forcePolling,
+	);
+	return runtime.supervision;
+}
+
+function drainPersistentEventsSafely(running: RunningSubagent): void {
+	if (!running.persistent || !runtime.pi) return;
+	try {
+		drainPersistentTaskEvents(running, runtime.pi);
+	} catch {
+		// Leave an unread task event for the next file wake-up or reconciliation.
+	}
+}
+
 async function watchSubagent(
 	running: RunningSubagent,
 	signal: AbortSignal,
 ): Promise<SubagentResult> {
 	const { name, task, surface, startTime, sessionFile } = running;
+	const supervision = getSupervisionCoordinator().register(
+		sessionFile,
+		surface,
+	);
+	running.supervisionRegistration = supervision;
 
 	try {
 		const result = await waitForCompletion(signal, {
 			intervalMs: 1000,
 			sessionFile,
+			waitForNextCheck: supervision.wait,
 			readTerminalTail: () => readPaneAsync(surface, 5),
-			inspectPane: async () => inspectPane(surface),
+			inspectPane: supervision.inspectPane,
+			onLocalEvidence: () => drainPersistentEventsSafely(running),
 			onPaneInspection: (inspection: PaneInspection, observedAt: number) => {
 				ensureLifecycle(running);
 				running.lifecycle = observePaneInspection(
@@ -2391,7 +2837,7 @@ async function watchSubagent(
 					: `Sub-agent exited with code ${result.exitCode}`;
 		}
 
-		const worktreeHandoff = finalizeSubagentSurface(
+		const worktreeHandoff = finalizeSubagentWorktree(
 			running,
 			result.ping
 				? "needs_help"
@@ -2423,7 +2869,7 @@ async function watchSubagent(
 		if (worktreeHandoff) watchResult.worktree = worktreeHandoff;
 		return watchResult;
 	} catch (err: any) {
-		const worktreeHandoff = finalizeSubagentSurface(running, "failed", true);
+		const worktreeHandoff = finalizeSubagentWorktree(running, "failed");
 		running.lifecycle = markFailed(
 			running.lifecycle,
 			signal.aborted ? "Subagent cancelled." : (err?.message ?? String(err)),
@@ -2455,14 +2901,20 @@ async function watchSubagent(
 		};
 		if (worktreeHandoff) errorResult.worktree = worktreeHandoff;
 		return errorResult;
+	} finally {
+		supervision.unregister();
+		if (running.supervisionRegistration === supervision) {
+			running.supervisionRegistration = undefined;
+		}
 	}
 }
 
 export function shouldAdvanceToFallback(
 	result: Pick<SubagentResult, "errorMessage">,
 	remainingPlans: number,
+	persistent = false,
 ): boolean {
-	return !!result.errorMessage && remainingPlans > 0;
+	return !persistent && result.errorMessage !== undefined && remainingPlans > 0;
 }
 
 async function watchSubagentWithFallbacks(
@@ -2473,6 +2925,7 @@ async function watchSubagentWithFallbacks(
 	parentThinking: ThinkingLevel,
 	plans: ResolvedRuntimePlan[],
 	signal: AbortSignal,
+	completedPanes: Set<string>,
 	initialLaunchFailures: ModelFailure[] = [],
 ): Promise<{ running: RunningSubagent; result: SubagentResult }> {
 	let running = initial;
@@ -2484,9 +2937,11 @@ async function watchSubagentWithFallbacks(
 
 	for (;;) {
 		const result = await watchSubagent(running, signal);
+		if (!running.worktree) completedPanes.add(running.surface);
 		const shouldRetry = shouldAdvanceToFallback(
 			result,
 			plans.length - nextPlan,
+			running.persistent,
 		);
 		if (result.errorMessage) {
 			modelFailures.push({
@@ -2583,23 +3038,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	// subagents whose watchers survived a reload.
 	pi.on("session_start", (_event, ctx) => {
 		runtime.latestCtx = ctx;
-		if (!runtime.workflowStartupScanned) {
-			runtime.workflowStartupScanned = true;
-			recoverWorkflowStartup(
-				ctx.cwd,
-				runtime.activeWorkflow
-					? new Set([runtime.activeWorkflow.runId])
-					: new Set(),
-			);
-		}
-		const pendingSession = runtime.pendingWorkflow?.parentSession;
-		if (
-			pendingSession &&
-			(ctx.sessionManager.getSessionId() !== pendingSession.id ||
-				ctx.sessionManager.getSessionFile() !== pendingSession.file)
-		) {
-			runtime.pendingWorkflow = undefined;
-		}
 		runtime.modelCatalog = buildAuthenticatedModelCatalog(
 			wrapPiModelRegistry(ctx.modelRegistry),
 		);
@@ -2638,12 +3076,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		}
 
 		cleanupSubagentsForShutdown(event.reason, runningSubagents);
-		if (
-			event.reason === "new" ||
-			event.reason === "resume" ||
-			event.reason === "fork"
-		) {
-			runtime.pendingWorkflow = undefined;
+		if (!shouldPreserveSubagentsOnShutdown(event.reason)) {
+			runtime.supervision?.close();
+			runtime.supervision = undefined;
 		}
 		try {
 			await closeBtw();
@@ -2661,803 +3096,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	);
 
 	const shouldRegister = (name: string) => !deniedTools.has(name);
-	const prepareCandidate = (
-		ctx: ExtensionContext,
-		path: string,
-		parentSession: PendingWorkflow["parentSession"],
-		roles = workflowRoles(discoverAgentCatalog(pi)),
-	) =>
-		prepareWorkflow({
-			cwd: ctx.cwd,
-			path,
-			roles,
-			modelRegistry: wrapPiModelRegistry(ctx.modelRegistry),
-			parentSession,
-		});
-	const workflowFailure = (
-		code: string,
-		message: string,
-		retryable = false,
-	) => ({
-		ok: false,
-		code,
-		message,
-		retryable,
-	});
-	const runWorkflowAgent = async (
-		owner: WorkflowOwner,
-		candidate: PendingWorkflow,
-		checkout: string,
-		journal: ReturnType<typeof createWorkflowJournal>,
-		roles: WorkflowRole[],
-		prompt: string,
-		options: any,
-	) => {
-		if (owner.controller.signal.aborted || owner.gate.phase !== "running") {
-			return workflowFailure("cancelled", "Workflow cancelled.");
-		}
-		if (!isPlainObject(options)) {
-			return workflowFailure(
-				"workflow_agent_options",
-				"Workflow agent options must contain kind: review and one declared review node.",
-			);
-		}
-		const entries = Object.entries(options);
-		const { kind, node, role: legacyRole } = options;
-		if (
-			entries.length !== 2 ||
-			kind !== "review" ||
-			(!isString(node) && !isString(legacyRole))
-		) {
-			return workflowFailure(
-				"workflow_agent_options",
-				"Workflow agent options must contain only kind: review and one declared review node.",
-			);
-		}
-		const resolved = resolveWorkflowReviewNode(
-			candidate.rolePolicies,
-			isString(node) ? node : undefined,
-			isString(legacyRole) ? legacyRole : undefined,
-		);
-		if ("error" in resolved)
-			return workflowFailure("policy_error", resolved.error);
-		const { policy } = resolved;
-		const nodeId = policy.id;
-		const role = roles.find((value) => value.name === policy.role);
-		if (!role || role.disableModelInvocation || policy.tools.length === 0) {
-			return workflowFailure(
-				"policy_error",
-				`Workflow review node ${JSON.stringify(nodeId)} is unavailable.`,
-			);
-		}
-		const id = `workflow-${candidate.runId}-${Math.random().toString(16).slice(2, 10)}`;
-		const sessionFile = join(
-			dirname(candidate.path),
-			"sessions",
-			`${id}.jsonl`,
-		);
-		let surface: string | undefined;
-		let launched = false;
-		const childController = new AbortController();
-		const onOwnerAbort = () => childController.abort();
-		if (owner.controller.signal.aborted) childController.abort();
-		else
-			owner.controller.signal.addEventListener("abort", onOwnerAbort, {
-				once: true,
-			});
-		try {
-			if (childController.signal.aborted)
-				return workflowFailure("cancelled", "Workflow cancelled.");
-			mkdirSync(dirname(sessionFile), { recursive: true });
-			writeSubagentSessionPolicy(sessionFile, {
-				owner: "workflow",
-				tools: policy.tools,
-				deniedTools: [
-					"caller_ping",
-					"subagent_done",
-					"subagent",
-					"subagent_interrupt",
-					"subagent_resume",
-					"subagents_list",
-					"herdr_workflow",
-				],
-			});
-			surface = createSubagentPane(`${candidate.runId}: ${nodeId}`);
-			owner.children.set(id, { controller: childController, surface });
-			await waitForShellReady(surface, { signal: childController.signal });
-			if (childController.signal.aborted)
-				return workflowFailure("cancelled", "Workflow cancelled.");
-			const command = buildWorkflowChildCommand({
-				checkout,
-				sessionFile,
-				id,
-				name: nodeId,
-				model: policy.model,
-				thinking: policy.thinking,
-				tools: policy.tools,
-				rolePrompt: role.body,
-				task: prompt,
-			});
-			journal.append("agent_started", {
-				id,
-				node: nodeId,
-				role: role.name,
-				sessionFile,
-				tools: policy.tools,
-			});
-			runScriptInPane(surface, command, {
-				scriptPath: join(dirname(candidate.path), "launch", `${id}.sh`),
-			});
-			launched = true;
-			const watched = await watchSubagent(
-				{
-					id,
-					name: nodeId,
-					task: prompt,
-					surface,
-					startTime: Date.now(),
-					sessionFile,
-					interactive: false,
-					runtimePlan: undefined,
-					lifecycle: createLifecycle(Date.now()),
-				},
-				childController.signal,
-			);
-			surface = undefined;
-			if (childController.signal.aborted || watched.error === "cancelled") {
-				return workflowFailure("cancelled", "Workflow cancelled.");
-			}
-			const sessionExists = existsSync(sessionFile);
-			const childEntries = sessionExists ? getNewEntries(sessionFile, 0) : [];
-			const finalAssistant = inspectFinalAssistantMessage(childEntries);
-			const completedDetails: WorkflowAgentCompletedDetails = {
-				id,
-				node: nodeId,
-				role: role.name,
-				sessionFile,
-				sessionExists,
-				exitCode: watched.exitCode,
-				finalAssistantContentLength: finalAssistant.contentLength,
-			};
-			if (watched.errorMessage)
-				completedDetails.errorMessage = watched.errorMessage;
-			if (finalAssistant.stopReason) {
-				completedDetails.finalAssistantStopReason = finalAssistant.stopReason;
-			}
-			journal.append("agent_completed", completedDetails);
-			if (watched.exitCode !== 0 || watched.errorMessage) {
-				return workflowFailure(
-					"child_error",
-					watched.errorMessage ??
-						`Workflow child exited with code ${watched.exitCode}`,
-				);
-			}
-			if (!finalAssistant.text) {
-				return workflowFailure(
-					"empty_completion",
-					`Workflow child completed without assistant text${
-						finalAssistant.stopReason
-							? ` (stopReason: ${finalAssistant.stopReason})`
-							: ""
-					}.`,
-				);
-			}
-			const summary = finalAssistant.text;
-			const observed = findObservedSessionRuntime(childEntries);
-			const observedModel =
-				observed.provider && observed.modelId
-					? `${observed.provider}/${observed.modelId}`
-					: undefined;
-			if (
-				observedModel !== policy.model ||
-				observed.thinking !== policy.thinking
-			) {
-				return workflowFailure(
-					"workflow_runtime_mismatch",
-					"Workflow child did not report the approved provider/model and thinking.",
-				);
-			}
-			return { ok: true, value: summary, sessionFile };
-		} catch (error) {
-			if (childController.signal.aborted)
-				return workflowFailure("cancelled", "Workflow cancelled.");
-			const message = error instanceof Error ? error.message : String(error);
-			return workflowFailure(
-				launched ? "child_error" : "launch_error",
-				message,
-			);
-		} finally {
-			owner.controller.signal.removeEventListener("abort", onOwnerAbort);
-			owner.children.delete(id);
-			if (surface) {
-				try {
-					closePane(surface);
-				} catch (error) {
-					journal.append("pane_close_failed", {
-						surface,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
-			}
-		}
-	};
-	const deliverWorkflowOutcome = (
-		candidate: PendingWorkflow,
-		journal: ReturnType<typeof createWorkflowJournal>,
-		outcome: WorkflowTerminalOutcome,
-		checkoutResult?: WorkflowReaderCheckout,
-	) => {
-		const envelope: WorkflowResultEnvelope = {
-			runId: candidate.runId,
-			state: outcome.state,
-		};
-		if (outcome.result !== undefined) envelope.result = outcome.result;
-		if (outcome.error) envelope.error = outcome.error;
-		if (checkoutResult) envelope.checkout = { ...checkoutResult };
-		const terminalEventId = journal.append(outcome.state, { envelope });
-		const content =
-			outcome.state === "cancelled"
-				? `Workflow ${candidate.runId} cancelled.\n\nJournal: ${journal.path}`
-				: `Workflow ${candidate.runId} ${outcome.state}.\n\nResult:\n${JSON.stringify(envelope)}\n\nJournal: ${journal.path}`;
-		try {
-			selectCompletionApi(pi, runtime.pi).sendMessage(
-				{
-					customType: "herdr_workflow_result",
-					content,
-					display: true,
-					details: { ...envelope, journal: journal.path },
-				},
-				{ triggerTurn: true, deliverAs: "steer" },
-			);
-			journal.append("delivery", {
-				terminalEventId,
-				state: outcome.state,
-				targetSession: candidate.parentSession.file,
-				status: "sent",
-			});
-		} catch {
-			journal.append("delivery", {
-				terminalEventId,
-				state: outcome.state,
-				targetSession: candidate.parentSession.file,
-				status: "failed",
-			});
-		}
-		return outcome;
-	};
-	const finalizeWorkflow = (
-		owner: WorkflowOwner,
-		outcome: WorkflowTerminalOutcome,
-		checkoutResult?: WorkflowReaderCheckout,
-	) => {
-		if (!claimWorkflowTerminal(owner.gate, outcome)) {
-			return (
-				owner.gate.outcome ??
-				runtime.workflowOutcomes.get(owner.runId) ??
-				outcome
-			);
-		}
-		runtime.workflowOutcomes.set(owner.runId, outcome);
-		const journal = owner.journal;
-		if (journal)
-			deliverWorkflowOutcome(owner.candidate, journal, outcome, checkoutResult);
-		if (runtime.activeWorkflow?.runId === owner.runId)
-			runtime.activeWorkflow = undefined;
-		return outcome;
-	};
-	const terminateWorkflowChildren = async (
-		owner: WorkflowOwner,
-		options: WorkflowCancelHooks = {},
-	): Promise<CancelTerminationResult> => {
-		const hooks = { ...runtime.workflowCancelHooks, ...options };
-		const getProcessInfo = hooks.getProcessInfo ?? getPaneProcessInfo;
-		const closeSurface = hooks.closeSurface ?? closePane;
-		const waitAbsence = hooks.waitAbsence ?? waitForPaneAbsence;
-		const waitExit = hooks.waitExit ?? waitForProcessesExit;
-		try {
-			owner.controller.abort();
-			const children = [...owner.children.values()];
-			const captured: Array<{
-				surface?: string;
-				pids: number[];
-				identityUnconfirmed: boolean;
-			}> = [];
-			for (const child of children) {
-				child.controller.abort();
-				const pids: number[] = [];
-				let identityUnconfirmed = false;
-				if (child.surface) {
-					try {
-						const info = getProcessInfo(child.surface);
-						pids.push(...info.pids);
-						owner.journal?.append("cancel_process_info", {
-							surface: child.surface,
-							pids: info.pids,
-						});
-						if (info.pids.length === 0) identityUnconfirmed = true;
-					} catch (error) {
-						identityUnconfirmed = true;
-						owner.journal?.append("cancel_process_info_failed", {
-							surface: child.surface,
-							error: error instanceof Error ? error.message : String(error),
-						});
-					}
-				}
-				captured.push({
-					surface: child.surface,
-					pids,
-					identityUnconfirmed,
-				});
-			}
-			for (const child of captured) {
-				if (!child.surface) continue;
-				try {
-					closeSurface(child.surface);
-				} catch (error) {
-					owner.journal?.append("pane_close_failed", {
-						surface: child.surface,
-						error: error instanceof Error ? error.message : String(error),
-					});
-				}
-			}
-			const surviving: number[] = [];
-			let identityUnconfirmed = false;
-			for (const child of captured) {
-				if (child.identityUnconfirmed) identityUnconfirmed = true;
-				if (child.surface) {
-					const gone = await waitAbsence(child.surface, {
-						timeoutMs: 5_000,
-						intervalMs: 50,
-					});
-					if (!gone) {
-						identityUnconfirmed = true;
-						owner.journal?.append("cancel_pane_still_present", {
-							surface: child.surface,
-						});
-					}
-				}
-				if (child.pids.length > 0) {
-					surviving.push(
-						...(await waitExit(child.pids, {
-							timeoutMs: 5_000,
-							intervalMs: 50,
-						})),
-					);
-				}
-			}
-			const uniqueSurvivors = [...new Set(surviving)];
-			const termination = cancelTerminationResult(
-				uniqueSurvivors,
-				owner.checkout,
-				{ identityUnconfirmed },
-			);
-			if (termination.retainCheckout && owner.checkout) {
-				owner.journal?.append("reader_checkout_retained", {
-					path: owner.checkout,
-					reason: "cancel_termination_failed",
-					survivingPids: uniqueSurvivors,
-					identityUnconfirmed,
-				});
-			}
-			owner.termination = termination;
-			return termination;
-		} catch (error) {
-			const termination = cancelTerminationResult([], owner.checkout, {
-				identityUnconfirmed: true,
-			});
-			termination.outcome.error!.message =
-				error instanceof Error ? error.message : String(error);
-			if (owner.checkout) {
-				owner.journal?.append("reader_checkout_retained", {
-					path: owner.checkout,
-					reason: "cancel_termination_failed",
-				});
-			}
-			owner.termination = termination;
-			return termination;
-		}
-	};
-	const cancelWorkflow = async (
-		owner: WorkflowOwner,
-		options: WorkflowCancelHooks = {},
-	): Promise<WorkflowTerminalOutcome> => {
-		if (owner.cancelPromise) return owner.cancelPromise;
-
-		// Claim the gate first. Only the claimer creates cancelPromise, and it is
-		// assigned before any await so concurrent callers await the real outcome.
-		const begin = beginWorkflowCancellation(owner.gate);
-		if (!begin.claimed) {
-			if (begin.outcome) return begin.outcome;
-			while (!owner.cancelPromise && owner.gate.phase === "cancelling") {
-				await new Promise((resolve) => setImmediate(resolve));
-			}
-			if (owner.cancelPromise) return owner.cancelPromise;
-			const previous =
-				owner.gate.outcome ?? runtime.workflowOutcomes.get(owner.runId);
-			if (previous) return previous;
-			return {
-				state: "failed" as const,
-				error: {
-					code: "cancel_termination_failed",
-					message:
-						"Workflow cancellation lost its in-flight waiter without a terminal outcome.",
-				},
-			};
-		}
-
-		// Publish the waiter immediately so concurrent cancel callers never invent success.
-		let settle!: (outcome: WorkflowTerminalOutcome) => void;
-		const deferred = new Promise<WorkflowTerminalOutcome>((resolve) => {
-			settle = resolve;
-		});
-		owner.cancelPromise = deferred;
-
-		void (async () => {
-			const termination = await terminateWorkflowChildren(owner, options);
-			let checkoutResult: WorkflowReaderCheckout | undefined =
-				termination.checkout;
-			if (termination.retainCheckout) {
-				settle(finalizeWorkflow(owner, termination.outcome, checkoutResult));
-				return;
-			}
-			if (owner.checkout && owner.journal) {
-				checkoutResult = disposeWorkflowReaderCheckout(
-					owner.candidate,
-					owner.checkout,
-					owner.journal,
-				);
-				owner.checkout = undefined;
-			}
-			settle(finalizeWorkflow(owner, termination.outcome, checkoutResult));
-		})();
-		return deferred;
-	};
-	const deliverWorkflow = async (
-		owner: WorkflowOwner,
-		candidate: PendingWorkflow,
-		journal: ReturnType<typeof createWorkflowJournal>,
-		roles: WorkflowRole[],
-	) => {
-		owner.journal = journal;
-		journal.append("started");
-		let execution: WorkflowTerminalOutcome;
-		try {
-			owner.checkout = createWorkflowReaderCheckout(candidate, journal);
-			execution = await executeWorkflow(candidate, {
-				signal: owner.controller.signal,
-				onWorker: (worker) => {
-					owner.worker = worker;
-				},
-				onLog: (message) => journal.append("workflow_log", { message }),
-				onTerminal: async () => {
-					if (owner.gate.phase !== "running") {
-						if (owner.cancelPromise) await owner.cancelPromise;
-						return undefined;
-					}
-					const termination = await terminateWorkflowChildren(owner);
-					return termination.retainCheckout
-						? { state: "failed" as const, error: termination.outcome.error! }
-						: undefined;
-				},
-				onAgent: async (prompt, options) => {
-					const result = await runWorkflowAgent(
-						owner,
-						candidate,
-						owner.checkout!,
-						journal,
-						roles,
-						prompt,
-						options,
-					);
-					// Cancel may already have written the terminal + delivery; do not
-					// append late agent results after the journal has terminalized.
-					if (owner.gate.phase === "running") {
-						journal.append("agent_result", { result });
-					}
-					return result;
-				},
-			});
-		} catch (error) {
-			execution = {
-				state: "failed",
-				error: {
-					code: "workflow_runner_error",
-					message: error instanceof Error ? error.message : String(error),
-				},
-			};
-		}
-		if (owner.gate.phase === "cancelling" || owner.gate.phase === "terminal") {
-			if (owner.cancelPromise) await owner.cancelPromise;
-			return;
-		}
-		let checkoutResult = owner.termination?.checkout;
-		if (owner.termination?.retainCheckout) {
-			finalizeWorkflow(owner, execution, checkoutResult);
-			return;
-		}
-		if (owner.checkout) {
-			checkoutResult = disposeWorkflowReaderCheckout(
-				candidate,
-				owner.checkout,
-				journal,
-			);
-			owner.checkout = undefined;
-		}
-		finalizeWorkflow(owner, execution, checkoutResult);
-	};
-
-	// Workflow control is parent-only. Workflow children must not be able to
-	// prepare a revision or acquire approval for any later execution slice.
-	if (!process.env.PI_SUBAGENT_ID)
-		pi.registerTool({
-			name: "herdr_workflow",
-			label: "Herdr Workflow",
-			description:
-				"Prepare, start, or cancel one exact project-local workflow. Preparation validates and compiles the script without evaluating it. Start requires the matching user approval. Cancel stops queued and active children under the process-global terminal gate.",
-			parameters: Type.Object({
-				action: Type.Union([
-					Type.Literal("prepare"),
-					Type.Literal("start"),
-					Type.Literal("cancel"),
-				]),
-				path: Type.Optional(Type.String()),
-				runId: Type.Optional(Type.String()),
-			}),
-			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-				if (params.action === "prepare") {
-					if (runtime.activeWorkflow) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: "Error: a workflow is already active in this Pi process.",
-								},
-							],
-							details: { error: "workflow_active" },
-						};
-					}
-					if (!isTerminalAvailable()) return muxUnavailableResult();
-					if (!params.path) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: "Error: workflow preparation requires path.",
-								},
-							],
-							details: { error: "workflow_path_required" },
-						};
-					}
-					const sessionFile = ctx.sessionManager.getSessionFile();
-					const leafId = ctx.sessionManager.getLeafId();
-					if (!sessionFile || !leafId) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: "Error: start pi with a persistent session before preparing a workflow.",
-								},
-							],
-							details: { error: "workflow_persistent_session_required" },
-						};
-					}
-					runtime.pendingWorkflow = undefined;
-					try {
-						const candidate = prepareCandidate(ctx, params.path, {
-							id: ctx.sessionManager.getSessionId(),
-							file: sessionFile,
-							prepareLeafId: leafId,
-						});
-						runtime.pendingWorkflow = candidate;
-						return {
-							content: [
-								{ type: "text", text: formatApprovalPacket(candidate) },
-							],
-							details: {
-								runId: candidate.runId,
-								scriptHash: candidate.scriptHash,
-								repository: candidate.repository,
-								baseSha: candidate.baseSha,
-								sources: candidate.sources,
-								rolePolicies: candidate.rolePolicies,
-							},
-						};
-					} catch (error) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Workflow preparation failed: ${error instanceof Error ? error.message : String(error)}`,
-								},
-							],
-							details: { error: "workflow_prepare_failed" },
-						};
-					}
-				}
-				if (params.action === "start") {
-					const candidate = runtime.pendingWorkflow;
-					if (
-						!candidate ||
-						params.runId !== candidate.runId ||
-						runtime.activeWorkflow
-					) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: "Error: no matching pending workflow can be started.",
-								},
-							],
-							details: { error: "workflow_start_rejected" },
-						};
-					}
-					try {
-						const sessionFile = ctx.sessionManager.getSessionFile();
-						if (!sessionFile)
-							throw new Error("No persistent parent session is available");
-						const approval = validateWorkflowApproval(candidate, {
-							sessionId: ctx.sessionManager.getSessionId(),
-							sessionFile,
-							branch: ctx.sessionManager.getBranch(),
-						});
-						const approvedRoles = workflowRoles(discoverAgentCatalog(pi));
-						const revalidated = prepareCandidate(
-							ctx,
-							candidate.path,
-							candidate.parentSession,
-							approvedRoles,
-						);
-						if (!sameWorkflowCandidate(candidate, revalidated)) {
-							throw new Error("Workflow candidate changed after preparation");
-						}
-						const journal = createWorkflowJournal(candidate, approval);
-						runtime.pendingWorkflow = undefined;
-						runtime.workflowOutcomes.delete(candidate.runId);
-						const owner: WorkflowOwner = {
-							runId: candidate.runId,
-							candidate,
-							children: new Map(),
-							controller: new AbortController(),
-							gate: createWorkflowTerminalGate(),
-							journal,
-						};
-						runtime.activeWorkflow = owner;
-						void deliverWorkflow(owner, candidate, journal, approvedRoles);
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Workflow ${candidate.runId} started in the background.`,
-								},
-							],
-							details: {
-								runId: candidate.runId,
-								journal: journal.path,
-								status: "started",
-							},
-						};
-					} catch (error) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Workflow start failed: ${error instanceof Error ? error.message : String(error)}`,
-								},
-							],
-							details: { error: "workflow_start_failed" },
-						};
-					}
-				}
-				if (params.action === "cancel") {
-					if (!params.runId) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: "Error: workflow cancellation requires runId.",
-								},
-							],
-							details: { error: "workflow_run_id_required" },
-						};
-					}
-					const owner = runtime.activeWorkflow;
-					if (!owner || owner.runId !== params.runId) {
-						const previous = runtime.workflowOutcomes.get(params.runId);
-						if (previous) {
-							return {
-								content: [
-									{
-										type: "text",
-										text: `Workflow ${params.runId} already ended as ${previous.state}.`,
-									},
-								],
-								details: {
-									runId: params.runId,
-									status: previous.state,
-									outcome: previous,
-								},
-							};
-						}
-						return {
-							content: [
-								{
-									type: "text",
-									text: "Error: no matching active workflow can be cancelled.",
-								},
-							],
-							details: { error: "workflow_cancel_rejected" },
-						};
-					}
-					try {
-						const root = realpathSync(
-							execFileSync(
-								"git",
-								["-C", ctx.cwd, "rev-parse", "--show-toplevel"],
-								{
-									encoding: "utf8",
-								},
-							).trim(),
-						);
-						const commonDir = realpathSync(
-							execFileSync(
-								"git",
-								[
-									"-C",
-									ctx.cwd,
-									"rev-parse",
-									"--path-format=absolute",
-									"--git-common-dir",
-								],
-								{ encoding: "utf8" },
-							).trim(),
-						);
-						if (
-							root !== owner.candidate.repository.root ||
-							commonDir !== owner.candidate.repository.commonDir
-						) {
-							return {
-								content: [
-									{
-										type: "text",
-										text: "Error: workflow cancellation must use the approved repository identity.",
-									},
-								],
-								details: { error: "workflow_cancel_identity_mismatch" },
-							};
-						}
-					} catch (error) {
-						return {
-							content: [
-								{
-									type: "text",
-									text: `Workflow cancellation failed: ${error instanceof Error ? error.message : String(error)}`,
-								},
-							],
-							details: { error: "workflow_cancel_identity_failed" },
-						};
-					}
-					const outcome = await cancelWorkflow(owner);
-					return {
-						content: [
-							{
-								type: "text",
-								text:
-									outcome.state === "cancelled"
-										? `Workflow ${owner.runId} cancelled.`
-										: `Workflow ${owner.runId} ended as ${outcome.state}${outcome.error ? `: ${outcome.error.message}` : "."}`,
-							},
-						],
-						details: { runId: owner.runId, status: outcome.state, outcome },
-					};
-				}
-				return {
-					content: [
-						{ type: "text", text: "Error: unsupported workflow action." },
-					],
-					details: { error: "workflow_action_unavailable" },
-				};
-			},
-		});
 
 	// ── subagent tool ──
 	if (shouldRegister("subagent"))
@@ -3526,6 +3164,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					};
 				}
 
+				const persistent = resolveEffectivePersistent(
+					params,
+					params.agent ? loadAgentDefaults(params.agent, runtime.pi) : null,
+				);
+				const capError = persistent ? persistentCapacityError() : undefined;
+				if (capError) {
+					return {
+						content: [{ type: "text", text: capError }],
+						details: { error: "persistent-cap" },
+					};
+				}
+
 				// Validate prerequisites
 				if (!isTerminalAvailable()) {
 					return muxUnavailableResult();
@@ -3568,7 +3218,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					runtime.pi,
 				);
 				const {
-					running,
+					running: initialRunning,
 					index: initialPlanIndex,
 					launchFailures: initialLaunchFailures,
 				} = await launchSubagentWithFallbacks(
@@ -3577,6 +3227,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					parentThinking,
 					runtimePlans,
 				);
+
+				let running = initialRunning;
 
 				// Create a separate AbortController for the watcher
 				// (the tool's signal completes when we return)
@@ -3587,6 +3239,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				startWidgetRefresh();
 				startStatusRefresh(pi);
 
+				// Keep all temporary attempt panes until the final parent handoff.
+				const completedPanes = new Set<string>();
+				// Close after accepted delivery or explicit parent shutdown, not failed delivery.
+				let shouldCloseTemporaryPanes = false;
 				// Fire-and-forget: start watching in background
 				watchSubagentWithFallbacks(
 					running,
@@ -3596,10 +3252,59 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					parentThinking,
 					runtimePlans,
 					watcherAbort.signal,
+					completedPanes,
 					initialLaunchFailures,
 				)
 					.then(({ running: completedRunning, result }) => {
+						running = completedRunning;
+						if (completedRunning.stopTimeout)
+							clearTimeout(completedRunning.stopTimeout);
+						if (completedRunning.persistent) {
+							if (!shouldDeliverSubagentCompletion(completedRunning)) {
+								shouldCloseTemporaryPanes = true;
+								return;
+							}
+							drainPersistentTaskEvents(
+								completedRunning,
+								selectCompletionApi(pi, runtime.pi),
+							);
+							completedRunning.lifecycle = markDelivery(
+								completedRunning.lifecycle,
+								"delivered",
+							);
+							const completionApi = selectCompletionApi(pi, runtime.pi);
+							if (
+								completedRunning.stopState === "requested" ||
+								completedRunning.stopState === "pending"
+							) {
+								appendPersistentDeliveryLedger(completedRunning.sessionFile, {
+									task: "stop",
+									outcome: "stopped",
+									generation: completedRunning.generationId!,
+									logicalId: completedRunning.logicalId!,
+									policyHash: completedRunning.policyHash!,
+								});
+								const facts = persistentSpecialistFacts(completedRunning);
+								completionApi.sendMessage(
+									{
+										customType: "subagent_stop",
+										content: `Persistent specialist stopped.\n\n${formatPersistentSpecialistFacts(facts)}`,
+										display: true,
+										details: { status: "stopped", facts },
+									},
+									{ triggerTurn: true, deliverAs: "steer" },
+								);
+							} else if (completedRunning.stopState !== "failed") {
+								notifyPersistentCrash(completedRunning, completionApi);
+							}
+							shouldCloseTemporaryPanes = true;
+							runningSubagents.delete(completedRunning.id);
+							updateWidget();
+							return;
+						}
 						if (!shouldDeliverSubagentCompletion(completedRunning)) {
+							// Explicit parent shutdown still releases temporary panes.
+							shouldCloseTemporaryPanes = true;
 							completedRunning.lifecycle = markDelivery(
 								completedRunning.lifecycle,
 								"suppressed",
@@ -3626,7 +3331,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 								name: result.ping.name,
 								message: result.ping.message,
 								agent: running.agent,
-								sessionFile: result.sessionFile,
+								sessionFile: result.sessionFile!,
 							};
 							if (result.worktree) pingDetails.worktree = result.worktree;
 							completionApi.sendMessage(
@@ -3638,6 +3343,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 								},
 								{ triggerTurn: true, deliverAs: "steer" },
 							);
+							shouldCloseTemporaryPanes = true;
 							return;
 						}
 
@@ -3661,10 +3367,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 							resultDetails.fallbackAttempts = result.fallbackAttempts;
 						if (result.fallbackFailures)
 							resultDetails.fallbackFailures = result.fallbackFailures;
-						if (result.worktree) resultDetails.worktree = result.worktree;
+						if (result.worktree)
+							resultDetails.worktree = captureWorktreeHandoff(result.worktree);
 						if (completedRunning.runtimePlan)
 							resultDetails.runtimePlan = completedRunning.runtimePlan;
 						sendSubagentResult(completionApi, presentation, resultDetails);
+						shouldCloseTemporaryPanes = true;
 					})
 					.catch((err) => {
 						if (!shouldDeliverSubagentCompletion(running)) {
@@ -3676,13 +3384,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						running.lifecycle = markDelivery(running.lifecycle, "delivered");
 						runningSubagents.delete(running.id);
 						updateWidget();
+						if (running.persistent) {
+							notifyPersistentCrash(
+								running,
+								selectCompletionApi(pi, runtime.pi),
+							);
+							shouldCloseTemporaryPanes = true;
+							return;
+						}
 						const errDetails: SubagentResultDetails = {
 							name: running.name,
 							task: running.task,
 							error: err?.message,
 							sessionFile: running.sessionFile,
 						};
-						if (running.worktree) errDetails.worktree = running.worktree;
+						if (running.worktree)
+							errDetails.worktree = captureWorktreeHandoff(running.worktree);
 						sendSubagentResult(
 							selectCompletionApi(pi, runtime.pi),
 							resolveUnexpectedErrorPresentation(
@@ -3692,6 +3409,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 							),
 							errDetails,
 						);
+						shouldCloseTemporaryPanes = true;
+					})
+					.finally(() => {
+						if (shouldCloseTemporaryPanes) closeCompletedPanes(completedPanes);
 					});
 
 				// Return immediately
@@ -3811,6 +3532,55 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			},
 		});
 
+	// ── subagent_send tool ──
+	if (shouldRegister("subagent_send"))
+		pi.registerTool({
+			name: "subagent_send",
+			label: "Send Persistent Task",
+			description:
+				"Deliver one follow-up task to an idle persistent specialist. Busy specialists reject tasks; no queue is kept.",
+			parameters: Type.Object({
+				id: Type.Optional(
+					Type.String({
+						description: "Exact persistent specialist logical ID",
+					}),
+				),
+				name: Type.Optional(
+					Type.String({
+						description: "Exact unambiguous persistent specialist name",
+					}),
+				),
+				message: Type.String({ description: "The next task" }),
+			}),
+			async execute(_toolCallId, params) {
+				return handleSubagentSend(params);
+			},
+		});
+
+	// ── subagent_stop tool ──
+	if (shouldRegister("subagent_stop"))
+		pi.registerTool({
+			name: "subagent_stop",
+			label: "Stop Persistent Specialist",
+			description:
+				"Gracefully stop a persistent specialist after its active task settles. Exit is confirmed before the specialist is removed.",
+			parameters: Type.Object({
+				id: Type.Optional(
+					Type.String({
+						description: "Exact persistent specialist logical ID",
+					}),
+				),
+				name: Type.Optional(
+					Type.String({
+						description: "Exact unambiguous persistent specialist name",
+					}),
+				),
+			}),
+			async execute(_toolCallId, params) {
+				return handleSubagentStop(params, selectCompletionApi(pi, runtime.pi));
+			},
+		});
+
 	// ── subagent_interrupt tool ──
 	if (shouldRegister("subagent_interrupt"))
 		pi.registerTool({
@@ -3892,6 +3662,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				);
 				const lines = [
 					...formatVisibleAgentDefinitions(list),
+					...formatLivePersistentSpecialists(),
+					...formatSupervisionDiagnostics(),
 					...formatAgentDiagnostics(catalog.diagnostics),
 				];
 
@@ -3981,12 +3753,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 							"Whether the resumed session should automatically exit after completing its response. Defaults to true for autonomous follow-up work; set false for interactive resumed sessions.",
 					}),
 				),
-				workspace: Type.Optional(
-					Type.String({
-						description:
-							"Herdr workspace ID to open the resumed tab in (e.g. a retained worktree's workspace). Defaults to the current space.",
-					}),
-				),
 			}),
 
 			renderCall(args, theme) {
@@ -4049,12 +3815,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					name,
 					sessionFile: params.sessionPath,
 					message: params.message,
-					workspace:
-						params.workspace ??
-						autoWorktreeWorkspace(
-							sessionFileCwd(params.sessionPath) ?? ctx.cwd,
-							false,
-						),
 					parent: {
 						sessionId: ctx.sessionManager.getSessionId(),
 						sessionDir: ctx.sessionManager.getSessionDir(),
@@ -4069,9 +3829,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				const watcherAbort = new AbortController();
 				running.abortController = watcherAbort;
 
+				// Close after accepted delivery or explicit parent shutdown, not failed delivery.
+				let shouldCloseTemporaryPanes = false;
 				watchSubagent(running, watcherAbort.signal)
 					.then((result) => {
 						if (!shouldDeliverSubagentCompletion(running)) {
+							shouldCloseTemporaryPanes = true;
 							running.lifecycle = markDelivery(running.lifecycle, "suppressed");
 							runningSubagents.delete(running.id);
 							updateWidget();
@@ -4097,6 +3860,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 								},
 								{ triggerTurn: true, deliverAs: "steer" },
 							);
+							shouldCloseTemporaryPanes = true;
 							return;
 						}
 
@@ -4129,6 +3893,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						if (running.runtimePlan)
 							resumeDetails.runtimePlan = running.runtimePlan;
 						sendSubagentResult(completionApi, presentation, resumeDetails);
+						shouldCloseTemporaryPanes = true;
 					})
 					.catch((err) => {
 						if (!shouldDeliverSubagentCompletion(running)) {
@@ -4149,6 +3914,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 							),
 							{ name, error: err?.message, sessionFile: params.sessionPath },
 						);
+						shouldCloseTemporaryPanes = true;
+					})
+					.finally(() => {
+						if (shouldCloseTemporaryPanes)
+							closeCompletedPanes([running.surface]);
 					});
 
 				return {

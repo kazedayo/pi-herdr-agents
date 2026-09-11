@@ -92,7 +92,6 @@ function writePublicResumePolicy(sessionFile: string): void {
 describe("Pi launch", () => {
 	it("launches an ordinary child through one transaction", async () => {
 		await withFixture(async ({ request, project, agentDir }) => {
-			request.workspace = "space-9";
 			const projectAgentDir = join(project, ".pi", "agent");
 			mkdirSync(projectAgentDir, { recursive: true });
 			const events: string[] = [];
@@ -100,9 +99,9 @@ describe("Pi launch", () => {
 			let command = "";
 			let scriptPath = "";
 			const operations: PiLaunchOperations = {
-				createPane(name, workspaceId) {
+				createPane(name, cwd) {
 					assert.equal(name, "Worker");
-					assert.equal(workspaceId, "space-9");
+					assert.equal(cwd, project, "placement must use the child's checkout");
 					events.push("create");
 					return "pane-1";
 				},
@@ -133,12 +132,12 @@ describe("Pi launch", () => {
 			assert.equal(running.surface, "pane-1");
 			assert.equal(running.launchScriptFile, scriptPath);
 			assert.ok(running.sessionFile.startsWith(join(agentDir, "sessions")));
-			assert.deepEqual(readSubagentSessionPolicy(running.sessionFile), {
-				version: 1,
-				owner: "public",
-				tools: ["read", "bash"],
-				deniedTools: ["subagent", "subagent_resume"],
-			});
+			const policy = readSubagentSessionPolicy(running.sessionFile);
+			assert.equal(policy.version, 2);
+			assert.equal(policy.owner, "public");
+			assert.deepEqual(policy.tools, ["read", "bash"]);
+			assert.deepEqual(policy.deniedTools, ["subagent", "subagent_resume"]);
+			assert.equal(policy.persistent, false);
 			assert.equal(command.includes(projectAgentDir), false);
 			assert.match(command, new RegExp(`^cd '${project}' && `));
 			assert.match(command, /--model 'fake\/worker'/);
@@ -173,7 +172,11 @@ describe("Pi launch", () => {
 					const pane = `pane-${kind}`;
 					const closed: string[] = [];
 					const sessionFile = join(root, "resumed.jsonl");
-					writeFileSync(sessionFile, "existing session\n");
+					writeFileSync(
+						sessionFile,
+						JSON.stringify({ type: "session", id: "resumed", cwd: root }) +
+							"\n",
+					);
 					if (kind === "resume") writePublicResumePolicy(sessionFile);
 					const launchRequest: FreshPiLaunchRequest | ResumePiLaunchRequest =
 						kind === "fresh"
@@ -221,7 +224,7 @@ describe("Pi launch", () => {
 			const closed: string[] = [];
 			const operations: PiLaunchOperations = {
 				createPane: createSubagentPaneFactory(
-					{ mode: "split", direction: "down" },
+					{ mode: "split", direction: "down", maxPerTab: 4 },
 					() => {
 						throw new Error("must not create a tab");
 					},
@@ -394,7 +397,10 @@ describe("Pi launch", () => {
 			await launchPiSubagent({ ...request, name: injectedName }, operations);
 
 			const resumedSession = join(root, "resumed.jsonl");
-			writeFileSync(resumedSession, "existing session\n");
+			writeFileSync(
+				resumedSession,
+				JSON.stringify({ type: "session", id: "resumed", cwd: root }) + "\n",
+			);
 			writePublicResumePolicy(resumedSession);
 			await launchPiSubagent(
 				{
@@ -493,9 +499,12 @@ describe("Pi launch", () => {
 	});
 
 	it("resumes a session through the launch transaction", async () => {
-		await withFixture(async ({ root, sessionDir }) => {
+		await withFixture(async ({ root, project, sessionDir }) => {
 			const sessionFile = join(root, "child.jsonl");
-			writeFileSync(sessionFile, "existing session\n");
+			writeFileSync(
+				sessionFile,
+				JSON.stringify({ type: "session", id: "child", cwd: project }) + "\n",
+			);
 			writePublicResumePolicy(sessionFile);
 			const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 			process.env.PI_CODING_AGENT_DIR = join(root, "isolated-agent");
@@ -511,13 +520,12 @@ describe("Pi launch", () => {
 					name: "Resume worker",
 					sessionFile,
 					message: "Use the approved schema.",
-					workspace: "wt-space",
 					parent: { sessionId: "parent", sessionDir },
 				};
 				const operations: PiLaunchOperations = {
-					createPane(name, workspaceId) {
+					createPane(name, cwd) {
 						assert.equal(name, "Resume worker");
-						assert.equal(workspaceId, "wt-space");
+						assert.equal(cwd, project);
 						events.push("create");
 						return "pane-resume";
 					},
@@ -601,7 +609,10 @@ describe("Pi launch", () => {
 	it("clears inherited auto-exit state when a resumed session is interactive", async () => {
 		await withFixture(async ({ root, sessionDir }) => {
 			const sessionFile = join(root, "interactive.jsonl");
-			writeFileSync(sessionFile, "existing session\n");
+			writeFileSync(
+				sessionFile,
+				JSON.stringify({ type: "session", id: "resumed", cwd: root }) + "\n",
+			);
 			writePublicResumePolicy(sessionFile);
 			const previousAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
 			process.env.PI_SUBAGENT_AUTO_EXIT = "1";
