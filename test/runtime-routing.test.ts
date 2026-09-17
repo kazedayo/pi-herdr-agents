@@ -249,18 +249,12 @@ describe("authenticated model catalog", () => {
 		assert.match(catalog, /200k context/);
 		assert.match(catalog, /other\/plain/);
 		assert.match(catalog, /non-reasoning/);
-		assert.match(
-			catalog,
-			/explicitly select an exact provider\/model-id by task tier first/,
-		);
+		assert.match(catalog, /omit model to use the configured defaults/);
 		assert.match(
 			catalog,
 			/Reviews must use a different provider\/family than the producing model/,
 		);
-		assert.match(
-			catalog,
-			/inherits the parent runtime as a discouraged fallback/,
-		);
+		assert.match(catalog, /select an exact provider\/model-id by task tier/);
 	});
 
 	it("caps large catalogs and reports omitted models", () => {

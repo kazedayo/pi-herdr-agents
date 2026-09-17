@@ -373,7 +373,7 @@ export function buildAuthenticatedModelCatalog(
 		);
 	}
 	lines.push(
-		"For orchestrated children, explicitly select an exact provider/model-id by task tier first (fast for bounded mechanical work and recon, mid for ordinary implementation or review, frontier for architecture, security, hard diagnosis, or adversarial review), then set supported thinking. Reviews must use a different provider/family than the producing model. Omitting model and thinking inherits the parent runtime as a discouraged fallback.",
+		"For orchestrated children, omit model to use the configured defaults (pi-herdr-agents.config.json: models.agents[agent], then models.default); select an exact provider/model-id by task tier (fast for bounded mechanical work and recon, mid for ordinary implementation or review, frontier for architecture, security, hard diagnosis, or adversarial review) only to deviate, then set supported thinking. Reviews must use a different provider/family than the producing model.",
 	);
 	return lines.join("\n");
 }

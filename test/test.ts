@@ -5567,7 +5567,7 @@ describe("tool registration", () => {
 		assert.match(subagent.promptGuidelines.join("\n"), /fake\/fast/);
 		assert.match(
 			subagent.promptGuidelines.join("\n"),
-			/explicitly set both model and thinking for every child/,
+			/omit model to use the configured defaults/,
 		);
 		assert.match(
 			subagent.promptGuidelines.join("\n"),
@@ -5575,7 +5575,7 @@ describe("tool registration", () => {
 		);
 		assert.match(
 			subagent.promptGuidelines.join("\n"),
-			/Omitting model and thinking still inherits the parent runtime, but this is a discouraged fallback/,
+			/Omitting model resolves through agent frontmatter/,
 		);
 		assert.match(subagent.promptGuidelines.join("\n"), /login-test2/);
 	});

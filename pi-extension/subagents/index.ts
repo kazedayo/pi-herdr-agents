@@ -184,10 +184,10 @@ function buildSubagentRoutingGuidelines(catalog?: string): string[] {
 	return [
 		"Act as the coordinator: decompose the work, give each child one bounded outcome — goal, allowed files, verification, and whether to commit — and keep dependent writes sequential; parallelize only independent tasks.",
 		"Children are leaves by default: they do not push, merge, deploy, or orchestrate further agents unless their task explicitly authorizes it. The parent inspects each result or worktree handoff (diff against the reported base, run relevant tests) and owns integration, verification, and cleanup.",
-		"For orchestrated subagent work, explicitly set both model and thinking for every child: first choose a fast, mid, or frontier provider-family tier matched to task complexity, then set thinking within that model's supported range.",
+		"For orchestrated subagent work, omit model to use the configured defaults (pi-herdr-agents.config.json: models.agents[agent], then models.default); set model explicitly only to deviate from them: first choose a fast, mid, or frontier provider-family tier matched to task complexity, then set thinking within that model's supported range.",
 		"Use fast tier for bounded mechanical work and recon, mid tier for ordinary implementation or review, and frontier tier for architecture, security, hard diagnosis, or adversarial review. Use minimal/low thinking for mechanical work, medium for ordinary work, and high+ for hard work.",
 		"Review agents must use a different provider/family than the model that produced the work; a stronger model in the same family is quality escalation, not independent review. Use an exact authenticated provider/model-id from the live catalog below, never an alias or fuzzy name.",
-		"Omitting model and thinking still inherits the parent runtime, but this is a discouraged fallback for orchestrated children.",
+		"Omitting model resolves through agent frontmatter → pi-herdr-agents.config.json (models.agents[agent] → models.default) → the parent model; omitting thinking inherits the agent frontmatter or parent level.",
 		"Before launching a new group of subagents, choose a short task slug and name each new child <task>-<role>[-n], for example login-api or login-test2. Use only plan, research, ui, api, build, test, review, browser, security, perf, or merge as roles; leave existing names unchanged. After the final launch, print name | agent kind | role | model | worktree (if any), then use each name in prompts, handoffs, and results.",
 		catalog ??
 			"Authenticated subagent model catalog becomes available after session start.",
@@ -225,7 +225,7 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Explicitly pick an exact authenticated provider/model-id in a fast, mid, or frontier provider-family tier matched to the task, or use an ordered comma-separated fallback list. Review must use a different provider/family than the producing model. Omitting still inherits the parent model; do not omit for orchestrated children. Fallbacks are Pi-backed only and cannot be used with worktrees.",
+				"Exact authenticated provider/model-id, or an ordered comma-separated fallback list, to override the configured default. Omit to use pi-herdr-agents.config.json (models.agents[agent], else models.default, else the parent model). Review must use a different provider/family than the producing model. Fallbacks are Pi-backed only and cannot be used with worktrees.",
 		}),
 	),
 	thinking: Type.Optional(ThinkingLevelSchema),
