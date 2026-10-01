@@ -235,6 +235,9 @@ function createMockExtensionApi(extensionEvents = createEventBus()) {
 			getAllTools() {
 				return [];
 			},
+			getActiveTools() {
+				return [];
+			},
 		} as any,
 	};
 }
@@ -4300,7 +4303,8 @@ describe("subagent-done.ts", () => {
 		try {
 			const { api, registeredShortcuts, eventHandlers } =
 				createMockExtensionApi();
-			api.getAllTools = () => [{ name: "read" }, { name: "bash" }];
+			let active = ["read", "bash"];
+			api.getActiveTools = () => active;
 			subagentDoneExtension(api);
 			assert.deepEqual(registeredShortcuts, []);
 
@@ -4342,6 +4346,15 @@ describe("subagent-done.ts", () => {
 				rendered.includes("Ctrl+J"),
 				false,
 				`widget must not mention Ctrl+J: ${JSON.stringify(rendered)}`,
+			);
+			active = ["bash", "multi_grep", "read"];
+			for (const handler of eventHandlers.get("before_agent_start") ?? []) {
+				handler({}, ctx);
+			}
+			const refreshed = widgetFactory?.({}, theme).render(80)[0];
+			assert.ok(
+				refreshed?.includes("[shortcut-test-agent] — 3 tools"),
+				`widget must refresh late-registered tools: ${JSON.stringify(refreshed)}`,
 			);
 		} finally {
 			restoreEnvVar("PI_SUBAGENT_AGENT", previousAgent);

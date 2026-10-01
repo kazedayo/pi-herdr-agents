@@ -193,13 +193,22 @@ export default function (pi: ExtensionAPI) {
 	let completionFinalized = false;
 	let sessionContext: { shutdown(): void } | undefined;
 
+	// Re-read the live active set and re-render only when it changed.
+	// Extensions register tools inside their own session_start, which can run
+	// after this snapshot.
+	function refreshTools(ctx: { ui: { setWidget: Function } }) {
+		const names = [...pi.getActiveTools()].sort();
+		if (names.join(",") === toolNames.join(",")) return;
+		toolNames = names;
+		renderWidget(ctx, null);
+	}
+
 	// Show widget + status bar on session start
 	pi.on("session_start", (_event, ctx) => {
 		sessionContext = ctx;
 		recorder.sessionStart();
-		const tools = pi.getAllTools();
-		toolNames = tools.map((t) => t.name).sort();
 		denied = parseDeniedTools(deniedToolsValue);
+		toolNames = [...pi.getActiveTools()].sort();
 
 		renderWidget(ctx, null);
 	});
@@ -212,8 +221,9 @@ export default function (pi: ExtensionAPI) {
 		userTookOver = true;
 	});
 
-	pi.on("before_agent_start", () => {
+	pi.on("before_agent_start", (_event, ctx) => {
 		recorder.beforeAgentStart();
+		refreshTools(ctx);
 	});
 
 	pi.on("agent_start", () => {
