@@ -13,7 +13,6 @@ import {
 	visibleWidth,
 } from "@earendil-works/pi-tui";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { getAgentConfigDir } from "./config-paths.ts";
 import { fileURLToPath } from "node:url";
 import {
 	readdirSync,
@@ -23,6 +22,7 @@ import {
 	statSync,
 } from "node:fs";
 import { randomUUID } from "node:crypto";
+
 import {
 	isTerminalAvailable,
 	terminalSetupHint,
@@ -36,6 +36,7 @@ import {
 	listPanes,
 	waitForShellReady,
 } from "./terminal.ts";
+import { listHerdrWorktrees } from "./herdr.ts";
 import { waitForCompletion } from "./completion.ts";
 import {
 	SupervisionCoordinator,
@@ -44,6 +45,8 @@ import {
 import { loadSupervisionConfig } from "./supervision-config.ts";
 import {
 	buildAuthenticatedModelCatalog,
+	getAuthenticatedTaskPreferences,
+	parseExactModelRef,
 	resolveRuntimePlan,
 	resolveRuntimePlans,
 	wrapPiModelRegistry,
@@ -52,8 +55,25 @@ import {
 	type ResolvedRuntimePlan,
 	type ThinkingLevel,
 } from "./runtime-routing.ts";
-import { loadModelConfig, resolveModelDefault } from "./model-config.ts";
+import {
+	loadModelConfig,
+	resolveModelDefault,
+	writeTaskModelConfig,
+	TASK_CATEGORIES,
+	TASK_CATEGORY_DESCRIPTIONS,
+	type TaskPreferences,
+	type TaskPreferencesMeta,
+} from "./model-config.ts";
+import {
+	getAgentConfigDir,
+	getSubagentsConfigExamplePath,
+	getSubagentsConfigPath,
+} from "./config-path.ts";
 import { loadRoleConfig, type RoleConfig } from "./role-config.ts";
+import {
+	buildTaskModelBrief,
+	buildTaskModelInitPrompt,
+} from "./task-model-init.ts";
 import {
 	loadPersistentConfig,
 	type PersistentConfig,
@@ -104,7 +124,13 @@ import {
 	type SubagentLifecycle,
 	type PaneInspection,
 } from "./lifecycle.ts";
-import { listHerdrWorktrees } from "./herdr.ts";
+import {
+	createWorktreeCleanupOperations,
+	listContainedWorktrees,
+	removeContainedWorktree,
+	formatWorktreeInventory,
+	type WorktreeCleanupOperations,
+} from "./worktree-cleanup.ts";
 import {
 	captureWorktreeHandoff,
 	launchPiSubagent,
@@ -180,14 +206,23 @@ function getFirstText(
 	}
 }
 
-function buildSubagentRoutingGuidelines(catalog?: string): string[] {
+function buildSubagentRoutingGuidelines(
+	catalog?: string,
+	authenticatedTaskPreferences?: TaskPreferences,
+): string[] {
 	return [
 		"Act as the coordinator: decompose the work, give each child one bounded outcome — goal, allowed files, verification, and whether to commit — and keep dependent writes sequential; parallelize only independent tasks.",
 		"Children are leaves by default: they do not push, merge, deploy, or orchestrate further agents unless their task explicitly authorizes it. The parent inspects each result or worktree handoff (diff against the reported base, run relevant tests) and owns integration, verification, and cleanup.",
-		"For orchestrated subagent work, omit model to use the configured defaults (pi-herdr-agents.config.json: models.agents[agent], then models.default); set model explicitly only to deviate from them: first choose a fast, mid, or frontier provider-family tier matched to task complexity, then set thinking within that model's supported range.",
-		"Use fast tier for bounded mechanical work and recon, mid tier for ordinary implementation or review, and frontier tier for architecture, security, hard diagnosis, or adversarial review. Use minimal/low thinking for mechanical work, medium for ordinary work, and high+ for hard work.",
-		"Review agents must use a different provider/family than the model that produced the work; a stronger model in the same family is quality escalation, not independent review. Use an exact authenticated provider/model-id from the live catalog below, never an alias or fuzzy name.",
-		"Omitting model resolves through agent frontmatter → pi-herdr-agents.config.json (models.agents[agent] → models.default) → the parent model; omitting thinking inherits the agent frontmatter or parent level.",
+		...(Object.keys(authenticatedTaskPreferences ?? {}).length > 0
+			? [
+					"For non-review work, prefer the configured task-category shortlists below and use task:<category> only as the entire model value. Use exact IDs for reviews when the authoring family is known.",
+				]
+			: [
+					"For orchestrated subagent work, explicitly set both model and thinking for every child: first choose a fast, mid, or frontier provider-family tier matched to task complexity, then set thinking within that model's supported range.",
+					"Use fast tier for bounded mechanical work and recon, mid tier for ordinary implementation or review, and frontier tier for architecture, security, hard diagnosis, or adversarial review. Use minimal/low thinking for mechanical work, medium for ordinary work, and high+ for hard work.",
+				]),
+		"For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Use an exact authenticated provider/model-id from the live catalog below, never an alias or fuzzy name.",
+		"Omitting model and thinking still inherits the parent runtime, but this is a discouraged fallback for orchestrated children.",
 		"Before launching a new group of subagents, choose a short task slug and name each new child <task>-<role>[-n], for example login-api or login-test2. Use only plan, research, ui, api, build, test, review, browser, security, perf, or merge as roles; leave existing names unchanged. After the final launch, print name | agent kind | role | model | worktree (if any), then use each name in prompts, handoffs, and results.",
 		catalog ??
 			"Authenticated subagent model catalog becomes available after session start.",
@@ -225,7 +260,7 @@ const SubagentParams = Type.Object({
 	model: Type.Optional(
 		Type.String({
 			description:
-				"Exact authenticated provider/model-id, or an ordered comma-separated fallback list, to override the configured default. Omit to use pi-herdr-agents.config.json (models.agents[agent], else models.default, else the parent model). Review must use a different provider/family than the producing model. Fallbacks are Pi-backed only and cannot be used with worktrees.",
+				"Explicitly pick an exact authenticated provider/model-id, an ordered comma-separated fallback list, or task:<category> as the entire value. task: categories are case-insensitive and expand configured authenticated candidates; worktrees use only the first. For ordinary review, prefer a different authenticated model family. When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session. Disclose that this review is context-isolated, not cross-family independent. Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback. Omitting still inherits the parent model; do not omit for orchestrated children. Fallback lists cannot be used with worktrees.",
 		}),
 	),
 	thinking: Type.Optional(ThinkingLevelSchema),
@@ -246,24 +281,33 @@ const SubagentParams = Type.Object({
 		}),
 	),
 	worktree: Type.Optional(
-		Type.Object({
-			branch: Type.String({
-				minLength: 1,
-				description:
-					"New branch name for an isolated Herdr-managed Git worktree",
-			}),
-			base: Type.Optional(
-				Type.String({
-					description:
-						"Git revision to branch from. Defaults to the source checkout's committed HEAD.",
+		Type.Union(
+			[
+				Type.Object({
+					branch: Type.String({
+						minLength: 1,
+						description:
+							"New branch name for an isolated Herdr-managed Git worktree",
+					}),
+					base: Type.Optional(
+						Type.String({
+							description:
+								"Git revision to branch from. Defaults to the source checkout's committed HEAD.",
+						}),
+					),
 				}),
-			),
-		}),
+				Type.Null(),
+			],
+			{
+				description:
+					"Optional isolated Herdr-managed Git worktree. Omit or pass null to use an ordinary pane in cwd.",
+			},
+		),
 	),
 	fork: Type.Optional(
 		Type.Boolean({
 			description:
-				"Force the full-context fork mode for this spawn. The sub-agent inherits the current session conversation, overriding any agent frontmatter session-mode.",
+				"Override the child session mode for this spawn. `true` forces full-context fork; `false` forces standalone. Omit to inherit the agent frontmatter session-mode.",
 		}),
 	),
 	persistent: Type.Optional(
@@ -337,6 +381,7 @@ const SPAWNING_TOOLS = new Set([
 	"subagent_resume",
 	"subagent_send",
 	"subagent_stop",
+	"subagents_write_task_models",
 ]);
 
 /**
@@ -875,7 +920,8 @@ function resolveEffectiveSessionMode(
 	params: Static<typeof SubagentParams>,
 	agentDefs: AgentDefaults | null,
 ): SubagentSessionMode {
-	if (params.fork) return "fork";
+	if (params.fork === true) return "fork";
+	if (params.fork === false) return "standalone";
 	return agentDefs?.sessionMode ?? "standalone";
 }
 
@@ -1180,7 +1226,7 @@ interface PartialSubagentArgs {
 	task?: unknown;
 	agent?: unknown;
 	cwd?: unknown;
-	worktree?: PartialWorktreeArgs;
+	worktree?: PartialWorktreeArgs | null;
 }
 
 function sendSubagentResult(
@@ -1231,7 +1277,10 @@ function formatWorktreeHandoff(worktree: WorktreeHandoff): string {
 	if (worktree.gitError)
 		lines.push(`Git inspection warning: ${worktree.gitError}`);
 	lines.push(
-		"After review and preservation, remove the workspace with:",
+		"After review and preservation, explicitly remove (branch retained):",
+		`  /worktree remove ${worktree.workspaceId}`,
+		`  worktree_remove({ target: ${JSON.stringify(worktree.path)} })`,
+		"Operator override after independent safety checks:",
 		`  herdr worktree remove --workspace ${worktree.workspaceId}`,
 	);
 	return lines.join("\n");
@@ -2369,6 +2418,7 @@ export const __test__ = {
 	evaluateNoProgressAdvisory,
 	formatNoProgressAdvisoryLine,
 	resolveDenyTools,
+	buildSubagentRoutingGuidelines,
 	resolveInterruptTarget,
 	requestSubagentInterrupt,
 	handleSubagentInterrupt,
@@ -2380,6 +2430,7 @@ export const __test__ = {
 	resolveUnexpectedErrorPresentation,
 	shouldAdvanceToFallback,
 	deliverPersistentTaskEvent,
+	drainPersistentTaskEvents,
 	notifyPersistentCrash,
 	sendSubagentResult,
 	shouldRetainSubagentSurface,
@@ -2566,6 +2617,8 @@ function resolveSubagentRuntimePlans(
 			thinking: parentThinking,
 		},
 		wrapPiModelRegistry(ctx.modelRegistry),
+		modelConfig.tasks,
+		!!params.worktree,
 	);
 	if (params.worktree && plans.length > 1) {
 		throw new Error(
@@ -2613,11 +2666,13 @@ function deliverPersistentTaskEvent(
 	running: RunningSubagent,
 	event: ReturnType<typeof readPersistentTaskEvents>[number],
 	api: Pick<ExtensionAPI, "sendMessage">,
+	ledgerSnapshot?: ReturnType<typeof readPersistentDeliveryLedger>,
 ): void {
 	if (!running.persistent || event.generation !== running.generationId) return;
 	const deliveryKey = `${running.id}:${event.type}:${event.task}`;
 	if (inFlightPersistentTaskDeliveries.has(deliveryKey)) return;
-	const ledger = readPersistentDeliveryLedger(running.sessionFile);
+	const ledger =
+		ledgerSnapshot ?? readPersistentDeliveryLedger(running.sessionFile);
 	if (event.type === "help-request") {
 		if (
 			ledger.some(
@@ -2641,13 +2696,15 @@ function deliverPersistentTaskEvent(
 				},
 				{ triggerTurn: true, deliverAs: "steer" },
 			);
-			appendPersistentDeliveryLedger(running.sessionFile, {
-				task: event.task,
-				outcome: "help-requested",
-				generation: running.generationId!,
-				logicalId: running.logicalId!,
-				policyHash: running.policyHash!,
-			});
+			ledger.push(
+				appendPersistentDeliveryLedger(running.sessionFile, {
+					task: event.task,
+					outcome: "help-requested",
+					generation: running.generationId!,
+					logicalId: running.logicalId!,
+					policyHash: running.policyHash!,
+				}),
+			);
 			if (running.taskId === event.task) running.taskId = undefined;
 		} finally {
 			inFlightPersistentTaskDeliveries.delete(deliveryKey);
@@ -2680,13 +2737,15 @@ function deliverPersistentTaskEvent(
 				policyHash: running.policyHash!,
 			},
 		);
-		appendPersistentDeliveryLedger(running.sessionFile, {
-			task: event.task,
-			outcome: "delivered",
-			generation: running.generationId!,
-			logicalId: running.logicalId!,
-			policyHash: running.policyHash!,
-		});
+		ledger.push(
+			appendPersistentDeliveryLedger(running.sessionFile, {
+				task: event.task,
+				outcome: "delivered",
+				generation: running.generationId!,
+				logicalId: running.logicalId!,
+				policyHash: running.policyHash!,
+			}),
+		);
 		running.tasksCompleted = completed;
 		if (running.taskId === event.task) running.taskId = undefined;
 		if (running.stopState === "pending")
@@ -2699,13 +2758,25 @@ function deliverPersistentTaskEvent(
 function drainPersistentTaskEvents(
 	running: RunningSubagent,
 	api: Pick<ExtensionAPI, "sendMessage">,
+	readLedger = readPersistentDeliveryLedger,
 ): void {
 	const events = readPersistentTaskEvents(running.sessionFile);
+	let ledger: ReturnType<typeof readPersistentDeliveryLedger> | undefined;
 	for (const event of events.slice(running.observedTaskEvents ?? 0)) {
+		if (!running.persistent || event.generation !== running.generationId)
+			continue;
+		if (
+			inFlightPersistentTaskDeliveries.has(
+				`${running.id}:${event.type}:${event.task}`,
+			)
+		)
+			continue;
+		ledger ??= readLedger(running.sessionFile);
 		deliverPersistentTaskEvent(
 			running,
 			event,
 			selectCompletionApi(api, runtime.pi),
+			ledger,
 		);
 	}
 	running.observedTaskEvents = events.length;
@@ -2999,8 +3070,33 @@ async function watchSubagentWithFallbacks(
 	}
 }
 
-export default function subagentsExtension(pi: ExtensionAPI) {
+export default function subagentsExtension(
+	pi: ExtensionAPI,
+	options: {
+		cleanupOperations?: (ctx: ExtensionContext) => WorktreeCleanupOperations;
+	} = {},
+) {
 	runtime.pi = pi;
+	const parentSession = !process.env.PI_SUBAGENT_ID;
+	const cleanupInput = (ctx: ExtensionContext) => ({
+		cwd: ctx.cwd,
+		operations:
+			options.cleanupOperations?.(ctx) ??
+			createWorktreeCleanupOperations({
+				manifestDir: join(
+					ctx.sessionManager.getSessionDir(),
+					"artifacts",
+					ctx.sessionManager.getSessionId(),
+					"worktree-runs",
+				),
+				liveHolders: () =>
+					[...runningSubagents.values()].flatMap((child) =>
+						child.worktree
+							? [{ path: child.worktree.path, persistent: child.persistent }]
+							: [],
+					),
+			}),
+	});
 	let btwChild: BtwChild | undefined;
 
 	const closeBtw = async (): Promise<boolean> => {
@@ -3036,13 +3132,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	// Capture the UI context for widget updates and restore presentation for
 	// subagents whose watchers survived a reload.
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		runtime.latestCtx = ctx;
+		const registry = wrapPiModelRegistry(ctx.modelRegistry);
+		const authenticatedTaskPreferences = getAuthenticatedTaskPreferences(
+			registry,
+			modelConfig.tasks,
+		);
 		runtime.modelCatalog = buildAuthenticatedModelCatalog(
-			wrapPiModelRegistry(ctx.modelRegistry),
+			registry,
+			24,
+			modelConfig.tasks,
 		);
 		const refreshedGuidelines = buildSubagentRoutingGuidelines(
 			runtime.modelCatalog,
+			authenticatedTaskPreferences,
 		);
 		subagentRoutingGuidelines.splice(
 			0,
@@ -3096,6 +3200,106 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	);
 
 	const shouldRegister = (name: string) => !deniedTools.has(name);
+
+	if (parentSession) {
+		pi.registerTool({
+			name: "worktree_list",
+			label: "Worktree inventory",
+			description:
+				"Inspect managed worktrees, including cross-session orphans. Only source repositories inside cwd are eligible for explicit removal. This tool never removes anything.",
+			parameters: Type.Object({}),
+			execute: async (_id, _params, _signal, _update, ctx) => {
+				const entries = await listContainedWorktrees(cleanupInput(ctx));
+				return {
+					content: [{ type: "text", text: formatWorktreeInventory(entries) }],
+					details: { entries },
+				};
+			},
+		});
+		pi.registerTool({
+			name: "worktree_remove",
+			label: "Remove worktree",
+			description:
+				"Explicitly remove one managed worktree by exact path, branch, or workspace ID. Rechecks cwd containment, live children/leases, and Git state. Branches and commits are retained. Dirty work requires explicit preserve: true to make a WIP commit first.",
+			parameters: Type.Object({
+				target: Type.String({ minLength: 1 }),
+				preserve: Type.Optional(Type.Boolean()),
+			}),
+			execute: async (_id, params, _signal, _update, ctx) => {
+				const result = await removeContainedWorktree({
+					...cleanupInput(ctx),
+					...params,
+				});
+				if (result.status === "blocked" || result.status === "failed")
+					throw new Error(result.message);
+				return {
+					content: [{ type: "text", text: result.message }],
+					details: result,
+				};
+			},
+		});
+	}
+
+	if (
+		!process.env.PI_SUBAGENT_ID &&
+		shouldRegister("subagents_write_task_models")
+	)
+		pi.registerTool({
+			name: "subagents_write_task_models",
+			label: "Write task model preferences",
+			description: `Validate and atomically replace models.tasks and models.tasksMeta in the durable Pi agent config, preserving unrelated settings. Supported categories: ${TASK_CATEGORIES.join(", ")}. Partial nonempty categories are accepted; omitted categories are removed. Rejects duplicate exact refs within a category. Review the active authenticated registry and existing preferences first. Returns normalized saved preferences and missing categories; reload required.`,
+			parameters: Type.Object({
+				tasks: Type.Object(
+					Object.fromEntries(
+						TASK_CATEGORIES.map((category) => [
+							category,
+							Type.Optional(
+								Type.Array(Type.String({ minLength: 1 }), {
+									minItems: 1,
+									description: TASK_CATEGORY_DESCRIPTIONS[category],
+								}),
+							),
+						]),
+					),
+					{ additionalProperties: false, minProperties: 1 },
+				),
+				tasksMeta: Type.Object({
+					generatedAt: Type.String(),
+					method: Type.Union([
+						Type.Literal("research"),
+						Type.Literal("registry-only"),
+					]),
+				}),
+			}),
+			execute: async (_id, params, _signal, _update, ctx) => {
+				const registry = wrapPiModelRegistry(ctx.modelRegistry);
+				// SAFETY: TypeBox validates the tool payload; the write seam performs stricter schema validation.
+				const tasks = params.tasks as TaskPreferences;
+				// SAFETY: TypeBox validates the tool payload; the write seam performs stricter schema validation.
+				const tasksMeta = params.tasksMeta as TaskPreferencesMeta;
+				const saved = writeTaskModelConfig(
+					getSubagentsConfigPath(),
+					getSubagentsConfigExamplePath(),
+					tasks,
+					tasksMeta,
+					(candidate) => {
+						const parsed = parseExactModelRef(candidate);
+						const model =
+							parsed && registry.find(parsed.provider, parsed.modelId);
+						return !!model && registry.hasConfiguredAuth(model);
+					},
+				);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Wrote task model preferences. Reload required.\n${JSON.stringify(saved, null, 2)}`,
+						},
+					],
+					details: saved,
+				};
+			},
+		});
 
 	// ── subagent tool ──
 	if (shouldRegister("subagent"))
@@ -3934,6 +4138,20 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			},
 		});
 
+	if (!process.env.PI_SUBAGENT_ID)
+		pi.registerCommand("subagents-init", {
+			description:
+				"Draft task-category model preferences from the live registry; optional arguments set ranking preferences",
+			handler: async (args, ctx) => {
+				const brief = buildTaskModelBrief(
+					ctx.modelRegistry,
+					loadModelConfig(),
+					args,
+				);
+				pi.sendUserMessage(buildTaskModelInitPrompt(brief));
+			},
+		});
+
 	pi.registerCommand("btw", {
 		description:
 			"Open an ephemeral side-question session in a background Herdr tab",
@@ -4036,8 +4254,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("worktree", {
-		description:
-			"Fork this session into a worktree; use /worktree list to inspect them",
+		description: parentSession
+			? "Fork into a worktree, list retained worktrees, or explicitly remove one"
+			: "Fork this session into a worktree; use /worktree list to inspect them",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			const parts = trimmed.split(/\s+/).filter(Boolean);
@@ -4047,14 +4266,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					return;
 				}
 				try {
-					const worktrees = listHerdrWorktrees(ctx.cwd);
 					ctx.ui.notify(
-						worktrees
-							.map(
-								(worktree) =>
-									`${worktree.branch} — ${worktree.path}${worktree.workspaceId ? ` (${worktree.workspaceId})` : ""}`,
-							)
-							.join("\n") || "No worktrees found.",
+						parentSession
+							? formatWorktreeInventory(
+									await listContainedWorktrees(cleanupInput(ctx)),
+								)
+							: listHerdrWorktrees(ctx.cwd)
+									.map(
+										(worktree) =>
+											`${worktree.branch || "(detached HEAD)"} — ${worktree.path}${worktree.workspaceId ? ` (${worktree.workspaceId})` : ""}`,
+									)
+									.join("\n") || "No worktrees found.",
 						"info",
 					);
 				} catch (error) {
@@ -4066,10 +4288,42 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				return;
 			}
 
+			if (parts[0] === "remove") {
+				if (!parentSession) {
+					ctx.ui.notify("Worktree removal is parent-only.", "warning");
+					return;
+				}
+				const preserve = parts.at(-1) === "--preserve";
+				const target = trimmed
+					.slice("remove".length)
+					.trim()
+					.replace(/\s+--preserve$/, "");
+				if (!target || target === "--preserve") {
+					ctx.ui.notify(
+						"Usage: /worktree remove <path|branch|workspace-id> [--preserve]",
+						"warning",
+					);
+					return;
+				}
+				const result = await removeContainedWorktree({
+					...cleanupInput(ctx),
+					target,
+					preserve,
+				});
+				ctx.ui.notify(
+					result.message,
+					result.status === "removed" || result.status === "already-removed"
+						? "info"
+						: "warning",
+				);
+				return;
+			}
 			const branch = parts.shift();
 			if (!branch || branch === "list") {
 				ctx.ui.notify(
-					"Usage: /worktree <name> [task] | /worktree list",
+					parentSession
+						? "Usage: /worktree <name> [task] | /worktree list | /worktree remove <target> [--preserve]"
+						: "Usage: /worktree <name> [task] | /worktree list",
 					"warning",
 				);
 				return;

@@ -24,8 +24,14 @@ import {
 	writeSubagentSessionPolicy,
 } from "../pi-extension/subagents/session.ts";
 
+function expectedShellQuote(value: string): string {
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 function fixture() {
-	const root = mkdtempSync(join(tmpdir(), "subagent-launch-test-"));
+	const root = mkdtempSync(
+		join(tmpdir(), "subagent-launch-test-[probe](regex)-"),
+	);
 	const project = join(root, "project");
 	const agentDir = join(root, "agent");
 	const sessionDir = join(root, "parent-sessions");
@@ -79,6 +85,39 @@ function withFixture(
 	return Promise.resolve(run(value)).finally(() => {
 		rmSync(value.root, { recursive: true, force: true });
 	});
+}
+
+function initializeGitRepository(cwd: string): void {
+	execFileSync("git", ["init", "-q", "-b", "main"], { cwd });
+	execFileSync("git", ["config", "user.email", "test@example.com"], { cwd });
+	execFileSync("git", ["config", "user.name", "Test"], { cwd });
+	execFileSync("git", ["config", "commit.gpgsign", "false"], { cwd });
+}
+
+function commitAll(cwd: string, message: string): string {
+	execFileSync("git", ["add", "."], { cwd });
+	execFileSync("git", ["commit", "-qm", message], { cwd });
+	return execFileSync("git", ["rev-parse", "HEAD"], {
+		cwd,
+		encoding: "utf8",
+	}).trim();
+}
+
+function createLinkedGitFixture(root: string, principal: string) {
+	initializeGitRepository(principal);
+	writeFileSync(join(principal, "base.txt"), "base\n");
+	const principalSha = commitAll(principal, "base");
+	const linked = join(root, "linked source α\ncheckout");
+	execFileSync(
+		"git",
+		["worktree", "add", "-q", "-b", "linked/source", linked, principalSha],
+		{ cwd: principal },
+	);
+	writeFileSync(join(linked, "linked.txt"), "linked\n");
+	const linkedSha = commitAll(linked, "linked change");
+	const linkedCwd = join(linked, "nested caller");
+	mkdirSync(linkedCwd);
+	return { linked, linkedCwd, linkedSha };
 }
 
 function writePublicResumePolicy(sessionFile: string): void {
@@ -139,7 +178,7 @@ describe("Pi launch", () => {
 			assert.deepEqual(policy.deniedTools, ["subagent", "subagent_resume"]);
 			assert.equal(policy.persistent, false);
 			assert.equal(command.includes(projectAgentDir), false);
-			assert.match(command, new RegExp(`^cd '${project}' && `));
+			assert.ok(command.startsWith(`cd ${expectedShellQuote(project)} && `));
 			assert.match(command, /--model 'fake\/worker'/);
 			assert.match(command, /--thinking 'high'/);
 			assert.match(command, /--tools 'read,bash,caller_ping'/);
@@ -162,6 +201,39 @@ describe("Pi launch", () => {
 				readFileSync(systemPromptPath, "utf8"),
 				"You are a focused worker.",
 			);
+		});
+	});
+
+	it("treats an explicit null worktree as an ordinary pane", async () => {
+		await withFixture(async ({ request, project }) => {
+			let worktreeCreationAttempts = 0;
+			const operations: PiLaunchOperations = {
+				createPane(name, cwd) {
+					assert.equal(name, "Worker");
+					assert.equal(cwd, project);
+					return "pane-null-worktree";
+				},
+				createWorktree() {
+					worktreeCreationAttempts++;
+					throw new Error("unexpected worktree creation");
+				},
+				async waitForShellReady(surface) {
+					assert.equal(surface, "pane-null-worktree");
+				},
+				runScript(_surface, _command, options) {
+					return options.scriptPath;
+				},
+				closePane() {},
+			};
+
+			const running = await launchPiSubagent(
+				{ ...request, worktree: null },
+				operations,
+			);
+
+			assert.equal(worktreeCreationAttempts, 0);
+			assert.equal(running.surface, "pane-null-worktree");
+			assert.equal(running.worktree, undefined);
 		});
 	});
 
@@ -454,6 +526,136 @@ describe("Pi launch", () => {
 		});
 	});
 
+	it("does not seed or inherit context when fork is explicitly false", async () => {
+		await withFixture(async ({ request, project }) => {
+			writeFileSync(
+				request.parent.sessionFile,
+				[
+					{ type: "session", version: 3, id: "parent", cwd: project },
+					{
+						type: "message",
+						id: "u1",
+						parentId: null,
+						message: {
+							role: "user",
+							content: [{ type: "text", text: "secret context" }],
+							timestamp: 1,
+						},
+					},
+				]
+					.map((e) => JSON.stringify(e))
+					.join("\n") + "\n",
+			);
+			let command = "";
+			const running = await launchPiSubagent(
+				{
+					...request,
+					fork: false,
+					behavior: {
+						...request.behavior,
+						sessionMode: "fork",
+					},
+				},
+				{
+					createPane: () => "pane-no-fork",
+					createWorktree: () => {
+						throw new Error("unexpected worktree creation");
+					},
+					waitForShellReady: async () => {},
+					runScript: (_surface, value, options) => {
+						command = value;
+						return options.scriptPath;
+					},
+					closePane: () => {},
+				},
+			);
+
+			assert.equal(
+				existsSync(running.sessionFile),
+				false,
+				"fork: false must not seed parent conversation into child session",
+			);
+			const taskPath = command.match(/'@([^']+\.md)'/)?.[1];
+			assert.ok(taskPath, "expected artifact-backed task delivery, not direct");
+		});
+	});
+
+	it("seeds context and uses direct delivery when fork is omitted and sessionMode is fork", async () => {
+		await withFixture(async ({ request, project }) => {
+			const timestamp = new Date().toISOString();
+			writeFileSync(
+				request.parent.sessionFile,
+				[
+					{
+						type: "session",
+						version: 3,
+						id: "parent",
+						timestamp,
+						cwd: project,
+					},
+					{
+						type: "model_change",
+						id: "mc-1",
+						parentId: null,
+						timestamp,
+					},
+					{
+						type: "message",
+						id: "u1",
+						parentId: "mc-1",
+						timestamp,
+						message: {
+							role: "user",
+							content: [{ type: "text", text: "inherited context" }],
+							timestamp: 1,
+						},
+					},
+				]
+					.map((e) => JSON.stringify(e))
+					.join("\n") + "\n",
+			);
+			let command = "";
+			const running = await launchPiSubagent(
+				{
+					...request,
+					behavior: {
+						...request.behavior,
+						sessionMode: "fork",
+					},
+				},
+				{
+					createPane: () => "pane-inherited-fork",
+					createWorktree: () => {
+						throw new Error("unexpected worktree creation");
+					},
+					waitForShellReady: async () => {},
+					runScript: (_surface, value, options) => {
+						command = value;
+						return options.scriptPath;
+					},
+					closePane: () => {},
+				},
+			);
+
+			assert.equal(
+				existsSync(running.sessionFile),
+				true,
+				"omitted fork with sessionMode fork must seed the child session",
+			);
+			const childSession = readFileSync(running.sessionFile, "utf8");
+			assert.match(
+				childSession,
+				/parentSession/,
+				"child session must link to parent",
+			);
+			assert.doesNotMatch(
+				command,
+				/'@[^']+\.md'/,
+				"fork mode must use direct delivery, not artifact-backed",
+			);
+		});
+	});
+
 	it("keeps an autonomous multi-wave coordinator open for completion steers", async () => {
 		await withFixture(async ({ request }) => {
 			let command = "";
@@ -562,22 +764,21 @@ describe("Pi launch", () => {
 				assert.equal(running.interactive, false);
 				assert.equal(running.runtimePlan, undefined);
 				assert.equal(running.worktree, undefined);
-				assert.match(
-					command,
-					new RegExp(
-						`^PI_CODING_AGENT_DIR='${process.env.PI_CODING_AGENT_DIR}' `,
+				assert.ok(
+					command.startsWith(
+						`PI_CODING_AGENT_DIR=${expectedShellQuote(process.env.PI_CODING_AGENT_DIR!)} `,
 					),
 				);
-				assert.match(
-					command,
-					new RegExp(
-						`pi --session '${sessionFile}' --tools 'read,bash,caller_ping' -e `,
+				assert.ok(
+					command.includes(
+						`pi --session ${expectedShellQuote(sessionFile)} --tools 'read,bash,caller_ping' -e `,
 					),
 				);
 				assert.match(command, /PI_SUBAGENT_NAME='Resume worker'/);
-				assert.match(
-					command,
-					new RegExp(`PI_SUBAGENT_SESSION='${sessionFile}'`),
+				assert.ok(
+					command.includes(
+						`PI_SUBAGENT_SESSION=${expectedShellQuote(sessionFile)}`,
+					),
 				);
 				assert.match(command, /PI_SUBAGENT_ID='resume-1'/);
 				assert.match(command, /PI_SUBAGENT_ACTIVITY_FILE='/);
@@ -594,9 +795,8 @@ describe("Pi launch", () => {
 					scriptPreamble,
 					/# Subagent resume script for Resume worker/,
 				);
-				assert.match(
-					scriptPreamble,
-					new RegExp(`# Resume message file: ${messagePath}`),
+				assert.ok(
+					scriptPreamble.includes(`# Resume message file: ${messagePath}`),
 				);
 			} finally {
 				if (previousAgentDir === undefined)
@@ -737,11 +937,203 @@ describe("Pi launch", () => {
 				readSubagentSessionPolicy(running.sessionFile).owner,
 				"managed-worktree",
 			);
-			assert.match(command, new RegExp(`^cd '${worktreePath}' && `));
+			assert.ok(
+				command.startsWith(`cd ${expectedShellQuote(worktreePath)} && `),
+			);
 			const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
 			assert.equal(manifest.state, "running");
 			assert.equal(manifest.owner, "pi-herdr-subagents");
 			assert.equal(manifest.paneId, "root-pane-1");
+		});
+	});
+
+	it("provisions a linked checkout from its principal while preserving its base", async () => {
+		await withFixture(async ({ request, project, root, sessionDir }) => {
+			const { linkedCwd, linkedSha } = createLinkedGitFixture(root, project);
+			const worktreePath = join(root, "linked-child");
+			const worktreeRequest: FreshPiLaunchRequest = {
+				...request,
+				cwd: linkedCwd,
+				worktree: { branch: "issue/59-fresh", base: "HEAD" },
+			};
+			const manifestFile = join(
+				sessionDir,
+				"artifacts",
+				"parent",
+				"worktree-runs",
+				"child-1.json",
+			);
+			let command = "";
+			const operations: PiLaunchOperations = {
+				createPane() {
+					throw new Error("unexpected pane creation");
+				},
+				createWorktree(name, cwd, branch, base) {
+					assert.equal(name, "Worker");
+					assert.equal(cwd, project);
+					assert.equal(branch, "issue/59-fresh");
+					assert.equal(base, linkedSha);
+					const provisioning = JSON.parse(readFileSync(manifestFile, "utf8"));
+					assert.equal(provisioning.sourceCwd, linkedCwd);
+					assert.equal(provisioning.baseSha, linkedSha);
+					execFileSync(
+						"git",
+						["worktree", "add", "-q", "-b", branch, worktreePath, base],
+						{ cwd },
+					);
+					return {
+						path: worktreePath,
+						branch,
+						workspaceId: "workspace-linked-fresh",
+						paneId: "pane-linked-fresh",
+					};
+				},
+				async waitForShellReady(surface) {
+					assert.equal(surface, "pane-linked-fresh");
+				},
+				runScript(surface, value, options) {
+					assert.equal(surface, "pane-linked-fresh");
+					command = value;
+					return options.scriptPath;
+				},
+				closePane: () => {
+					throw new Error("must retain the worktree workspace");
+				},
+			};
+
+			const running = await launchPiSubagent(worktreeRequest, operations);
+
+			assert.equal(running.worktree?.baseSha, linkedSha);
+			assert.equal(running.worktree?.path, worktreePath);
+			assert.equal(
+				readFileSync(join(worktreePath, "linked.txt"), "utf8"),
+				"linked\n",
+			);
+			assert.ok(
+				command.startsWith(`cd ${expectedShellQuote(worktreePath)} && `),
+			);
+			const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+			assert.equal(manifest.sourceCwd, linkedCwd);
+			assert.equal(manifest.baseSha, linkedSha);
+		});
+	});
+
+	it("uses the principal checkout for linked worktree handoffs", async () => {
+		await withFixture(async ({ request, project, root, sessionDir }) => {
+			const { linked, linkedCwd, linkedSha } = createLinkedGitFixture(
+				root,
+				project,
+			);
+			writeFileSync(
+				request.parent.sessionFile,
+				[
+					{
+						type: "session",
+						version: 3,
+						id: "parent",
+						cwd: linked,
+					},
+					{
+						type: "message",
+						id: "user-1",
+						parentId: null,
+						message: {
+							role: "user",
+							content: [{ type: "text", text: "Start the feature" }],
+							timestamp: 1,
+						},
+					},
+					{
+						type: "message",
+						id: "assistant-1",
+						parentId: "user-1",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "Continue" }],
+							api: "test",
+							provider: "fake",
+							model: "worker",
+							usage: {},
+							stopReason: "stop",
+							timestamp: 2,
+						},
+					},
+				]
+					.map((entry) => JSON.stringify(entry))
+					.join("\n") + "\n",
+			);
+			const worktreePath = join(root, "linked-handoff-child");
+			const manifestFile = join(
+				sessionDir,
+				"artifacts",
+				"parent",
+				"worktree-runs",
+				"child-1.json",
+			);
+			const operations: PiLaunchOperations = {
+				createPane() {
+					throw new Error("unexpected pane creation");
+				},
+				createWorktree(name, cwd, branch, base) {
+					assert.equal(name, "Handoff");
+					assert.equal(cwd, project);
+					assert.equal(branch, "handoff/59");
+					assert.equal(base, linkedSha);
+					assert.equal(
+						JSON.parse(readFileSync(manifestFile, "utf8")).sourceCwd,
+						linkedCwd,
+					);
+					execFileSync(
+						"git",
+						["worktree", "add", "-q", "-b", branch, worktreePath, base],
+						{ cwd },
+					);
+					return {
+						path: worktreePath,
+						branch,
+						workspaceId: "workspace-linked-handoff",
+						paneId: "pane-linked-handoff",
+					};
+				},
+				async waitForShellReady(surface) {
+					assert.equal(surface, "pane-linked-handoff");
+				},
+				runScript(surface, _command, options) {
+					assert.equal(surface, "pane-linked-handoff");
+					return options.scriptPath;
+				},
+				async waitForPiReady(surface) {
+					assert.equal(surface, "pane-linked-handoff");
+				},
+				focusWorkspace(workspaceId) {
+					assert.equal(workspaceId, "workspace-linked-handoff");
+				},
+				closePane: () => {
+					throw new Error("must retain the worktree workspace");
+				},
+			};
+
+			const result = await launchPiWorktreeHandoff(
+				{
+					...request,
+					name: "Handoff",
+					cwd: linkedCwd,
+					worktree: { branch: "handoff/59" },
+					handoff: { leafId: "assistant-1" },
+				},
+				operations,
+			);
+
+			assert.equal(result.running.worktree?.baseSha, linkedSha);
+			assert.equal(result.running.worktree?.path, worktreePath);
+			assert.equal(
+				readFileSync(join(worktreePath, "linked.txt"), "utf8"),
+				"linked\n",
+			);
+			assert.equal(
+				JSON.parse(readFileSync(manifestFile, "utf8")).sourceCwd,
+				linkedCwd,
+			);
 		});
 	});
 
@@ -869,7 +1261,9 @@ describe("Pi launch", () => {
 				readFileSync(request.parent.sessionFile, "utf8"),
 				parentBefore,
 			);
-			assert.match(command, new RegExp(`^cd '${worktreePath}' && `));
+			assert.ok(
+				command.startsWith(`cd ${expectedShellQuote(worktreePath)} && `),
+			);
 			assert.doesNotMatch(
 				command,
 				/subagent-done|PI_SUBAGENT_|__SUBAGENT_DONE_/,

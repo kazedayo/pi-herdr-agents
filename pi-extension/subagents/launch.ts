@@ -14,7 +14,7 @@ import { createLifecycle, type SubagentLifecycle } from "./lifecycle.ts";
 import type { ResolvedRuntimePlan } from "./runtime-routing.ts";
 import { createSubagentPaneFactory, loadPaneConfig } from "./pane-config.ts";
 import { HerdrWorktreeCreateError } from "./herdr.ts";
-import { isNonEmptyString, type JsonObject } from "./type-guards.ts";
+import { isNonEmptyString, isRecord, type JsonObject } from "./type-guards.ts";
 import {
 	createWorktreeSessionFork,
 	getNewEntries,
@@ -84,7 +84,7 @@ export interface FreshPiLaunchRequest {
 	task: string;
 	agent?: string;
 	cwd?: string;
-	worktree?: { branch: string; base?: string };
+	worktree?: { branch: string; base?: string } | null;
 	fork?: boolean;
 	handoff?: { leafId: string };
 	surface?: string;
@@ -350,7 +350,9 @@ function resolveLaunchRequest(request: FreshPiLaunchRequest): ResolvedLaunch {
 			: join(cwdBase, rawCwd)
 		: request.parent.cwd;
 	const localAgentDir = rawCwd ? join(sourceCwd, ".pi", "agent") : null;
-	const sessionMode = request.fork ? "fork" : request.behavior.sessionMode;
+	let sessionMode: SubagentSessionMode = request.behavior.sessionMode;
+	if (request.fork === true) sessionMode = "fork";
+	else if (request.fork === false) sessionMode = "standalone";
 	return {
 		request,
 		id,
@@ -389,6 +391,7 @@ function prepareLaunchSurface(
 
 	const baseRef = request.worktree.base ?? "HEAD";
 	const baseSha = resolveGitCommit(resolved.sourceCwd, baseRef);
+	const provisionCwd = resolveWorktreeProvisionCwd(resolved.sourceCwd);
 	const manifestFile = join(
 		resolved.artifactDir,
 		"worktree-runs",
@@ -412,7 +415,7 @@ function prepareLaunchSurface(
 	try {
 		created = operations.createWorktree(
 			request.name,
-			resolved.sourceCwd,
+			provisionCwd,
 			request.worktree.branch,
 			baseSha,
 		);
@@ -916,6 +919,66 @@ function resolveGitCommit(cwd: string, ref: string): string {
 	}).trim();
 }
 
+function resolveWorktreeProvisionCwd(sourceCwd: string): string {
+	let gitDir: string;
+	let commonDir: string;
+	try {
+		gitDir = resolveGitPath(sourceCwd, "--git-dir");
+		commonDir = resolveGitPath(sourceCwd, "--git-common-dir");
+	} catch (error) {
+		throw new Error(
+			`Unable to identify the Git checkout for worktree provisioning from ${sourceCwd}: ${errorMessage(error)}`,
+		);
+	}
+	if (gitDir === commonDir) return sourceCwd;
+
+	try {
+		const output = execFileSync(
+			"git",
+			["worktree", "list", "--porcelain", "-z"],
+			{ cwd: sourceCwd },
+		).toString("utf8");
+		const principal = output
+			.split("\0")
+			.find((record) => record.startsWith("worktree "))
+			?.slice("worktree ".length);
+		if (!principal) throw new Error("Git returned no principal worktree");
+		return principal;
+	} catch (error) {
+		throw new Error(
+			`Unable to determine the principal Git checkout for linked worktree ${sourceCwd}: ${errorMessage(error)}`,
+		);
+	}
+}
+
+function resolveGitPath(
+	cwd: string,
+	flag: "--git-dir" | "--git-common-dir",
+): string {
+	const output = execFileSync(
+		"git",
+		["rev-parse", "--path-format=absolute", flag],
+		{ cwd, encoding: "utf8" },
+	);
+	return output.endsWith("\n") ? output.slice(0, -1) : output;
+}
+
+export function readWorktreeManifest(path: string): JsonObject | undefined {
+	try {
+		const value: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (
+			isRecord(value) &&
+			value.version === 1 &&
+			value.kind === "worktree-run" &&
+			value.owner === "pi-herdr-subagents"
+		)
+			return value;
+	} catch {
+		// Unreachable or malformed manifests do not establish ownership.
+	}
+	return undefined;
+}
+
 export function writeWorktreeManifest(path: string, value: JsonObject): void {
 	mkdirSync(dirname(path), { recursive: true });
 	let existing: JsonObject = {};
@@ -1017,7 +1080,7 @@ export function captureWorktreeHandoff(
 
 export function persistWorktreeResult(
 	worktree: WorktreeLaunch,
-	state: "running" | "ready_for_review" | "failed" | "needs_help",
+	state: "running" | "ready_for_review" | "failed" | "needs_help" | "removed",
 	handoff?: WorktreeHandoff,
 ): void {
 	writeWorktreeManifest(worktree.manifestFile, {

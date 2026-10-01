@@ -1,4 +1,6 @@
+import "./isolated-agent-dir.ts";
 import { describe, it, before, after } from "node:test";
+import { cleanupFixture } from "./worktree-cleanup-fixture.ts";
 import assert from "node:assert/strict";
 import {
 	existsSync,
@@ -6,19 +8,27 @@ import {
 	writeFileSync,
 	readFileSync,
 	mkdirSync,
+	readdirSync,
 	renameSync,
 	rmSync,
 	utimesSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import {
+	getSubagentsConfigPath,
+	getSubagentsConfigExamplePath,
+	getSubagentsPackageRoot,
+} from "../pi-extension/subagents/config-path.ts";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { execFileSync } from "node:child_process";
+import childProcess, { execFileSync, spawnSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import {
 	createEventBus,
 	SessionManager,
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { Value } from "@sinclair/typebox/value";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
 	isPlainObject,
@@ -53,6 +63,7 @@ import {
 	readPersistentTaskEvents,
 	appendPersistentDeliveryLedger,
 	readPersistentDeliveryLedger,
+	getPersistentDeliveryLedgerFile,
 	writePersistentTaskInbox,
 	consumePersistentTaskInbox,
 	type SessionEntry,
@@ -60,15 +71,14 @@ import {
 
 import {
 	isHerdrAvailable,
-	listHerdrWorktrees,
 	waitForProcessesExit,
 	__herdrTest__,
 } from "../pi-extension/subagents/herdr.ts";
-import { resolveConfigPath } from "../pi-extension/subagents/config-paths.ts";
 import {
 	loadModelConfig,
 	parseModelConfig,
 	resolveModelDefault,
+	writeTaskModelConfig,
 } from "../pi-extension/subagents/model-config.ts";
 import {
 	loadRoleConfig,
@@ -136,6 +146,10 @@ import {
 	type SubagentLifecycle,
 } from "../pi-extension/subagents/lifecycle.ts";
 import { launchPiSubagent } from "../pi-extension/subagents/launch.ts";
+import {
+	buildAuthenticatedModelCatalog,
+	wrapPiModelRegistry,
+} from "../pi-extension/subagents/runtime-routing.ts";
 
 // Tool-registration behavior is environment-sensitive for child subagents.
 // Isolate the unit suite from inherited parent/child capability variables.
@@ -177,6 +191,7 @@ function withTempDir(run: (dir: string) => void) {
 function createMockExtensionApi(extensionEvents = createEventBus()) {
 	const registeredTools: Array<any> = [];
 	const registeredCommands: Array<any> = [];
+	const registeredShortcuts: Array<any> = [];
 	const registeredMessageRenderers: Array<any> = [];
 	const eventHandlers = new Map<string, Array<Function>>();
 	const sentUserMessages: string[] = [];
@@ -184,6 +199,7 @@ function createMockExtensionApi(extensionEvents = createEventBus()) {
 	return {
 		registeredTools,
 		registeredCommands,
+		registeredShortcuts,
 		registeredMessageRenderers,
 		eventHandlers,
 		sentUserMessages,
@@ -207,7 +223,9 @@ function createMockExtensionApi(extensionEvents = createEventBus()) {
 			registerMessageRenderer(name: string, renderer: any) {
 				registeredMessageRenderers.push({ name, renderer });
 			},
-			registerShortcut() {},
+			registerShortcut(key: string, shortcut: any) {
+				registeredShortcuts.push({ key, ...shortcut });
+			},
 			sendUserMessage(message: string) {
 				sentUserMessages.push(message);
 			},
@@ -215,9 +233,6 @@ function createMockExtensionApi(extensionEvents = createEventBus()) {
 				sentMessages.push({ message, options });
 			},
 			getAllTools() {
-				return [];
-			},
-			getActiveTools() {
 				return [];
 			},
 		} as any,
@@ -1264,59 +1279,6 @@ describe("session.ts", () => {
 	});
 });
 
-describe("config-paths.ts", () => {
-	it("prefers the user-level config when it exists", () => {
-		withTempDir((dir) => {
-			writeFileSync(join(dir, "pi-herdr-agents.config.json"), "{}\n");
-			const previous = process.env.PI_CODING_AGENT_DIR;
-			process.env.PI_CODING_AGENT_DIR = dir;
-			try {
-				assert.equal(
-					resolveConfigPath("/fallback/config.json"),
-					join(dir, "pi-herdr-agents.config.json"),
-				);
-			} finally {
-				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
-			}
-		});
-	});
-
-	it("falls back to the package-local config when the user-level file is absent", () => {
-		withTempDir((dir) => {
-			const previous = process.env.PI_CODING_AGENT_DIR;
-			process.env.PI_CODING_AGENT_DIR = dir;
-			try {
-				assert.equal(
-					resolveConfigPath("/fallback/config.json"),
-					"/fallback/config.json",
-				);
-			} finally {
-				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
-			}
-		});
-	});
-
-	it("routes the no-argument loaders through the user-level config", () => {
-		withTempDir((dir) => {
-			writeFileSync(
-				join(dir, "pi-herdr-agents.config.json"),
-				JSON.stringify({
-					status: { enabled: false },
-					models: { default: "x/y" },
-				}) + "\n",
-			);
-			const previous = process.env.PI_CODING_AGENT_DIR;
-			process.env.PI_CODING_AGENT_DIR = dir;
-			try {
-				assert.equal(loadStatusConfig().enabled, false);
-				assert.equal(loadModelConfig().default, "x/y");
-			} finally {
-				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
-			}
-		});
-	});
-});
-
 describe("subagent resume launch policy", () => {
 	function runtimePlan() {
 		return {
@@ -1968,6 +1930,93 @@ describe("status.ts", () => {
 	});
 });
 
+describe("shared subagent configuration path", () => {
+	it("resolves the user config under PI_CODING_AGENT_DIR and keeps the packaged example separate", () => {
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = "/tmp/custom-pi-agent";
+		try {
+			assert.equal(
+				getSubagentsConfigPath(),
+				"/tmp/custom-pi-agent/herdr-agents/config.json",
+			);
+			assert.match(getSubagentsConfigExamplePath(), /config\.json\.example$/);
+		} finally {
+			restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+		}
+	});
+
+	it("keeps the packaged example strict JSON without task preferences", () => {
+		const example = JSON.parse(
+			readFileSync(getSubagentsConfigExamplePath(), "utf8"),
+		);
+		assert.equal(example.models.tasks, undefined);
+	});
+
+	it("ignores a decoy package-root config.json in every reader", () => {
+		withTempDir((dir) => {
+			const decoyPath = join(getSubagentsPackageRoot(), "config.json");
+			const previousDecoy = existsSync(decoyPath)
+				? readFileSync(decoyPath, "utf8")
+				: undefined;
+			const previous = process.env.PI_CODING_AGENT_DIR;
+			process.env.PI_CODING_AGENT_DIR = dir;
+			try {
+				writeFileSync(
+					decoyPath,
+					JSON.stringify({
+						status: { enabled: false },
+						models: { default: "decoy/model" },
+						roles: { bundled: false },
+						panes: { mode: "tab" },
+						supervision: { forcePolling: true },
+						persistent: { maxAgents: 1 },
+					}),
+				);
+				assert.deepEqual(loadModelConfig(), { agents: {} });
+				assert.equal(loadRoleConfig().bundled, true);
+				assert.equal(loadPaneConfig().mode, "grouped");
+				assert.equal(loadSupervisionConfig().forcePolling, false);
+				assert.equal(loadPersistentConfig().maxAgents, 3);
+				assert.equal(loadStatusConfig().enabled, true);
+			} finally {
+				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+				if (previousDecoy == null) rmSync(decoyPath, { force: true });
+				else writeFileSync(decoyPath, previousDecoy);
+			}
+		});
+	});
+
+	it("routes every config reader through the user config path", () => {
+		withTempDir((dir) => {
+			const previous = process.env.PI_CODING_AGENT_DIR;
+			process.env.PI_CODING_AGENT_DIR = dir;
+			try {
+				const configPath = getSubagentsConfigPath();
+				mkdirSync(dirname(configPath), { recursive: true });
+				writeFileSync(
+					configPath,
+					JSON.stringify({
+						status: { enabled: false },
+						models: { default: "fake/default" },
+						roles: { bundled: false },
+						panes: { mode: "tab" },
+						supervision: { forcePolling: true },
+						persistent: { maxAgents: 2 },
+					}),
+				);
+				assert.equal(loadModelConfig().default, "fake/default");
+				assert.equal(loadRoleConfig().bundled, false);
+				assert.equal(loadPaneConfig().mode, "tab");
+				assert.equal(loadSupervisionConfig().forcePolling, true);
+				assert.equal(loadPersistentConfig().maxAgents, 2);
+				assert.equal(loadStatusConfig().enabled, false);
+			} finally {
+				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			}
+		});
+	});
+});
+
 describe("pane configuration", () => {
 	it("defaults to four grouped panes when panes are absent", () => {
 		assert.deepEqual(parsePaneConfig({}), {
@@ -2154,6 +2203,240 @@ describe("model configuration", () => {
 		);
 	});
 
+	it("parses strict task preferences and metadata", () => {
+		assert.deepEqual(
+			parseModelConfig({
+				models: {
+					tasks: { coding: ["fake/worker"] },
+					tasksMeta: {
+						generatedAt: "2026-09-17T00:00:00Z",
+						method: "research",
+					},
+				},
+			}),
+			{
+				agents: {},
+				tasks: { coding: ["fake/worker"] },
+				tasksMeta: {
+					generatedAt: "2026-09-17T00:00:00Z",
+					method: "research",
+				},
+			},
+		);
+		for (const config of [
+			{ models: { tasks: { debugging: ["fake/worker"] } } },
+			{ models: { tasks: { coding: [] } } },
+			{ models: { tasks: { coding: [1] } } },
+			{ models: { tasksMeta: { generatedAt: "nope", method: "guesswork" } } },
+		]) {
+			assert.throws(
+				() => parseModelConfig(config),
+				/models\.tasks|models\.tasksMeta/,
+			);
+		}
+		for (const config of [
+			{ models: { default: "task:coding" } },
+			{ models: { agents: { worker: "task:coding" } } },
+		]) {
+			assert.throws(
+				() => parseModelConfig(config),
+				/only valid in the subagent tool's model parameter/,
+			);
+		}
+		assert.deepEqual(parseModelConfig({ models: { tasks: {} } }), {
+			agents: {},
+		});
+	});
+
+	it("rejects exact duplicate task candidates after trimming without changing case-sensitive IDs", () => {
+		assert.throws(
+			() =>
+				parseModelConfig({
+					models: { tasks: { coding: [" fake/Worker ", "fake/Worker"] } },
+				}),
+			/models\.tasks\.coding.*duplicate.*fake\/Worker/,
+		);
+		assert.deepEqual(
+			parseModelConfig({
+				models: {
+					tasks: { coding: [" fake/Worker ", "fake/worker", "proxy/Worker"] },
+				},
+			}).tasks,
+			{ coding: ["fake/Worker", "fake/worker", "proxy/Worker"] },
+		);
+	});
+
+	it("returns normalized saved preferences and missing categories after atomic replacement", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			const tasksMeta = {
+				generatedAt: "2026-09-18T00:00:00Z",
+				method: "registry-only" as const,
+			};
+			const result = writeTaskModelConfig(
+				configPath,
+				getSubagentsConfigExamplePath(),
+				{ coding: [" fake/worker "] },
+				tasksMeta,
+				(candidate) => candidate === "fake/worker",
+			);
+			assert.deepEqual(result, {
+				configPath,
+				tasks: { coding: ["fake/worker"] },
+				tasksMeta,
+				missingCategories: ["review", "recon", "qa", "architecture", "docs"],
+			});
+			const before = readFileSync(configPath, "utf8");
+			assert.throws(
+				() =>
+					writeTaskModelConfig(
+						configPath,
+						getSubagentsConfigExamplePath(),
+						{ coding: ["fake/worker", " fake/worker "] },
+						tasksMeta,
+						() => true,
+					),
+				/duplicate/,
+			);
+			assert.equal(readFileSync(configPath, "utf8"), before);
+		});
+	});
+
+	it("seeds from the packaged example and keeps every config section loadable", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "herdr-agents", "config.json");
+			const examplePath = getSubagentsConfigExamplePath();
+			writeTaskModelConfig(
+				configPath,
+				examplePath,
+				{ coding: ["fake/worker"] },
+				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+				(candidate) => candidate === "fake/worker",
+			);
+			assert.equal(
+				loadModelConfig(configPath).tasks?.coding?.[0],
+				"fake/worker",
+			);
+			assert.equal(loadRoleConfig(configPath, examplePath).bundled, true);
+			assert.equal(loadPaneConfig(configPath, examplePath).mode, "grouped");
+			assert.equal(
+				loadSupervisionConfig(configPath, examplePath).forcePolling,
+				false,
+			);
+			assert.equal(loadPersistentConfig(configPath, examplePath).maxAgents, 3);
+			assert.equal(loadStatusConfig(configPath, examplePath).enabled, true);
+		});
+	});
+
+	it("writes only validated task preferences into a seeded user config", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "herdr-agents", "config.json");
+			const examplePath = join(dir, "config.json.example");
+			writeFileSync(
+				examplePath,
+				JSON.stringify({
+					status: { enabled: true },
+					roles: { bundled: false },
+					models: { default: "fake/default" },
+				}),
+			);
+			writeTaskModelConfig(
+				configPath,
+				examplePath,
+				{ coding: ["fake/worker"] },
+				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+				(candidate) => candidate === "fake/worker",
+			);
+			assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+				status: { enabled: true },
+				roles: { bundled: false },
+				models: {
+					default: "fake/default",
+					tasks: { coding: ["fake/worker"] },
+					tasksMeta: {
+						generatedAt: "2026-09-17T00:00:00Z",
+						method: "research",
+					},
+				},
+			});
+			const before = readFileSync(configPath, "utf8");
+			assert.throws(
+				() =>
+					writeTaskModelConfig(
+						configPath,
+						examplePath,
+						{ coding: ["missing/model"] },
+						{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+						() => false,
+					),
+				/missing\/model/,
+			);
+			assert.equal(readFileSync(configPath, "utf8"), before);
+		});
+	});
+
+	it("repairs invalid existing task preferences without rewriting other model keys", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					status: { enabled: false },
+					models: { default: "fake/default", tasks: { coding: null } },
+				}),
+			);
+			writeTaskModelConfig(
+				configPath,
+				getSubagentsConfigExamplePath(),
+				{ coding: ["fake/worker"] },
+				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+				(candidate) => candidate === "fake/worker",
+			);
+			assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+				status: { enabled: false },
+				models: {
+					default: "fake/default",
+					tasks: { coding: ["fake/worker"] },
+					tasksMeta: {
+						generatedAt: "2026-09-17T00:00:00Z",
+						method: "research",
+					},
+				},
+			});
+		});
+	});
+
+	it("writes through an exclusive sibling temporary file before rename", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			const writes: Array<{ path: string; options: unknown }> = [];
+			const renames: Array<{ from: string; to: string }> = [];
+			writeTaskModelConfig(
+				configPath,
+				getSubagentsConfigExamplePath(),
+				{ coding: ["fake/worker"] },
+				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
+				(candidate) => candidate === "fake/worker",
+				{
+					writeFileSync(path, data, options) {
+						writes.push({ path: String(path), options });
+						writeFileSync(path, data, options);
+					},
+					renameSync(from, to) {
+						renames.push({ from: String(from), to: String(to) });
+						renameSync(from, to);
+					},
+				},
+			);
+			assert.equal(writes.length, 1);
+			assert.equal(dirname(writes[0].path), dirname(configPath));
+			assert.match(writes[0].path, /-config\.tmp$/);
+			assert.deepEqual(writes[0].options, { flag: "wx" });
+			assert.deepEqual(renames, [{ from: writes[0].path, to: configPath }]);
+			assert.equal(existsSync(writes[0].path), false);
+		});
+	});
+
 	it("rejects invalid model configuration", () => {
 		assert.throws(
 			() => parseModelConfig({ models: { default: "" } }),
@@ -2162,6 +2445,51 @@ describe("model configuration", () => {
 		assert.throws(
 			() => parseModelConfig({ models: { agents: [] } }),
 			/must be an object/,
+		);
+		assert.throws(
+			() => parseModelConfig({ models: { tasks: { debugging: ["fake/x"] } } }),
+			/models\.tasks\.debugging.*supported categories: coding, review, recon, qa, architecture, docs/,
+		);
+		assert.throws(
+			() => parseModelConfig({ models: { tasks: { coding: null } } }),
+			/models\.tasks\.coding must be a non-empty list/,
+		);
+		assert.throws(
+			() =>
+				parseModelConfig({
+					models: {
+						tasksMeta: {
+							generatedAt: "2026-09-17T00:00:00Z",
+							method: "guesswork",
+						},
+					},
+				}),
+			/models\.tasksMeta\.method must be "research" or "registry-only"/,
+		);
+		assert.throws(
+			() =>
+				parseModelConfig({
+					models: {
+						tasksMeta: {
+							generatedAt: "2026-09-17",
+							method: "research",
+						},
+					},
+				}),
+			/models\.tasksMeta\.generatedAt must be an ISO-8601 string/,
+		);
+		assert.throws(
+			() =>
+				parseModelConfig({
+					models: {
+						tasksMeta: {
+							generatedAt: "2026-09-17T00:00:00Z",
+							method: "research",
+							extra: true,
+						},
+					},
+				}),
+			/models\.tasksMeta has unsupported key\(s\): extra/,
 		);
 	});
 });
@@ -3005,6 +3333,11 @@ describe("subagent discovery", () => {
 		);
 		assert.match(instructions, /candidate-dependent/i);
 		assert.match(instructions, /different provider\/model family/i);
+		assert.doesNotMatch(
+			instructions,
+			/same-family.*fallback/i,
+			"adversarial reviewer must not allow same-family fallback",
+		);
 		assert.match(instructions, /fresh reviewer carrying alias\s+`S1`/i);
 		assert.match(instructions, /subagent_ping.*not a review report/is);
 		assert.match(instructions, /nonzero exit, provider error, launch error/i);
@@ -3064,8 +3397,16 @@ describe("subagent discovery", () => {
 				{ name: "A", task: "T", fork: false },
 				{ sessionMode: "fork" },
 			),
+			"standalone",
+			"fork: false must force standalone even when role declares fork",
+		);
+		assert.equal(
+			testApi.resolveEffectiveSessionMode(
+				{ name: "A", task: "T" },
+				{ sessionMode: "fork" },
+			),
 			"fork",
-			"fork: false must not override an inherited fork session mode",
+			"omitted fork must inherit role session-mode",
 		);
 	});
 
@@ -3114,6 +3455,19 @@ describe("subagent discovery", () => {
 				inheritsConversationContext: true,
 				taskDelivery: "direct",
 			},
+		);
+		assert.deepEqual(
+			testApi.resolveLaunchBehavior(
+				{ name: "A", task: "T", fork: false },
+				{ sessionMode: "fork" },
+			),
+			{
+				sessionMode: "standalone",
+				seededSessionMode: null,
+				inheritsConversationContext: false,
+				taskDelivery: "artifact",
+			},
+			"fork: false must produce standalone behavior despite role fork mode",
 		);
 	});
 
@@ -3936,6 +4290,63 @@ describe("subagent-done.ts", () => {
 		assert.equal(event.task, "task-1");
 		assert.equal(event.generation, "generation-1");
 		assert.ok(event.at);
+	});
+
+	it("registers no keyboard shortcut and renders no Ctrl+J hint", () => {
+		const previousAgent = process.env.PI_SUBAGENT_AGENT;
+		const previousDenyTools = process.env.PI_DENY_TOOLS;
+		process.env.PI_SUBAGENT_AGENT = "shortcut-test-agent";
+		process.env.PI_DENY_TOOLS = "browser_navigate, subagent";
+		try {
+			const { api, registeredShortcuts, eventHandlers } =
+				createMockExtensionApi();
+			api.getAllTools = () => [{ name: "read" }, { name: "bash" }];
+			subagentDoneExtension(api);
+			assert.deepEqual(registeredShortcuts, []);
+
+			const theme = {
+				fg: (_color: string, text: string) => text,
+				bg: (_color: string, text: string) => text,
+				bold: (text: string) => text,
+			};
+			let widgetFactory: Function | undefined;
+			const ctx = {
+				ui: {
+					setWidget(_name: string, factory: Function) {
+						widgetFactory = factory;
+					},
+				},
+			};
+			for (const handler of eventHandlers.get("session_start") ?? []) {
+				handler({}, ctx);
+			}
+			assert.deepEqual(
+				registeredShortcuts,
+				[],
+				"session start must not register keyboard shortcuts",
+			);
+			assert.ok(widgetFactory, "tools widget should still be rendered");
+			const widget = widgetFactory?.({}, theme);
+			const lines: string[] = widget.render(80);
+			assert.equal(
+				lines.length,
+				1,
+				`widget must render one compact line: ${JSON.stringify(lines)}`,
+			);
+			const rendered = lines[0];
+			assert.ok(
+				rendered.includes("[shortcut-test-agent] — 2 tools · 2 denied"),
+				`widget must show tool and denied counts: ${JSON.stringify(rendered)}`,
+			);
+			assert.equal(
+				rendered.includes("Ctrl+J"),
+				false,
+				`widget must not mention Ctrl+J: ${JSON.stringify(rendered)}`,
+			);
+		} finally {
+			restoreEnvVar("PI_SUBAGENT_AGENT", previousAgent);
+			restoreEnvVar("PI_DENY_TOOLS", previousDenyTools);
+		}
 	});
 
 	it("does not register subagent_done for auto-exit children", () => {
@@ -5427,7 +5838,7 @@ describe("commands", () => {
 		);
 	});
 
-	it("registers /worktree with only its list subcommand", async () => {
+	it("registers /worktree with list and explicit remove usage", async () => {
 		const { api, registeredCommands } = createMockExtensionApi();
 		subagentsModule.default(api);
 
@@ -5451,14 +5862,394 @@ describe("commands", () => {
 		await worktree.handler("list extra", ctx);
 		assert.deepEqual(notifications, [
 			{
-				message: "Usage: /worktree <name> [task] | /worktree list",
+				message:
+					"Usage: /worktree <name> [task] | /worktree list | /worktree remove <target> [--preserve]",
 				level: "warning",
 			},
 			{
-				message: "Usage: /worktree <name> [task] | /worktree list",
+				message:
+					"Usage: /worktree <name> [task] | /worktree list | /worktree remove <target> [--preserve]",
 				level: "warning",
 			},
 		]);
+	});
+
+	it("registers /subagents-init with registry research and reload guidance", async () => {
+		const { api, registeredCommands, sentUserMessages } =
+			createMockExtensionApi();
+		subagentsModule.default(api);
+		const init = registeredCommands.find(
+			(command) => command.name === "subagents-init",
+		);
+		assert.ok(init, "expected /subagents-init to be registered");
+		await init.handler("", {
+			modelRegistry: { find: () => undefined, getAvailable: () => [] },
+		});
+		assert.equal(sentUserMessages.length, 1);
+		assert.match(sentUserMessages[0], /registry object/);
+		assert.match(sentUserMessages[0], /web search/);
+		assert.match(sentUserMessages[0], /registry-only/);
+		assert.match(sentUserMessages[0], /subagents_write_task_models/);
+		assert.match(sentUserMessages[0], /\/reload/);
+	});
+
+	it("injects every live available model with sanitized facts, preferences, and category definitions", async () => {
+		const dir = createTestDir();
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		try {
+			const { api, registeredCommands, sentUserMessages } =
+				createMockExtensionApi();
+			subagentsModule.default(api);
+			// Written after registration: init must read the current saved preferences, not the module snapshot.
+			const configPath = getSubagentsConfigPath();
+			mkdirSync(dirname(configPath), { recursive: true });
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					privateSetting: "secret-unrelated-config",
+					models: {
+						default: "plain/old",
+						agents: { worker: "plain/old" },
+						tasks: { coding: ["plain/old"] },
+						tasksMeta: {
+							generatedAt: "2026-09-17T00:00:00Z",
+							method: "registry-only",
+						},
+					},
+				}),
+			);
+			const before = readFileSync(configPath, "utf8");
+			const models = Array.from({ length: 30 }, (_, i) => ({
+				provider: i === 29 ? "extension-bridge" : "plain",
+				id: `model-${String(i).padStart(2, "0")}`,
+				name: "Upstream model display name",
+				api: "openai-completions",
+				baseUrl: "https://secret-endpoint",
+				headers: { authorization: "secret-header" },
+				apiKey: "secret-key",
+				token: "secret-token",
+				reasoning: i === 29,
+				thinkingLevelMap: {
+					minimal: null,
+					low: null,
+					medium: null,
+					high: "secret-effort-value",
+					xhigh: null,
+					max: "max",
+				},
+				input: i === 29 ? ["text", "image"] : ["text"],
+				contextWindow: 200001 + i,
+				maxTokens: 16001 + i,
+				cost:
+					i === 0
+						? undefined
+						: { input: 0, output: 2, cacheRead: 0, secret: "secret-cost" },
+			}));
+			const registry = {
+				getAvailable: () => models.slice().reverse(),
+				find: (provider: string, id: string) =>
+					models.find((m) => m.provider === provider && m.id === id),
+				getAll: () => {
+					throw new Error("init must not read the unauthenticated catalog");
+				},
+				getRegisteredProviderIds: () => ["extension-bridge"],
+				getProviderAuthStatus: (provider: string) => ({
+					configured: true,
+					source: provider === "plain" ? "stored" : "secret-auth-source",
+					label: "secret-auth-label",
+				}),
+			};
+			const init = registeredCommands.find(
+				(command) => command.name === "subagents-init",
+			)!;
+			await init.handler(
+				"  Prefer capability over price; keep\nexisting coding choices.  ",
+				{ modelRegistry: registry },
+			);
+			assert.equal(sentUserMessages.length, 1);
+			const message = sentUserMessages[0];
+			assert.doesNotMatch(
+				message,
+				/secret-|baseUrl|apiKey|authorization|thinkingLevelMap/,
+			);
+			const json = message.match(/```json\n([\s\S]*?)\n```/);
+			assert.ok(json, "init must supply a structured registry brief");
+			const brief = JSON.parse(json[1]);
+			assert.equal(
+				brief.operatorPreferences,
+				"Prefer capability over price; keep\nexisting coding choices.",
+			);
+			assert.deepEqual(brief.categories, {
+				coding: "Implementation workers",
+				review: "Code reviewers",
+				recon: "Reconnaissance scouts",
+				qa: "Software and test runners",
+				architecture: "Planning and diagnosis",
+				docs: "Documentation workers",
+			});
+			assert.deepEqual(brief.current, {
+				default: "plain/old",
+				agents: { worker: "plain/old" },
+				tasks: { coding: ["plain/old"] },
+				tasksMeta: {
+					generatedAt: "2026-09-17T00:00:00Z",
+					method: "registry-only",
+				},
+			});
+			assert.equal(brief.models.length, 30);
+			assert.deepEqual(
+				brief.models.map((m: any) => m.ref),
+				[
+					"extension-bridge/model-29",
+					...Array.from(
+						{ length: 29 },
+						(_, i) => `plain/model-${String(i).padStart(2, "0")}`,
+					),
+				],
+			);
+			assert.deepEqual(brief.models[0], {
+				ref: "extension-bridge/model-29",
+				provider: "extension-bridge",
+				id: "model-29",
+				name: "Upstream model display name",
+				extensionRegistered: true,
+				auth: { configured: true },
+				reasoning: true,
+				supportedThinkingLevels: ["off", "high", "max"],
+				input: ["text", "image"],
+				contextWindow: 200030,
+				maxTokens: 16030,
+				cost: { input: 0, output: 2, cacheRead: 0 },
+			});
+			assert.equal(Object.hasOwn(brief.models[1], "cost"), false);
+			assert.deepEqual(brief.models[1].auth, {
+				configured: true,
+				source: "stored",
+			});
+			assert.deepEqual(brief.models[1].supportedThinkingLevels, ["off"]);
+			assert.equal(Object.hasOwn(brief.models[2].cost, "cacheWrite"), false);
+			assert.equal(
+				readFileSync(configPath, "utf8"),
+				before,
+				"init must not save a draft itself",
+			);
+			for (const rule of [
+				/capability-first/,
+				/efficiency/,
+				/complexity/,
+				/notable exclusions/,
+				/primary sources/,
+				/no usable evidence/,
+				/same upstream/,
+				/different.*family/,
+				/context-isolated/,
+				/not cross-family independent/,
+				/[Ww]hen no other.*family is available/,
+				/[Oo]rdinary review/,
+				/before\/after/,
+				/launch-time/,
+				/first authenticated/,
+				/not commands/,
+				/parent model/,
+			])
+				assert.match(message, rule);
+			const normalizedPrompt = message.replace(/\s+/g, " ").trim();
+			for (const clause of [
+				"Cross-family independent review requires a reviewer from a different model family than the author.",
+				"For ordinary review, prefer a different authenticated model family.",
+				"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
+				"Disclose that this review is context-isolated, not cross-family independent.",
+				"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			])
+				assert.ok(
+					normalizedPrompt.includes(clause),
+					`task-model init prompt must include: ${clause}`,
+				);
+		} finally {
+			restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("keeps a large init catalog complete in compact JSON and reports snapshot limits", async () => {
+		const { api, registeredCommands, sentUserMessages } =
+			createMockExtensionApi();
+		subagentsModule.default(api);
+		const models = Array.from({ length: 350 }, (_, i) => ({
+			provider: "gateway",
+			id: `alias-${i}`,
+			name: `Upstream ${i}`,
+			reasoning: false,
+		}));
+		await registeredCommands
+			.find((command) => command.name === "subagents-init")!
+			.handler("", {
+				modelRegistry: { getAvailable: () => models },
+			});
+		const message = sentUserMessages[0];
+		const json = message.match(/```json\n([\s\S]*?)\n```/);
+		assert.ok(json);
+		const brief = JSON.parse(json[1]);
+		assert.deepEqual(
+			new Set(brief.models.map((model: any) => model.ref)),
+			new Set(models.map((model) => `${model.provider}/${model.id}`)),
+		);
+		assert.equal(brief.models.length, models.length);
+		assert.equal(
+			json[1],
+			JSON.stringify(brief),
+			"catalog JSON must not add indentation or formatting whitespace",
+		);
+		assert.ok(message.includes(`${models.length} models`));
+		assert.ok(message.includes(`${json[1].length} JSON characters`));
+		assert.match(message, /synchronous snapshot/);
+		assert.match(message, /initial catalog refresh/);
+	});
+
+	it("tolerates an optional auth-status method returning undefined", async () => {
+		const { api, registeredCommands, sentUserMessages } =
+			createMockExtensionApi();
+		subagentsModule.default(api);
+		await registeredCommands
+			.find((command) => command.name === "subagents-init")!
+			.handler("", {
+				modelRegistry: {
+					getAvailable: () => [
+						{ provider: "dynamic", id: "model", reasoning: false },
+					],
+					getProviderAuthStatus: () => undefined,
+				},
+			});
+		const json = sentUserMessages[0].match(/```json\n([\s\S]*?)\n```/);
+		assert.ok(json);
+		assert.deepEqual(JSON.parse(json[1]).models[0].auth, { configured: true });
+	});
+
+	it("rejects empty task maps through the writer schema but accepts partial categories", () => {
+		const { api, registeredTools } = createMockExtensionApi();
+		subagentsModule.default(api);
+		const writer = registeredTools.find(
+			(tool) => tool.name === "subagents_write_task_models",
+		)!;
+		const tasksMeta = {
+			generatedAt: "2026-09-18T00:00:00Z",
+			method: "registry-only",
+		};
+		assert.equal(
+			Value.Check(writer.parameters, { tasks: {}, tasksMeta }),
+			false,
+		);
+		assert.equal(
+			Value.Check(writer.parameters, {
+				tasks: { coding: ["fake/worker"] },
+				tasksMeta,
+			}),
+			true,
+		);
+	});
+
+	it("supplies an honest empty init brief without inventing models or writing configuration", async () => {
+		const { api, registeredCommands, sentUserMessages } =
+			createMockExtensionApi();
+		subagentsModule.default(api);
+		await registeredCommands
+			.find((command) => command.name === "subagents-init")!
+			.handler("   ", {
+				modelRegistry: {
+					find: () => undefined,
+					getAvailable: () => [],
+					getAll: () => {
+						throw new Error("no fallback catalog");
+					},
+				},
+			});
+		const json = sentUserMessages[0].match(/```json\n([\s\S]*?)\n```/);
+		assert.ok(json);
+		const brief = JSON.parse(json[1]);
+		assert.equal(brief.operatorPreferences, "");
+		assert.deepEqual(brief.models, []);
+		assert.deepEqual(brief.current, { agents: {} });
+		assert.match(sentUserMessages[0], /no available models.*do not write/i);
+		assert.match(sentUserMessages[0], /not proof of.*successful.*request/i);
+	});
+
+	it("returns saved tool details and text from normalized config while preserving unrelated preferences", async () => {
+		const dir = createTestDir();
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		try {
+			const { api, registeredTools } = createMockExtensionApi();
+			subagentsModule.default(api);
+			const configPath = getSubagentsConfigPath();
+			mkdirSync(dirname(configPath), { recursive: true });
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					status: { enabled: false },
+					models: {
+						default: "fake/default",
+						agents: { scout: "fake/scout" },
+						tasks: { review: ["fake/old"] },
+					},
+				}),
+			);
+			const writer = registeredTools.find(
+				(tool) => tool.name === "subagents_write_task_models",
+			)!;
+			assert.deepEqual(
+				Object.keys(writer.parameters.properties.tasks.properties),
+				["coding", "review", "recon", "qa", "architecture", "docs"],
+			);
+			assert.equal(
+				writer.parameters.properties.tasks.additionalProperties,
+				false,
+			);
+			assert.equal(writer.parameters.properties.tasks.required?.length ?? 0, 0);
+			const tasksMeta = {
+				generatedAt: "2026-09-18T00:00:00Z",
+				method: "registry-only",
+			};
+			const model = { provider: "fake", id: "worker", reasoning: false };
+			const result = await writer.execute(
+				"init-write",
+				{ tasks: { coding: [" fake/worker "] }, tasksMeta },
+				undefined,
+				undefined,
+				{
+					modelRegistry: {
+						find: (provider: string, id: string) =>
+							provider === "fake" && id === "worker" ? model : undefined,
+						getAvailable: () => [model],
+						hasConfiguredAuth: () => true,
+					},
+				},
+			);
+			assert.deepEqual(result.details, {
+				configPath,
+				tasks: { coding: ["fake/worker"] },
+				tasksMeta,
+				missingCategories: ["review", "recon", "qa", "architecture", "docs"],
+			});
+			assert.match(result.content[0].text, /Reload required/);
+			assert.ok(
+				result.content[0].text.includes(
+					JSON.stringify(result.details, null, 2),
+				),
+			);
+			assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+				status: { enabled: false },
+				models: {
+					default: "fake/default",
+					agents: { scout: "fake/scout" },
+					tasks: { coding: ["fake/worker"] },
+					tasksMeta,
+				},
+			});
+		} finally {
+			restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("registers direct BTW commands without steering the parent", async () => {
@@ -5529,6 +6320,320 @@ describe("commands", () => {
 	});
 });
 
+describe("worktree cleanup public surface", () => {
+	it("skips startup inventory outside Herdr", async (t) => {
+		const previousHerdr = process.env.HERDR_ENV;
+		t.after(() => restoreEnvVar("HERDR_ENV", previousHerdr));
+		for (const herdrEnv of [undefined, "0"]) {
+			restoreEnvVar("HERDR_ENV", herdrEnv);
+			const f = cleanupFixture();
+			const scan = t.mock.method(f.operations, "scan");
+			const { api, eventHandlers } = createMockExtensionApi();
+			subagentsModule.default(api, { cleanupOperations: () => f.operations });
+			const notices: string[] = [];
+			await eventHandlers.get("session_start")![0](
+				{},
+				{
+					cwd: "/repo",
+					hasUI: true,
+					modelRegistry: { find: () => undefined, getAvailable: () => [] },
+					ui: { notify: (text: string) => notices.push(text) },
+				},
+			);
+			assert.deepEqual(notices, []);
+			assert.equal(scan.mock.callCount(), 0);
+		}
+	});
+	it("delivers process warnings through tool inventory, successful results, and Pi error messages", async () => {
+		for (const status of ["removed", "blocked", "failed"] as const) {
+			const f = cleanupFixture();
+			const warnings = [
+				"Incomplete process coverage: a protected process could hold the checkout undetected.",
+			];
+			f.operations.holders = async () => ({
+				blockers:
+					status === "blocked" ? ["Live process 202 holds the checkout"] : [],
+				warnings,
+			});
+			if (status === "failed")
+				f.operations.removeCheckout = () => {
+					throw new Error("remove refused");
+				};
+			const { api, registeredTools } = createMockExtensionApi();
+			subagentsModule.default(api, { cleanupOperations: () => f.operations });
+			const ctx = { cwd: "/repo" };
+			const inventory = await registeredTools
+				.find((tool) => tool.name === "worktree_list")!
+				.execute("id", {}, undefined, undefined, ctx);
+			assert.deepEqual(inventory.details.entries[0].warnings, warnings);
+			assert.match(inventory.content[0].text, /Warning:.*protected process/);
+			const remove = () =>
+				registeredTools
+					.find((tool) => tool.name === "worktree_remove")!
+					.execute("id", { target: "task" }, undefined, undefined, ctx);
+			if (status === "removed") {
+				const result = await remove();
+				assert.deepEqual(result.details.warnings, warnings);
+				assert.match(result.content[0].text, /Warning:.*protected process/);
+			} else {
+				await assert.rejects(remove, /Warning:.*protected process/);
+				assert.deepEqual(f.calls, []);
+			}
+		}
+	});
+	it("keeps worktree inventory out of session startup", async (t) => {
+		const previousHerdr = process.env.HERDR_ENV;
+		process.env.HERDR_ENV = "1";
+		t.mock.method(childProcess, "execSync", () => "/fixture/herdr\n");
+		syncBuiltinESMExports();
+		t.after(() => {
+			restoreEnvVar("HERDR_ENV", previousHerdr);
+			t.mock.restoreAll();
+			syncBuiltinESMExports();
+		});
+		const f = cleanupFixture();
+		const { api, registeredTools, registeredCommands, eventHandlers } =
+			createMockExtensionApi();
+		subagentsModule.default(api, { cleanupOperations: () => f.operations });
+		const notices: string[] = [];
+		const ctx = {
+			cwd: "/repo",
+			hasUI: true,
+			modelRegistry: { find: () => undefined, getAvailable: () => [] },
+			ui: { notify: (text: string) => notices.push(text) },
+		};
+		const list = registeredTools.find((tool) => tool.name === "worktree_list");
+		const remove = registeredTools.find(
+			(tool) => tool.name === "worktree_remove",
+		);
+		assert.ok(list);
+		assert.ok(remove);
+		const result = await list.execute("id", {}, undefined, undefined, ctx);
+		assert.equal(result.details.entries[0].classification, "eligible");
+		const scan = t.mock.method(f.operations, "scan");
+		await eventHandlers.get("session_start")![0]({}, ctx);
+		assert.deepEqual(notices, []);
+		assert.equal(scan.mock.callCount(), 0);
+		assert.deepEqual(f.calls, []);
+		const command = registeredCommands.find(
+			(item) => item.name === "worktree",
+		)!;
+		await command.handler("remove task", ctx);
+		assert.match(notices.at(-1)!, /Removed/);
+		assert.deepEqual(f.calls, ["git:/repo:/managed/repo/task", "prune:/repo"]);
+	});
+	it("dispatches preserve explicitly from the tool and command", async () => {
+		for (const surface of ["tool", "command"]) {
+			const f = cleanupFixture();
+			f.state.dirtyFiles = 1;
+			const { api, registeredTools, registeredCommands } =
+				createMockExtensionApi();
+			subagentsModule.default(api, { cleanupOperations: () => f.operations });
+			const ctx = { cwd: "/repo", ui: { notify: () => {} } };
+			if (surface === "tool")
+				await registeredTools
+					.find((tool) => tool.name === "worktree_remove")!
+					.execute(
+						"id",
+						{ target: "task", preserve: true },
+						undefined,
+						undefined,
+						ctx,
+					);
+			else
+				await registeredCommands
+					.find((item) => item.name === "worktree")!
+					.handler("remove task --preserve", ctx);
+			assert.equal(f.calls[0], "preserve");
+		}
+	});
+	it("keeps child Herdr list formatting, handoff dispatch, and silent startup", async (t) => {
+		const dir = createTestDir();
+		const previousId = process.env.PI_SUBAGENT_ID;
+		const previousHerdr = process.env.HERDR_ENV;
+		process.env.PI_SUBAGENT_ID = "child";
+		process.env.HERDR_ENV = "1";
+		let worktrees: object[] = [
+			{
+				branch: "feature/topic",
+				path: "/checkout/topic",
+				is_linked_worktree: true,
+				open_workspace_id: "w9",
+			},
+			{ branch: "main", path: "/repo", is_linked_worktree: false },
+			{
+				is_detached: true,
+				path: "/checkout/detached",
+				is_linked_worktree: true,
+			},
+		];
+		const effects: string[][] = [];
+		const availability = t.mock.method(
+			childProcess,
+			"execSync",
+			(command: string) => {
+				assert.equal(command, "command -v herdr");
+				return "/fixture/herdr\n";
+			},
+		);
+		const mocked = t.mock.method(
+			childProcess,
+			"execFileSync",
+			(file: string, args: string[], options: { cwd?: string }) => {
+				effects.push([file, ...args]);
+				if (file === "herdr" && args[0] === "worktree" && args[1] === "list") {
+					assert.deepEqual(args, ["worktree", "list", "--cwd", "/repo"]);
+					return JSON.stringify({
+						result: { type: "worktree_list", worktrees },
+					});
+				}
+				if (file === "git") {
+					assert.equal(options.cwd, "/repo");
+					if (args[1] === "--verify") {
+						assert.deepEqual(args, ["rev-parse", "--verify", "HEAD^{commit}"]);
+						return "a".repeat(40);
+					}
+					if (args[1] === "--path-format=absolute") {
+						if (args[2] === "--git-dir")
+							assert.deepEqual(args, [
+								"rev-parse",
+								"--path-format=absolute",
+								"--git-dir",
+							]);
+						else if (args[2] === "--git-common-dir")
+							assert.deepEqual(args, [
+								"rev-parse",
+								"--path-format=absolute",
+								"--git-common-dir",
+							]);
+						else assert.fail(`unexpected Git path command: ${args.join(" ")}`);
+						return "/repo/.git\n";
+					}
+					assert.fail(`unexpected Git command: ${args.join(" ")}`);
+				}
+				assert.equal(file, "herdr");
+				assert.deepEqual(args, [
+					"worktree",
+					"create",
+					"--cwd",
+					"/repo",
+					"--branch",
+					"feature/followup",
+					"--base",
+					"a".repeat(40),
+					"--label",
+					"wt: feature/followup",
+					"--no-focus",
+				]);
+				// Stop at the external creation boundary: no real workspace is created.
+				throw new Error("fixture handoff creation stopped");
+			},
+		);
+		syncBuiltinESMExports();
+		try {
+			const { api, registeredCommands, eventHandlers } =
+				createMockExtensionApi();
+			api.getThinkingLevel = () => "medium";
+			subagentsModule.default(api, {
+				cleanupOperations: () => {
+					throw new Error("child must not inspect cleanup inventory");
+				},
+			});
+			const notices: string[] = [];
+			const model = { provider: "fake", id: "test", reasoning: true };
+			let idleWaits = 0;
+			const ctx = {
+				cwd: "/repo",
+				hasUI: true,
+				model,
+				modelRegistry: {
+					find: () => model,
+					getAvailable: () => [model],
+					hasConfiguredAuth: () => true,
+				},
+				ui: { notify: (text: string) => notices.push(text) },
+				waitForIdle: async () => {
+					idleWaits++;
+				},
+				sessionManager: {
+					getSessionFile: () => join(dir, "parent.jsonl"),
+					getLeafId: () => "active-leaf",
+					getSessionId: () => "child",
+					getSessionDir: () => dir,
+				},
+			};
+			await eventHandlers.get("session_start")![0]({}, ctx);
+			assert.deepEqual(notices, []);
+			assert.deepEqual(effects, []);
+			const command = registeredCommands.find(
+				(command) => command.name === "worktree",
+			)!;
+			await command.handler("list", ctx);
+			assert.equal(
+				notices.at(-1),
+				"feature/topic — /checkout/topic (w9)\nmain — /repo\n(detached HEAD) — /checkout/detached",
+			);
+			worktrees = [];
+			await command.handler("list", ctx);
+			assert.equal(notices.at(-1), "No worktrees found.");
+			await command.handler("feature/followup", ctx);
+			assert.equal(idleWaits, 1);
+			assert.equal(
+				notices.at(-1),
+				"Worktree launch failed: fixture handoff creation stopped",
+			);
+			assert.equal(effects.length, 6);
+			const manifestDir = join(dir, "artifacts", "child", "worktree-runs");
+			const manifests = readdirSync(manifestDir);
+			assert.equal(manifests.length, 1);
+			const manifest = JSON.parse(
+				readFileSync(join(manifestDir, manifests[0]), "utf8"),
+			);
+			assert.equal(manifest.branch, "feature/followup");
+			assert.equal(manifest.state, "failed");
+			assert.equal(manifest.sourceCwd, "/repo");
+		} finally {
+			mocked.mock.restore();
+			availability.mock.restore();
+			syncBuiltinESMExports();
+			restoreEnvVar("PI_SUBAGENT_ID", previousId);
+			restoreEnvVar("HERDR_ENV", previousHerdr);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	it("keeps the child worktree command but rejects removal and hides cleanup tools", async () => {
+		process.env.PI_SUBAGENT_ID = "child";
+		try {
+			const { api, registeredTools, registeredCommands } =
+				createMockExtensionApi();
+			subagentsModule.default(api);
+			assert.equal(
+				registeredTools.some((tool) =>
+					["worktree_list", "worktree_remove"].includes(tool.name),
+				),
+				false,
+			);
+			const command = registeredCommands.find(
+				(command) => command.name === "worktree",
+			)!;
+			assert.ok(command);
+			assert.doesNotMatch(command.description, /remove/);
+			const notices: string[] = [];
+			const ctx = {
+				cwd: "/repo",
+				ui: { notify: (text: string) => notices.push(text) },
+			};
+			await command.handler("", ctx);
+			assert.match(notices.at(-1)!, /<name>.*worktree list/);
+			assert.doesNotMatch(notices.at(-1)!, /remove/);
+			await command.handler("remove task --preserve", ctx);
+			assert.match(notices.at(-1)!, /parent-only/);
+		} finally {
+			delete process.env.PI_SUBAGENT_ID;
+		}
+	});
+});
+
 describe("tool registration", () => {
 	it("refreshes subagent routing guidance from the live authenticated model registry", () => {
 		const { api, registeredTools, eventHandlers } = createMockExtensionApi();
@@ -5567,17 +6672,112 @@ describe("tool registration", () => {
 		assert.match(subagent.promptGuidelines.join("\n"), /fake\/fast/);
 		assert.match(
 			subagent.promptGuidelines.join("\n"),
-			/omit model to use the configured defaults/,
+			/explicitly set both model and thinking for every child/,
 		);
 		assert.match(
 			subagent.promptGuidelines.join("\n"),
-			/different provider\/family than the model that produced the work/,
+			/For ordinary review, prefer a different authenticated model family/,
 		);
 		assert.match(
 			subagent.promptGuidelines.join("\n"),
-			/Omitting model resolves through agent frontmatter/,
+			/context-isolated/,
+			"injected routing guidelines must describe context-isolated same-family fallback",
+		);
+		assert.match(
+			subagent.promptGuidelines.join("\n"),
+			/Omitting model and thinking still inherits the parent runtime, but this is a discouraged fallback/,
 		);
 		assert.match(subagent.promptGuidelines.join("\n"), /login-test2/);
+	});
+
+	it("distinguishes ordinary context-isolated review from strict cross-family review", () => {
+		const registry = wrapPiModelRegistry({
+			find: (p: string, id: string) => ({ provider: p, id, reasoning: true }),
+			getAvailable: () => [
+				{
+					provider: "fake",
+					id: "worker",
+					reasoning: true,
+					input: ["text"],
+					contextWindow: 128_000,
+					maxTokens: 16_000,
+				},
+			],
+			getAll: () => {
+				throw new Error("must not call getAll");
+			},
+		});
+		const clauses = [
+			"For ordinary review, prefer a different authenticated model family.",
+			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
+			"Disclose that this review is context-isolated, not cross-family independent.",
+			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+		];
+		for (const [label, taskPreferences] of [
+			["shortlist", { coding: ["fake/worker"] }],
+			["generic", {}],
+		] as const) {
+			const catalog = buildAuthenticatedModelCatalog(
+				registry,
+				24,
+				taskPreferences,
+			);
+			const combined = subagentsModule.__test__
+				.buildSubagentRoutingGuidelines(catalog, taskPreferences)
+				.join("\n")
+				.replace(/\s+/g, " ")
+				.trim();
+			for (const clause of clauses)
+				assert.ok(
+					combined.includes(clause),
+					`${label} combined guidance must include: ${clause}`,
+				);
+			if (label === "generic") {
+				const orchestratedLine = catalog
+					.split("\n")
+					.find((line) => line.startsWith("For orchestrated children"));
+				assert.ok(orchestratedLine);
+				assert.doesNotMatch(
+					orchestratedLine,
+					/ordinary|same-family|context-isolated/i,
+				);
+			}
+		}
+	});
+
+	it("states the complete ordinary-review taxonomy in routing guidelines", () => {
+		const guidelines = subagentsModule.__test__
+			.buildSubagentRoutingGuidelines("catalog", { coding: ["fake/worker"] })
+			.join("\n")
+			.replace(/\s+/g, " ")
+			.trim();
+		for (const clause of [
+			"For ordinary review, prefer a different authenticated model family.",
+			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
+			"Disclose that this review is context-isolated, not cross-family independent.",
+			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+		])
+			assert.ok(
+				guidelines.includes(clause),
+				`routing guidelines must include: ${clause}`,
+			);
+	});
+
+	it("renders generic routing tiers only when no authenticated shortlist is available", () => {
+		const configured = subagentsModule.__test__
+			.buildSubagentRoutingGuidelines("catalog", { coding: ["fake/worker"] })
+			.join("\n");
+		assert.match(configured, /prefer the configured task-category shortlists/);
+		assert.doesNotMatch(configured, /first choose a fast, mid, or frontier/);
+
+		const generic = subagentsModule.__test__
+			.buildSubagentRoutingGuidelines("catalog", {})
+			.join("\n");
+		assert.match(generic, /first choose a fast, mid, or frontier/);
+		assert.doesNotMatch(
+			generic,
+			/prefer the configured task-category shortlists/,
+		);
 	});
 
 	it("ignores an inherited deny list in a parent process", () => {
@@ -5604,7 +6804,8 @@ describe("tool registration", () => {
 		process.env.PI_SUBAGENT_ID = "child-test";
 		process.env.PI_DENY_TOOLS = "subagent,subagent_interrupt";
 		try {
-			const { api, registeredTools } = createMockExtensionApi();
+			const { api, registeredTools, registeredCommands } =
+				createMockExtensionApi();
 			subagentsModule.default(api);
 			assert.equal(
 				registeredTools.some((tool) => tool.name === "subagent"),
@@ -5617,6 +6818,16 @@ describe("tool registration", () => {
 			assert.equal(
 				registeredTools.some((tool) => tool.name === "subagents_list"),
 				true,
+			);
+			assert.equal(
+				registeredTools.some(
+					(tool) => tool.name === "subagents_write_task_models",
+				),
+				false,
+			);
+			assert.equal(
+				registeredCommands.some((command) => command.name === "subagents-init"),
+				false,
 			);
 		} finally {
 			delete process.env.PI_SUBAGENT_ID;
@@ -5631,9 +6842,10 @@ describe("tool registration", () => {
 		assert.equal(denied.has("subagent"), true);
 		assert.equal(denied.has("subagent_interrupt"), true);
 		assert.equal(denied.has("subagent_resume"), true);
+		assert.equal(denied.has("subagents_write_task_models"), true);
 	});
 
-	it("exposes worktree branch and optional base on the subagent tool", () => {
+	it("exposes a nullable worktree with branch and optional base", () => {
 		const { api, registeredTools } = createMockExtensionApi();
 		subagentsModule.default(api);
 
@@ -5641,11 +6853,115 @@ describe("tool registration", () => {
 			(tool) => tool.name === "subagent",
 		);
 		const worktreeSchema = subagentTool.parameters.properties.worktree;
+		const [objectSchema, nullSchema] = worktreeSchema.anyOf;
 
-		assert.deepEqual(worktreeSchema.required, ["branch"]);
-		assert.equal(worktreeSchema.properties.branch.minLength, 1);
-		assert.equal(worktreeSchema.properties.base.type, "string");
+		assert.deepEqual(objectSchema.required, ["branch"]);
+		assert.equal(objectSchema.properties.branch.minLength, 1);
+		assert.equal(objectSchema.properties.base.type, "string");
+		assert.equal(nullSchema.type, "null");
+		assert.match(worktreeSchema.description, /omit or pass null/i);
 		assert.match(subagentTool.description, /retain.*parent review/i);
+	});
+
+	it("describes the complete ordinary-review taxonomy in the model parameter", () => {
+		const { api, registeredTools } = createMockExtensionApi();
+		subagentsModule.default(api);
+		const subagentTool = registeredTools.find(
+			(tool) => tool.name === "subagent",
+		);
+		const modelDesc = (
+			subagentTool.parameters.properties.model.description ?? ""
+		)
+			.replace(/\s+/g, " ")
+			.trim();
+		for (const clause of [
+			"For ordinary review, prefer a different authenticated model family.",
+			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
+			"Disclose that this review is context-isolated, not cross-family independent.",
+			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+		])
+			assert.ok(
+				modelDesc.includes(clause),
+				`model description must include: ${clause}`,
+			);
+		assert.doesNotMatch(
+			modelDesc,
+			/when unavailable/i,
+			"model description must use the authenticated-family availability gate",
+		);
+	});
+
+	it("strict surfaces never permit same-family fallback", () => {
+		const orchestrateSkill = readFileSync(
+			join(getSubagentsPackageRoot(), "skills/orchestrate/SKILL.md"),
+			"utf8",
+		);
+		const adversarialProcedure = readFileSync(
+			join(
+				getSubagentsPackageRoot(),
+				"skills/orchestrate/adversarial-review.md",
+			),
+			"utf8",
+		);
+		const adversarialAgent = readFileSync(
+			join(getSubagentsPackageRoot(), "agents/adversarial-reviewer.md"),
+			"utf8",
+		);
+		const forbiddenOrdinaryReviewClauses = [
+			"For ordinary review, prefer a different authenticated model family.",
+			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
+			"Disclose that this review is context-isolated, not cross-family independent.",
+			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+		];
+		for (const [label, content] of [
+			["skills/orchestrate/SKILL.md", orchestrateSkill],
+			["skills/orchestrate/adversarial-review.md", adversarialProcedure],
+			["agents/adversarial-reviewer.md", adversarialAgent],
+		] as const) {
+			assert.doesNotMatch(
+				content,
+				/same-family[\s\S]{0,100}fallback/i,
+				`${label} must not contain same-family fallback language`,
+			);
+			assert.doesNotMatch(
+				content,
+				/context-isolated[\s\S]{0,60}review/i,
+				`${label} must not describe context-isolated review`,
+			);
+			assert.match(
+				content,
+				/different.*family/i,
+				`${label} must require different-family review`,
+			);
+			const compact = content.replace(/\s+/g, " ").trim();
+			for (const clause of forbiddenOrdinaryReviewClauses)
+				assert.ok(
+					!compact.includes(clause),
+					`${label} must not contain ordinary-review fallback clause: ${clause}`,
+				);
+		}
+	});
+
+	it("adversarial reviewer agent rejects multiline same-family fallback bypass", () => {
+		const agent = readFileSync(
+			join(getSubagentsPackageRoot(), "agents/adversarial-reviewer.md"),
+			"utf8",
+		);
+		assert.doesNotMatch(
+			agent,
+			/ordinary[\s\S]{0,200}same-family[\s\S]{0,200}fallback/i,
+			"adversarial reviewer must not contain any ordinary same-family fallback path",
+		);
+		assert.doesNotMatch(
+			agent,
+			/[Ww]hen no other.*family[\s\S]{0,200}same-family/,
+			"adversarial reviewer must not contain same-family availability gate",
+		);
+		assert.match(
+			agent,
+			/no model or tool fallback/,
+			"adversarial reviewer must explicitly state no fallback",
+		);
 	});
 
 	it("warns only when the resolved role is bundled", async () => {
@@ -6054,6 +7370,176 @@ describe("subagent activity snapshots", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+});
+
+describe("persistent delivery batch ledger", () => {
+	const testApi = subagentsModule.__test__;
+	// SAFETY: the extension stores this private runtime under the documented global symbol.
+	const runtime = (globalThis as Record<symbol, { pi?: unknown } | undefined>)[
+		Symbol.for("pi-subagents/runtime")
+	];
+	const runtimePi = runtime?.pi;
+	before(() => {
+		if (runtime) runtime.pi = undefined;
+	});
+	after(() => {
+		if (runtime) runtime.pi = runtimePi;
+	});
+	const makeRunning = (sessionFile: string): any => ({
+		id: "batch",
+		name: "Batch",
+		sessionFile,
+		persistent: true,
+		generationId: "generation",
+		logicalId: "logical",
+		policyHash: "a".repeat(64),
+		taskId: "task-1",
+		tasksCompleted: 0,
+	});
+
+	it("reads once for new events and suppresses same-batch duplicates of both outcomes", () => {
+		withTempDir((dir) => {
+			const running = makeRunning(join(dir, "batch.jsonl"));
+			for (const type of ["help-request", "task-done"] as const) {
+				for (const task of ["task-1", "task-2", "task-1", "task-2"]) {
+					appendPersistentTaskEvent(running.sessionFile, {
+						type,
+						task,
+						generation: "generation",
+					});
+				}
+			}
+			let reads = 0;
+			const messages: any[] = [];
+			const readLedger = (path: string) => {
+				reads++;
+				return readPersistentDeliveryLedger(path);
+			};
+			const api = {
+				sendMessage(message: any) {
+					messages.push(message);
+				},
+			};
+			testApi.drainPersistentTaskEvents(running, api, readLedger);
+			assert.equal(reads, 1);
+			assert.deepEqual(
+				messages.map((message) => message.customType),
+				[
+					"subagent_ping",
+					"subagent_ping",
+					"subagent_result",
+					"subagent_result",
+				],
+			);
+			assert.equal(readPersistentDeliveryLedger(running.sessionFile).length, 4);
+			assert.equal(running.tasksCompleted, 2);
+			assert.equal(running.taskId, undefined);
+			assert.equal(running.observedTaskEvents, 8);
+			appendPersistentTaskEvent(running.sessionFile, {
+				type: "task-done",
+				task: "task-1",
+				generation: "generation",
+			});
+			testApi.drainPersistentTaskEvents(running, api, readLedger);
+			assert.equal(reads, 2);
+			assert.equal(messages.length, 4);
+		});
+	});
+
+	it("does not load the ledger for another generation or an empty drain", () => {
+		withTempDir((dir) => {
+			const running = makeRunning(join(dir, "generation.jsonl"));
+			const readLedger = () => {
+				assert.fail("unnecessary ledger read");
+			};
+			testApi.drainPersistentTaskEvents(
+				running,
+				{
+					sendMessage() {
+						assert.fail("unexpected delivery");
+					},
+				},
+				readLedger,
+			);
+			appendPersistentTaskEvent(running.sessionFile, {
+				type: "task-done",
+				task: "task-1",
+				generation: "other",
+			});
+			testApi.drainPersistentTaskEvents(
+				running,
+				{
+					sendMessage() {
+						assert.fail("unexpected delivery");
+					},
+				},
+				readLedger,
+			);
+			assert.equal(running.observedTaskEvents, 1);
+		});
+	});
+
+	for (const type of ["help-request", "task-done"] as const) {
+		it(`keeps the snapshot retryable after ${type} append failure`, () => {
+			withTempDir((dir) => {
+				const running = makeRunning(join(dir, "failure.jsonl"));
+				const event = appendPersistentTaskEvent(running.sessionFile, {
+					type,
+					task: "task-1",
+					generation: "generation",
+				});
+				const ledger = readPersistentDeliveryLedger(running.sessionFile);
+				const ledgerFile = getPersistentDeliveryLedgerFile(running.sessionFile);
+				mkdirSync(ledgerFile);
+				let sends = 0;
+				const api = {
+					sendMessage() {
+						sends++;
+					},
+				};
+				assert.throws(
+					() => testApi.deliverPersistentTaskEvent(running, event, api, ledger),
+					/EISDIR/,
+				);
+				assert.equal(sends, 1);
+				assert.deepEqual(ledger, []);
+				assert.equal(running.taskId, "task-1");
+				assert.equal(running.tasksCompleted, 0);
+				rmSync(ledgerFile, { recursive: true });
+				testApi.deliverPersistentTaskEvent(running, event, api, ledger);
+				assert.equal(ledger.length, 1);
+				assert.deepEqual(
+					ledger,
+					readPersistentDeliveryLedger(running.sessionFile),
+				);
+				testApi.deliverPersistentTaskEvent(running, event, api, ledger);
+				assert.equal(sends, 2);
+			});
+		});
+
+		it(`direct ${type} delivery reads current disk state`, () => {
+			withTempDir((dir) => {
+				const running = makeRunning(join(dir, "direct.jsonl"));
+				const event = appendPersistentTaskEvent(running.sessionFile, {
+					type,
+					task: "task-1",
+					generation: "generation",
+				});
+				let sends = 0;
+				const api = {
+					sendMessage() {
+						sends++;
+					},
+				};
+				testApi.deliverPersistentTaskEvent(running, event, api);
+				testApi.deliverPersistentTaskEvent(running, event, api);
+				assert.equal(sends, 1);
+				rmSync(getPersistentDeliveryLedgerFile(running.sessionFile));
+				testApi.deliverPersistentTaskEvent(running, event, api);
+				assert.equal(sends, 2);
+			});
+		});
+	}
 });
 
 describe("persistent subagent send", () => {
@@ -7370,9 +8856,11 @@ describe("subagent interruption", () => {
 		assert.match(presentation, /Untracked: notes\.txt/);
 		assert.match(
 			presentation,
-			/After review and preservation, remove the workspace with:/,
+			/After review and preservation, explicitly remove/,
 		);
 		assert.match(presentation, /herdr worktree remove --workspace w9/);
+		assert.match(presentation, /\/worktree remove w9/);
+		assert.match(presentation, /worktree_remove/);
 		assert.equal(testApi.shouldRetainSubagentSurface({ worktree }), true);
 		assert.equal(testApi.shouldRetainSubagentSurface({}), false);
 	});
@@ -8137,20 +9625,49 @@ describe("subagents widget rendering", () => {
 });
 
 describe("herdr.ts", () => {
+	it("captures failed CLI stderr without leaking it to the parent terminal", () => {
+		const dir = createTestDir();
+		try {
+			writeFileSync(
+				join(dir, "herdr"),
+				'#!/bin/sh\nprintf \'{"error":{"code":"server_not_running"}}\\n\' >&2\nexit 1\n',
+				{ mode: 0o755 },
+			);
+			const moduleUrl = new URL(
+				"../pi-extension/subagents/herdr.ts",
+				import.meta.url,
+			).href;
+			const result = spawnSync(
+				process.execPath,
+				[
+					"--experimental-strip-types",
+					"--input-type=module",
+					"-e",
+					`
+				import { listHerdrWorktrees } from ${JSON.stringify(moduleUrl)};
+				try {
+					listHerdrWorktrees();
+					process.exitCode = 2;
+				} catch (error) {
+					if (error.status !== 1 || !String(error.stderr).includes("server_not_running")) throw error;
+				}
+			`,
+				],
+				{
+					encoding: "utf8",
+					env: { ...process.env, PATH: dir, NODE_NO_WARNINGS: "1" },
+				},
+			);
+			assert.equal(result.status, 0, result.stderr);
+			assert.equal(result.stderr, "");
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
 	describe("isHerdrAvailable", () => {
 		it("returns boolean based on HERDR_ENV", () => {
 			const result = isHerdrAvailable();
 			assert.ok(result === true || result === false);
-		});
-	});
-
-	describe("git work tree guard", () => {
-		it("does not treat a non-git path as a work tree", () => {
-			assert.equal(__herdrTest__.isInsideGitWorkTree(tmpdir()), false);
-		});
-
-		it("skips herdr worktree list outside a git work tree", () => {
-			assert.deepEqual(listHerdrWorktrees(tmpdir()), []);
 		});
 	});
 
@@ -8189,6 +9706,40 @@ describe("herdr.ts", () => {
 					},
 				],
 			);
+		});
+
+		it("accepts detached entries without a branch but rejects malformed identities", () => {
+			const parse = (
+				row: {
+					path?: string | number | null;
+					branch?: string | number | null;
+					is_detached?: boolean | string;
+					is_linked_worktree?: boolean;
+				} | null,
+			) =>
+				__herdrTest__.parseHerdrWorktreeList(
+					JSON.stringify({
+						result: { type: "worktree_list", worktrees: [row] },
+					}),
+				);
+			assert.deepEqual(
+				parse({
+					path: "/detached",
+					is_detached: true,
+					is_linked_worktree: true,
+				}),
+				[{ branch: "", path: "/detached", isLinkedWorktree: true }],
+			);
+			for (const row of [
+				null,
+				{ path: "/missing-branch" },
+				{ path: "/wrong-flag", is_detached: "true" },
+				{ path: "/wrong-branch", branch: 42, is_detached: true },
+				{ path: "/null-branch", branch: null, is_detached: true },
+				{ path: 42, is_detached: true },
+				{ branch: "main", path: null },
+			])
+				assert.throws(() => parse(row), /Unexpected herdr worktree list entry/);
 		});
 
 		it("accepts only complete, unique pane snapshots", () => {

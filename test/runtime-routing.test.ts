@@ -3,6 +3,7 @@ import { describe, it } from "node:test";
 import {
 	RuntimeResolutionError,
 	buildAuthenticatedModelCatalog,
+	getAuthenticatedTaskPreferences,
 	resolveRuntimePlan,
 	resolveRuntimePlans,
 	wrapPiModelRegistry,
@@ -33,6 +34,17 @@ function model(
 		...overrides,
 	};
 }
+
+function normalized(value: string) {
+	return value.replace(/\s+/g, " ").trim();
+}
+
+const ordinaryReviewClauses = [
+	"For ordinary review, prefer a different authenticated model family.",
+	"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
+	"Disclose that this review is context-isolated, not cross-family independent.",
+	"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+];
 
 function registry(entries = [model("fake", "parent"), model("other", "fast")]) {
 	const byRef = new Map(
@@ -149,6 +161,88 @@ describe("runtime routing", () => {
 		);
 	});
 
+	it("expands whole-value task references using authenticated configured order", () => {
+		const entries = [
+			model("fake", "parent"),
+			model("other", "worker"),
+			model("other", "backup"),
+			model("other", "unauthed"),
+		];
+		const tasks = {
+			coding: ["other/worker", "other/unauthed", "other/backup"],
+		};
+		assert.deepEqual(
+			resolveRuntimePlans(
+				{ model: " task:CoDiNg " },
+				{},
+				parent,
+				registry(entries),
+				tasks,
+			).map((plan) => plan.model),
+			["other/worker", "other/backup"],
+		);
+		assert.deepEqual(
+			resolveRuntimePlans(
+				{ model: "task:coding" },
+				{},
+				parent,
+				registry(entries),
+				tasks,
+				true,
+			).map((plan) => plan.model),
+			["other/worker"],
+		);
+		for (const modelReference of [
+			"task:coding, other/backup",
+			"other/backup, task:coding",
+		]) {
+			assert.throws(
+				() =>
+					resolveRuntimePlans(
+						{ model: modelReference },
+						{},
+						parent,
+						registry(entries),
+						tasks,
+					),
+				/must be the entire model value/,
+			);
+		}
+		assert.throws(
+			() =>
+				resolveRuntimePlans(
+					{ model: "task:qa" },
+					{},
+					parent,
+					registry(entries),
+					tasks,
+				),
+			/configured categories: coding/,
+		);
+		assert.throws(
+			() =>
+				resolveRuntimePlans(
+					{},
+					{ model: "task:coding" },
+					parent,
+					registry(entries),
+					tasks,
+				),
+			/only valid in the subagent tool's model parameter/,
+		);
+		assert.throws(
+			() =>
+				resolveRuntimePlans(
+					{ model: "task:coding" },
+					{},
+					parent,
+					registry([model("fake", "parent"), model("other", "unauthed")]),
+					{ coding: ["other/unauthed"] },
+				),
+			/task category "coding" has no authenticated candidates; authenticated alternatives: fake\/parent/,
+		);
+	});
+
 	it("keeps the selected source when agent defaults provide fallbacks", () => {
 		const plans = resolveRuntimePlans(
 			{},
@@ -249,12 +343,68 @@ describe("authenticated model catalog", () => {
 		assert.match(catalog, /200k context/);
 		assert.match(catalog, /other\/plain/);
 		assert.match(catalog, /non-reasoning/);
-		assert.match(catalog, /omit model to use the configured defaults/);
 		assert.match(
 			catalog,
-			/Reviews must use a different provider\/family than the producing model/,
+			/explicitly select an exact authenticated provider\/model-id by task tier first/,
 		);
-		assert.match(catalog, /select an exact provider\/model-id by task tier/);
+		assert.match(
+			catalog,
+			/For ordinary review, prefer a different authenticated model family/,
+		);
+		assert.match(
+			catalog,
+			/context-isolated/,
+			"generic catalog must describe context-isolated same-family fallback",
+		);
+		assert.match(
+			catalog,
+			/inherits the parent runtime as a discouraged fallback/,
+		);
+	});
+
+	it("renders authenticated configured shortlists in order with review guidance", () => {
+		const entries = [
+			model("fake", "parent"),
+			model("other", "first"),
+			model("other", "second"),
+			model("other", "unauthed"),
+		];
+		const tasks = {
+			coding: ["other/second", "other/unauthed", "other/first"],
+			review: ["fake/parent"],
+		};
+		assert.deepEqual(
+			getAuthenticatedTaskPreferences(registry(entries), tasks),
+			{
+				coding: ["other/second", "other/first"],
+				review: ["fake/parent"],
+			},
+		);
+		const catalog = buildAuthenticatedModelCatalog(
+			registry(entries),
+			24,
+			tasks,
+		);
+		assert.match(catalog, /- coding: other\/second, other\/first/);
+		assert.match(catalog, /- review: fake\/parent/);
+		assert.doesNotMatch(catalog, /other\/unauthed/);
+		assert.match(catalog, /The extension does not enforce this/);
+		assert.match(
+			catalog,
+			/context-isolated/,
+			"shortlist catalog must describe context-isolated same-family fallback",
+		);
+	});
+
+	it("keeps generic tier guidance when shortlists are empty or unconfigured", () => {
+		for (const tasks of [undefined, {}]) {
+			const catalog = buildAuthenticatedModelCatalog(registry(), 24, tasks);
+			assert.match(
+				catalog,
+				/explicitly select an exact authenticated provider\/model-id by task tier first/,
+			);
+			assert.doesNotMatch(catalog, /Task-category shortlists/);
+		}
 	});
 
 	it("caps large catalogs and reports omitted models", () => {
@@ -264,5 +414,48 @@ describe("authenticated model catalog", () => {
 		const catalog = buildAuthenticatedModelCatalog(registry(available), 5);
 		assert.equal((catalog.match(/^- fake\//gm) ?? []).length, 5);
 		assert.match(catalog, /25 more authenticated models omitted/);
+	});
+
+	it("keeps ordinary fallback separate from strict orchestration guidance in both catalog branches", () => {
+		const catalogs = [
+			[
+				"shortlist",
+				buildAuthenticatedModelCatalog(registry(), 24, {
+					coding: ["other/fast"],
+				}),
+			],
+			["generic", buildAuthenticatedModelCatalog(registry())],
+		] as const;
+		for (const [label, catalog] of catalogs) {
+			const compact = normalized(catalog);
+			for (const clause of ordinaryReviewClauses)
+				assert.ok(
+					compact.includes(clause),
+					`${label} catalog must include: ${clause}`,
+				);
+			assert.match(
+				compact,
+				/exact authenticated provider\/model-id/,
+				`${label} catalog must require an exact authenticated provider/model-id`,
+			);
+		}
+
+		const genericLines = catalogs[1][1].split("\n");
+		const orchestratedLine = genericLines.find((line) =>
+			line.startsWith("For orchestrated children"),
+		);
+		assert.ok(
+			orchestratedLine,
+			"generic catalog must include an orchestrated line",
+		);
+		assert.doesNotMatch(
+			orchestratedLine,
+			/ordinary|same-family|context-isolated/i,
+			"generic catalog's orchestrated line must not embed ordinary-review fallback",
+		);
+		assert.ok(
+			genericLines.some((line) => line.startsWith("For ordinary review")),
+			"generic catalog must put ordinary-review guidance on a separate line",
+		);
 	});
 });

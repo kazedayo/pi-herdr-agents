@@ -106,12 +106,24 @@ function extractHerdrWorktree(output: string): HerdrWorktreeSurface {
 	};
 }
 
-function herdrExec(args: string[]): string {
-	return execFileSync("herdr", args, { encoding: "utf8" });
+function herdrExec(args: string[], timeout?: number): string {
+	return execFileSync("herdr", args, {
+		stdio: "pipe",
+		encoding: "utf8",
+		timeout,
+		killSignal: "SIGKILL",
+	});
 }
 
-async function herdrExecAsync(args: string[]): Promise<string> {
-	const { stdout } = await execFileAsync("herdr", args, { encoding: "utf8" });
+async function herdrExecAsync(
+	args: string[],
+	timeout?: number,
+): Promise<string> {
+	const { stdout } = await execFileAsync("herdr", args, {
+		encoding: "utf8",
+		timeout,
+		killSignal: "SIGKILL",
+	});
 	return stdout;
 }
 
@@ -368,6 +380,7 @@ export function createHerdrGroupedSurface(
 
 /** Worktree records returned by `herdr worktree list`. */
 export interface HerdrWorktreeInfo {
+	/** Empty for a detached HEAD, matching cleanup's Git inspection. */
 	branch: string;
 	path: string;
 	label?: string;
@@ -401,11 +414,16 @@ export function parseHerdrWorktreeList(output: string): HerdrWorktreeInfo[] {
 		throw new Error("Unexpected herdr worktree list output");
 	}
 	return worktrees.map((worktree) => {
-		if (!isString(worktree.branch) || !isString(worktree.path)) {
+		if (
+			!isPlainObject(worktree) ||
+			!isString(worktree.path) ||
+			(!isString(worktree.branch) &&
+				!(worktree.branch === undefined && worktree.is_detached === true))
+		) {
 			throw new Error("Unexpected herdr worktree list entry");
 		}
 		const info: HerdrWorktreeInfo = {
-			branch: worktree.branch,
+			branch: isString(worktree.branch) ? worktree.branch : "",
 			path: worktree.path,
 			isLinkedWorktree: worktree.is_linked_worktree === true,
 		};
@@ -416,27 +434,24 @@ export function parseHerdrWorktreeList(output: string): HerdrWorktreeInfo[] {
 	});
 }
 
-function isInsideGitWorkTree(cwd: string): boolean {
-	try {
-		return (
-			execFileSync("git", ["-C", cwd, "rev-parse", "--is-inside-work-tree"], {
-				encoding: "utf8",
-				stdio: ["ignore", "pipe", "ignore"],
-			}).trim() === "true"
-		);
-	} catch {
-		return false;
-	}
+export function buildWorktreeRemoveArgs(workspaceId: string): string[] {
+	return ["worktree", "remove", "--workspace", workspaceId];
 }
 
-export function listHerdrWorktrees(cwd?: string): HerdrWorktreeInfo[] {
-	const target = cwd ?? process.cwd();
-	// Ask git first. Herdr's worktree CLI writes not_git_worktree JSON into the
-	// originating pane's input even when the Node caller catches the failure.
-	if (!isInsideGitWorkTree(target)) return [];
+export function removeHerdrWorktree(
+	workspaceId: string,
+	timeout?: number,
+): void {
+	herdrExec(buildWorktreeRemoveArgs(workspaceId), timeout);
+}
+
+export function listHerdrWorktrees(
+	cwd?: string,
+	timeout?: number,
+): HerdrWorktreeInfo[] {
 	const args = ["worktree", "list"];
 	if (cwd) args.push("--cwd", cwd);
-	return parseHerdrWorktreeList(herdrExec(args));
+	return parseHerdrWorktreeList(herdrExec(args, timeout));
 }
 
 function parseHerdrPaneList(output: string, workspaceId: string): string[] {
@@ -512,11 +527,6 @@ export function createHerdrWorktree(
 	branch: string,
 	base: string,
 ): HerdrWorktreeSurface {
-	if (!isInsideGitWorkTree(cwd)) {
-		throw new Error(
-			`Cannot create a Herdr worktree: ${cwd} is not inside a Git work tree`,
-		);
-	}
 	const output = herdrExec(buildWorktreeCreateArgs(name, cwd, branch, base));
 	try {
 		return retainWorktreeTab(extractHerdrWorktree(output), output);
@@ -688,9 +698,13 @@ export function parseHerdrPaneSnapshot(
 	return result;
 }
 
-export async function listHerdrPanes(): Promise<HerdrPaneListEntry[] | null> {
+export async function listHerdrPanes(
+	timeout?: number,
+): Promise<HerdrPaneListEntry[] | null> {
 	try {
-		return parseHerdrPaneSnapshot(await herdrExecAsync(["pane", "list"]));
+		return parseHerdrPaneSnapshot(
+			await herdrExecAsync(["pane", "list"], timeout),
+		);
 	} catch {
 		return null;
 	}
@@ -777,9 +791,12 @@ export function parsePaneProcessInfo(
 	return result;
 }
 
-export function getHerdrPaneProcessInfo(surface: string): HerdrPaneProcessInfo {
+export function getHerdrPaneProcessInfo(
+	surface: string,
+	timeout?: number,
+): HerdrPaneProcessInfo {
 	return parsePaneProcessInfo(
-		herdrExec(["pane", "process-info", "--pane", surface]),
+		herdrExec(["pane", "process-info", "--pane", surface], timeout),
 		surface,
 	);
 }
@@ -972,6 +989,7 @@ export const __herdrTest__ = {
 	buildTabCreateArgs,
 	buildPaneSplitArgs,
 	buildWorktreeCreateArgs,
+	buildWorktreeRemoveArgs,
 	parseHerdrJson,
 	extractHerdrPaneId,
 	extractHerdrRootPaneId,
@@ -984,5 +1002,4 @@ export const __herdrTest__ = {
 	parsePaneProcessInfo,
 	isHerdrShellReady,
 	isExpectedPiProcess,
-	isInsideGitWorkTree,
 };

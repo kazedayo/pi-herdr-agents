@@ -48,7 +48,7 @@ Preserve these invariants when changing worktree behavior:
 6. Herdr creates the workspace without stealing focus; launch targets the returned root pane explicitly.
 7. Successful, failed, and help-requesting runs retain their worktree workspace.
 8. Completion reports reviewable Git state; inspection failures are unknown, never guessed clean or conflict-free.
-9. The extension does not push, create PRs, merge, cherry-pick, switch the parent checkout, or remove worktrees/branches automatically.
+9. The extension does not push, create PRs, merge, cherry-pick, switch the parent checkout, or remove worktrees automatically. Explicit parent-owned cleanup uses cwd containment and fail-closed eligibility; branches are never deleted.
 10. Ordinary non-worktree subagent behavior remains unchanged.
 
 Read [`docs/worktree-subagents.md`](docs/worktree-subagents.md) before changing any of these semantics.
@@ -60,7 +60,7 @@ Read [`docs/worktree-subagents.md`](docs/worktree-subagents.md) before changing 
 - Keep overlapping or dependent writing tasks sequential unless the dependency is committed and used as the next exact base.
 - Tell worktree workers whether to commit. A good default is: edit, test, commit, report the SHA, and do not push/merge/remove.
 - The parent owns review, integration, publication, and cleanup.
-- Do not use `subagent_resume` as if it reattached worktree ownership; v1 can open the tab in the retained worktree workspace but does not reattach the managed lifecycle.
+- Do not use `subagent_resume` as if it reattached worktree ownership; v1 resumes into an ordinary pane.
 
 ## Documentation synchronization
 
@@ -105,8 +105,8 @@ Use `PI_TEST_MODEL="openai-codex/gpt-5.6-luna" PI_TEST_TIMEOUT=180000 npm run te
 Before committing:
 
 - inspect `git status` and the final diff;
-- confirm the package preview includes `CHANGELOG.md`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, and `skills/orchestrate/adversarial-review-example.js`, while excluding `pi-extension/subagents/workflow-worker.js`, plans, journals, sessions, prototypes, generated evidence, and local config;
-- run `npm pack --dry-run` when package contents or documentation paths changed;
+- confirm the package preview includes `CHANGELOG.md`, `skills/orchestrate/SKILL.md`, `skills/orchestrate/adversarial-review.md`, and `skills/orchestrate/adversarial-review-example.js`, while excluding `pi-extension/subagents/workflow-worker.js`, plans, journals, sessions, prototypes, generated evidence, local config, and `openspec/`;
+- run `npm pack --dry-run` when package contents or documentation paths changed; durable configuration is `$PI_CODING_AGENT_DIR/herdr-agents/config.json`, never package-root `config.json` (move old files manually or re-run `/subagents-init`);
 - confirm that no generated plans, journals, sessions, provider configuration, test scripts, or review artifacts are staged; and
 - confirm that no accidental empty directory exists at the repository root:
 

@@ -1,6 +1,6 @@
 /**
  * Extension loaded into sub-agents.
- * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
+ * - Shows agent identity + available tools as a compact styled widget above the editor
  * - Provides a `subagent_done` tool for interactive agents to self-terminate
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -133,7 +133,6 @@ export function parseDeniedTools(rawValue: string | undefined): string[] {
 export default function (pi: ExtensionAPI) {
 	let toolNames: string[] = [];
 	let denied: string[] = [];
-	let expanded = false;
 
 	// Read subagent identity from env vars (set by parent orchestrator)
 	const subagentName = process.env.PI_SUBAGENT_NAME ?? "";
@@ -172,46 +171,15 @@ export default function (pi: ExtensionAPI) {
 					? theme.bold(theme.fg("accent", `[${label}]`))
 					: "";
 
-				if (expanded) {
-					// Expanded: full tool list + denied
-					const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
-					const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
+				const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
+				const deniedInfo =
+					denied.length > 0
+						? theme.fg("dim", " · ") +
+							theme.fg("error", `${denied.length} denied`)
+						: "";
 
-					const toolList = toolNames
-						.map((name: string) => theme.fg("dim", name))
-						.join(theme.fg("muted", ", "));
-
-					let deniedLine = "";
-					if (denied.length > 0) {
-						const deniedList = denied
-							.map((name: string) => theme.fg("error", name))
-							.join(theme.fg("muted", ", "));
-						deniedLine = "\n" + theme.fg("muted", "denied: ") + deniedList;
-					}
-
-					const content = new Text(
-						`${agentTag}${countInfo}${hint}\n${toolList}${deniedLine}`,
-						0,
-						0,
-					);
-					box.addChild(content);
-				} else {
-					// Collapsed: one-line summary
-					const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
-					const deniedInfo =
-						denied.length > 0
-							? theme.fg("dim", " · ") +
-								theme.fg("error", `${denied.length} denied`)
-							: "";
-					const hint = theme.fg("muted", "  (Ctrl+J to expand)");
-
-					const content = new Text(
-						`${agentTag}${countInfo}${deniedInfo}${hint}`,
-						0,
-						0,
-					);
-					box.addChild(content);
-				}
+				const content = new Text(`${agentTag}${countInfo}${deniedInfo}`, 0, 0);
+				box.addChild(content);
 
 				return box;
 			},
@@ -225,22 +193,13 @@ export default function (pi: ExtensionAPI) {
 	let completionFinalized = false;
 	let sessionContext: { shutdown(): void } | undefined;
 
-	// Re-read the live active set and re-render only when it changed.
-	// Extensions like pi-fff register/activate tools inside their own
-	// session_start handler, so a one-shot snapshot here can miss them.
-	function refreshTools(ctx: { ui: { setWidget: Function } }) {
-		const names = pi.getActiveTools().sort();
-		if (names.join(",") === toolNames.join(",")) return;
-		toolNames = names;
-		renderWidget(ctx, null);
-	}
-
 	// Show widget + status bar on session start
 	pi.on("session_start", (_event, ctx) => {
 		sessionContext = ctx;
 		recorder.sessionStart();
+		const tools = pi.getAllTools();
+		toolNames = tools.map((t) => t.name).sort();
 		denied = parseDeniedTools(deniedToolsValue);
-		toolNames = pi.getActiveTools().sort();
 
 		renderWidget(ctx, null);
 	});
@@ -253,11 +212,8 @@ export default function (pi: ExtensionAPI) {
 		userTookOver = true;
 	});
 
-	pi.on("before_agent_start", (_event, ctx) => {
+	pi.on("before_agent_start", () => {
 		recorder.beforeAgentStart();
-		// By the first turn, every extension's session_start has run, so
-		// late-registered tools (e.g. pi-fff's multi_grep) are visible here.
-		refreshTools(ctx);
 	});
 
 	pi.on("agent_start", () => {
@@ -376,15 +332,6 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", (event) => {
 		if (inboxPoller) clearInterval(inboxPoller);
 		recorder.sessionShutdown(event.reason);
-	});
-
-	// Toggle expand/collapse with Ctrl+J
-	pi.registerShortcut("ctrl+j", {
-		description: "Toggle subagent tools widget",
-		handler: (ctx) => {
-			expanded = !expanded;
-			renderWidget(ctx, null);
-		},
 	});
 
 	pi.registerTool({

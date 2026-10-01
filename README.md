@@ -23,7 +23,7 @@ Delegate investigation, implementation, and review without blocking the parent s
 - [Herdr](https://herdr.dev) and its CLI
 - `HERDR_ENV=1` — start Pi from inside Herdr
 
-Other terminal multiplexers are not supported. Worktrees isolate Git checkouts, not processes or permissions; child agents and installed Pi packages run with your user account's access.
+Other terminal multiplexers are not supported. Session startup skips worktree inventory to avoid blocking Pi initialization; use `/worktree list` or `worktree_list` to inspect managed worktrees. Outside Herdr, explicit inventory tools still report unavailable inspection as unknown. Worktrees isolate Git checkouts, not processes or permissions; child agents and installed Pi packages run with your user account's access.
 
 ## Install
 
@@ -119,7 +119,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 
 ### Extensions
 
-**Subagents** — 6 main-session tools + 6 commands, plus 2 child-only tools:
+**Subagents** — 9 parent-session tools + 7 commands, plus 2 child-only tools:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
@@ -128,7 +128,10 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `subagent_send`      | Deliver a follow-up task to an idle persistent specialist                                   |
 | `subagent_stop`      | Gracefully stop a persistent specialist after its active task settles                      |
 | `subagents_list`     | List available agent definitions                                                            |
+| `worktree_list` | Parent-only inspect-only inventory of managed worktrees and cleanup blockers |
+| `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
 | `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
+| `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences |
 
 | Pi child-only tool | Description |
 | ---------------- | ------------------------------------------------------------------------- |
@@ -143,6 +146,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `/btw-close`               | Close the current BTW session        |
 | `/worktree <name> [task]`  | Continue this session in a new managed worktree (`/worktree list` lists them) |
 | `/subagent <agent> <task>` | Spawn a named agent directly (`/subagent list` lists available agents) |
+| `/subagents-init [preferences]` | Draft task-category model preferences from the live authenticated registry, with optional ranking preferences |
 
 ### Taxonomy and discovery
 
@@ -190,8 +194,7 @@ Optional prerequisites fail closed and are not bundled:
 
 This package does not install optional prerequisites.
 
-Bundled agents use model defaults from the subagent config file (see
-[Configuration](#configuration)) when configured; otherwise
+Bundled agents use model defaults from `config.json` when configured; otherwise
 they inherit the parent model. Thinking defaults still come from agent
 frontmatter or the parent level. This resolution chain remains available as a
 fallback, but orchestrators should explicitly set each child's exact
@@ -199,9 +202,16 @@ authenticated `provider/model-id` and supported thinking level. Select the
 model tier first: fast for bounded mechanical work and recon, mid for ordinary
 implementation or review, and frontier for architecture, security, hard
 diagnosis, or adversarial review. Then select thinking within that model's
-supported range. Independent reviewers must use a different provider/family
-than the model that produced the work; a stronger model in the same family is a
-quality escalation, not independent review.
+supported range. Cross-family independent review requires a reviewer from a
+different model family than the author. For ordinary review, prefer a different
+authenticated model family. When no other authenticated model family is
+available, ordinary review may use a same-family reviewer in a fresh standalone
+session. Disclose that this review is context-isolated, not cross-family
+independent. Cross-family verification, `/skill:orchestrate`, and
+`adversarial-reviewer` must not use this fallback. A stronger model in the same
+family is a quality escalation, not cross-family
+independent review. Family is the independence boundary; project policy may
+separately require a different provider.
 
 Discovery loads definitions in **package → global → project** order, so effective
 priority remains **project** (`.pi/agents/`) > **global**
@@ -272,27 +282,13 @@ A fixed internal watchdog marks a run as `stalled` when pane inspection fails or
 
 #### Configuration
 
-The extension reads one JSON config file. The canonical location is
-`~/.pi/agent/pi-herdr-agents.config.json`—outside the installed package, so
-package updates cannot overwrite it. When pi's `PI_CODING_AGENT_DIR` override
-is set, the extension reads `$PI_CODING_AGENT_DIR/pi-herdr-agents.config.json`
-instead.
-
-If the user-level file is absent, the extension falls back to `config.json` in
-the installed package root—the directory containing this README and
-`package.json`, not `pi-extension/subagents/` or Herdr's `config.toml`. That
-fallback exists for development checkouts: it is package-local, and npm or git
-package updates may overwrite it. Common global package roots are:
-
-- npm: `~/.pi/agent/npm/node_modules/pi-herdr-agents/`
-- git: `~/.pi/agent/git/<host>/<owner>/pi-herdr-agents/`
-
-Project-local installs use the corresponding `.pi/npm/` or `.pi/git/` root.
-From the actual package root, copy the example when you want local overrides:
-
-```bash
-cp config.json.example config.json
-```
+The durable user configuration is `$PI_CODING_AGENT_DIR/herdr-agents/config.json`,
+defaulting to `~/.pi/agent/herdr-agents/config.json`. It is not read from the
+installed package root, so npm and git package upgrades do not overwrite it.
+Create it by copying the installed package's `config.json.example`, or run
+`/subagents-init` to seed and draft model task preferences. This is a breaking
+migration: manually move an existing package-local `config.json` to this path,
+or re-run `/subagents-init`.
 
 ```json
 {
@@ -335,10 +331,107 @@ exact IDs from your authenticated model catalog:
     "agents": {
       "scout": "your-provider/your-fast-model",
       "reviewer": "your-provider/your-review-model"
+    },
+    "tasks": {
+      "coding": ["your-provider/your-coding-model"],
+      "review": ["your-provider/your-review-model"],
+      "recon": ["your-provider/your-fast-model"],
+      "qa": ["your-provider/your-qa-model"],
+      "architecture": ["your-provider/your-architecture-model"],
+      "docs": ["your-provider/your-docs-model"]
+    },
+    "tasksMeta": {
+      "generatedAt": "2026-09-17T00:00:00Z",
+      "method": "research"
     }
   }
 }
 ```
+
+`models.tasks` candidates are ordered exact authenticated IDs. Use
+`task:<category>` only in the `subagent` tool's `model` argument; it is not
+valid in frontmatter or model defaults. Cross-family independent review requires
+a reviewer from a different model family than the author. For ordinary review,
+prefer a different authenticated model family. When no other authenticated
+model family is available, ordinary review may use a same-family reviewer in a
+fresh standalone session. Disclose that this review is context-isolated, not
+cross-family independent. Cross-family verification, `/skill:orchestrate`, and
+`adversarial-reviewer` must not use this fallback. Use an exact authenticated
+shortlist `provider/model-id` when the
+authoring family is known; `task:review` does not establish independence. Family
+is the independence boundary; project policy may separately require a different
+provider. This is guidance, not extension enforcement.
+
+Run `/subagents-init [preferences]` to draft task-model preferences. For example:
+
+```text
+/subagents-init Prefer capability over price for implementation; keep recon inexpensive
+```
+
+The command supplies a sanitized snapshot of **all available models from the
+active session registry**, including extension-registered providers, exact IDs,
+display names, reported base token costs, context/output limits, input
+modalities, reasoning, and supported thinking levels. Safe extension-registration and auth-source
+metadata is included when Pi exposes it; credentials, endpoints, and raw auth
+labels are not. Configured authentication does not prove account access or a
+successful request. Missing costs remain unknown; reported zero does not mean
+free, and OAuth does not establish subscription billing. The brief uses compact
+JSON without truncating models and reports its model count and JSON character
+count (not a token estimate); large catalogs still consume context. This is the
+current synchronous snapshot: a dynamic provider whose initial catalog refresh
+has not completed might be absent. Init does not refresh providers or probe the
+network for availability.
+
+The draft considers current saved task, default, and per-agent preferences.
+Optional command arguments set ranking preferences. Otherwise it favors
+capability for substantive work and efficiency for bounded reconnaissance and
+test execution. Categories describe work, not complexity tiers:
+
+| Category | Work |
+| --- | --- |
+| `coding` | Implementation workers |
+| `review` | Code reviewers |
+| `recon` | Reconnaissance scouts |
+| `qa` | Software and test runners |
+| `architecture` | Planning and diagnosis |
+| `docs` | Documentation workers |
+
+Init asks the agent to research major candidates across providers using primary
+sources, disclose uncertainty and notable exclusions, and avoid duplicate
+upstream models across routes unless deliberate redundancy is explained. Display
+names help identify candidates but, like aliases, do not prove upstream
+equivalence; research is still required. Price or context size alone is not
+quality evidence. It reports `registry-only` when
+search is unavailable or yields no usable evidence; no live model probes run.
+
+The writer validates and atomically replaces `models.tasks` and `tasksMeta`,
+preserving unrelated settings. Its tool schema accepts partial nonempty
+categories (omitted categories are removed), rejects empty `tasks: {}` input,
+and rejects exact duplicate refs within a category after trimming;
+IDs remain case-sensitive. Its result includes normalized saved `tasks`,
+`tasksMeta`, `configPath`, and `missingCategories`. Init requests all six categories
+and a before/after table based on that saved result, not the unsaved draft. It
+must explain missing categories or changed choices; with no available models,
+it must report the limitation without writing.
+
+`task:<category>` values select subagent models; they are not slash commands and
+do not change the parent model. Ordered authenticated candidate plans resolve
+before launch. Ordinary nonpersistent runs can retry later candidates after
+launch failure or after a running child settles with a provider/agent error,
+not after a completed negative task result. Persistent specialists do not
+advance after a running-child error. This is not per-step routing; worktrees
+use the first authenticated candidate only, without fallback retries.
+Shortlists do not enforce reviewer independence. Cross-family independent
+review requires a reviewer from a different model family than the author. For
+ordinary review, prefer a different authenticated model family. When no other
+authenticated model family is available, ordinary review may use a same-family
+reviewer in a fresh standalone session. Disclose that this review is
+context-isolated, not cross-family independent. Cross-family verification,
+`/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.
+Another route to the same family is not
+independent review. Family is the independence boundary; project policy may
+separately require a different provider. Run `/reload` (or start a new session)
+after writing preferences.
 
 Set `persistent.maxAgents` to the maximum concurrently retained persistent specialists. It defaults to `3`; a persistent spawn at the cap is rejected before Herdr creates a pane or workspace, and no specialist is evicted.
 
@@ -352,7 +445,7 @@ collection; it never establishes a result by itself. If the watcher or shared
 pane inspection becomes unavailable, supervision quietly returns to the legacy
 one-second polling cadence. No caller action is required.
 
-Set `supervision.forcePolling` to `true` in the package-local `config.json` to
+Set `supervision.forcePolling` to `true` in the durable user `config.json` to
 disable wake-ups and use that legacy cadence deliberately. The setting is read
 when the coordinator is created, so run `/reload` after changing it.
 `subagents_list` reports the active transport mode (`wake+batch`,
@@ -413,7 +506,9 @@ Run `/reload` after changing role, model, or pane settings.
 followed by agent frontmatter, per-agent config, the global default, and finally
 the parent model. Model values must be exact authenticated `provider/model-id`
 references. A value can contain an ordered comma-separated fallback list, for
-example `provider/preferred, provider/fallback`. The extension validates every
+example `provider/preferred, provider/fallback`. The tool argument also accepts
+`task:<category>` as its complete value (not in a list), for configured
+`coding`, `review`, `recon`, `qa`, `architecture`, or `docs` preferences. The extension validates every
 candidate before launch, then launches later candidates only after the selected
 child settles with a provider/agent error. Pi owns any automatic transient
 retrying inside that child; the extension does not infer retry counts or
@@ -433,19 +528,9 @@ claim a permanent failure or a retry count that Pi has not exposed. Reliable
 structured permanence and retry counts require an upstream Pi/ExtensionAPI
 diagnostics seam for final provider errors and retry outcomes.
 
-`config.json` is gitignored in the source tree so local overrides are not
-committed from a checkout. On an installed package, prefer the user-level file;
-migrate an existing package-root config with:
-
-```bash
-cp ~/.pi/agent/npm/node_modules/pi-herdr-agents/config.json \
-	~/.pi/agent/pi-herdr-agents.config.json
-```
-
-Adjust the source path for git installs or a custom `PI_CODING_AGENT_DIR`.
-
-Run `/reload` after changing the config; status, model, role, and pane
-configuration are loaded when the extension starts.
+`config.json` is durable user state under the Pi agent directory and is loaded
+when the extension starts. Run `/reload` after changing it. Package-root
+`config.json` files are ignored; move them manually or re-run `/subagents-init`.
 
 ---
 
@@ -482,16 +567,16 @@ subagent({
 | `name`                 | string  | required       | Short stable child label; coordinated groups use `<task>-<role>[-n]` (widget and pane title)      |
 | `task`                 | string  | required       | Task prompt for the sub-agent                                                                     |
 | `agent`                | string  | —              | Load defaults from agent definition                                                               |
-| `fork`                 | boolean | `false`        | Force the full-context fork mode for this spawn, overriding any agent `session-mode` frontmatter  |
+| `fork`                 | boolean | —              | Override the child session mode: `true` forces fork, `false` forces standalone. Omit to inherit the agent `session-mode` frontmatter |
 | `persistent`           | boolean | `false`        | Keep one specialist session alive for sequential tasks; follow-ups use `subagent_send` only       |
 | `interactive`          | boolean | derived        | Mark this spawn as interactive (don't wake the parent on stall/recovery). Defaults to the agent's `interactive` frontmatter, otherwise the inverse of `auto-exit`. |
-| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`, or an ordered comma-separated Pi fallback list; fallback lists are unavailable for worktree spawns. Resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
+| `model`                | string  | configured or parent | Exact authenticated `provider/model-id`, ordered fallback list, or whole-value `task:<category>` (coding, review, recon, qa, architecture, docs). Task routing is tool-only; worktrees use its first authenticated candidate. Resolution is tool argument → agent frontmatter → per-agent config → global config → parent |
 | `thinking`             | string  | parent level   | Pick the model tier first, then set thinking within that model's range: minimal/low for bounded mechanical work, medium for ordinary implementation or review, high+ for architecture, security, or hard diagnosis. Omitting still inherits the parent level; this is a discouraged fallback for orchestrated children. |
 | `systemPrompt`         | string  | —              | Role/system-prompt text for a bare spawn; named agents keep their definition body                  |
 | `skills`               | string  | —              | Comma-separated skill names                                                                       |
 | `tools`                | string  | —              | Comma-separated tool names                                                                        |
 | `cwd`                  | string  | —              | Working directory, or source repository when `worktree` is set (see [Role Folders](#role-folders)) |
-| `worktree`             | object  | —              | Isolated Herdr-managed Git worktree; requires `branch`, with optional `base` (committed `HEAD` by default) |
+| `worktree`             | object \| null | —          | Isolated Herdr-managed Git worktree; requires `branch`, with optional `base` (committed `HEAD` by default). Omit or pass `null` to use an ordinary pane in `cwd` when a client requires the property. |
 
 ### Naming coordinated children
 
@@ -504,7 +589,7 @@ prompts, handoffs, and results.
 
 ### Isolated worktree runs
 
-Use one worktree per parallel independent writing task; a single or sequential writer can work in the parent checkout, and read-only agents use ordinary panes. `cwd` selects the source Git repository, `branch` must be unique, and `base` is resolved to an exact commit before creation. If `base` is omitted, the source checkout's committed `HEAD` is used. Parent-checkout changes that have not been committed are not copied.
+Use one worktree per parallel independent writing task; a single or sequential writer can work in the parent checkout, and read-only agents use ordinary panes. Omit `worktree` for an ordinary pane; clients whose generated tool schema requires every property may send `worktree: null` with the same effect. `cwd` selects the source Git repository, `branch` must be unique, and `base` is resolved to an exact commit before creation. If `cwd` is a linked checkout, Herdr provisioning uses the principal checkout while the requested checkout supplies the base SHA and manifest provenance. A successful launch from that linked checkout does not itself authorize cleanup there: cleanup checks the canonical principal/source repository under the invoking parent session's cwd, not `manifest.sourceCwd` or shared Git identity. If cleanup is needed, start the parent Pi session rooted at the principal checkout or an ancestor containing it, then use the normal explicit cleanup flow; changing directories inside an existing Pi session does not change its session cwd. If `base` is omitted, the source checkout's committed `HEAD` is used. Parent-checkout changes that have not been committed are not copied.
 
 A launch with `worktree` and an effective bundled `scout`, `reviewer`, or `adversarial-reviewer` returns a non-blocking warning. Scouts and reviewers normally need an ordinary pane; the adversarial reviewer is a coordinator that uses an ordinary pane for its child reviewers. To inspect or review an existing worker result, start an ordinary child in that retained worktree path. Project or global role overrides do not receive these bundled-role warnings. A `read,bash` allowlist is not an enforced read-only boundary because shell commands can mutate files; report-only roles must restrict Bash to safe inspection and avoid artifact-generating verification in the reviewed checkout.
 
@@ -512,7 +597,7 @@ The child starts at the returned worktree root. Tell writing agents to test and 
 
 Successful, failed, and help-requesting worktree runs retain their workspace and root shell. A reviewer's disposable pane can close without closing that root, tab, or checkout. Completion includes the worktree path, Herdr workspace, branch, base/head SHAs, commits ahead, changed and untracked files, and clean/dirty/conflicted state. Here, `clean` means no uncommitted files; the branch may still contain commits. If Git inspection fails, state is reported as unknown rather than guessed.
 
-An ownership manifest is written under the parent session's `artifacts/<session-id>/worktree-runs/` directory before Herdr creates resources. V1 does not automatically recover watchers after a full process restart. `subagent_resume` can open the new tab in a retained worktree's Herdr workspace, but it does not reattach the managed worktree lifecycle.
+An ownership manifest is written under the parent session's `artifacts/<session-id>/worktree-runs/` directory before Herdr creates resources. V1 does not automatically recover watchers after a full process restart, and `subagent_resume` does not reattach the managed worktree lifecycle.
 
 The extension does **not** push, create a PR, merge, cherry-pick, or remove the worktree or branch automatically. For task selection, lifecycle states, review commands, failure recovery, and safe cleanup, read [Worktree subagents](docs/worktree-subagents.md). The [research report](docs/research/worktree-subagent-orchestration.md) records the rationale and deferred roadmap.
 
@@ -600,7 +685,7 @@ await caller_ping({
 // with guidance like "Use v2, v1 is deprecated"
 ```
 
-> **Note:** `caller_ping` is only available inside Pi-backed subagent contexts. Calling it from a standalone Pi session returns an error. For a worktree child, the help handoff retains the workspace. `subagent_resume` can open the tab in that workspace, but it does not reattach worktree tracking.
+> **Note:** `caller_ping` is only available inside Pi-backed subagent contexts. Calling it from a standalone Pi session returns an error. For a worktree child, the help handoff retains the workspace, but `subagent_resume` does not reattach worktree tracking; continue the work in the retained workspace.
 
 ---
 
@@ -653,9 +738,17 @@ BTW shares the current working directory. It treats inherited work as reference 
 
 ## The `/worktree` Workflow
 
-`/worktree <worktree> [task]` creates a Herdr-managed worktree from the current committed branch and launches a new interactive Pi session there with the active conversation branch. The original session remains available. Use `/worktree list` to list worktrees for the current repository. This is a new-process handoff, not an in-place move of the existing shell or Pi process.
+`/worktree <worktree> [task]` creates a Herdr-managed worktree from the current committed branch and launches a new interactive Pi session there with the active conversation branch. The original session remains available. Use `/worktree list` or `worktree_list({})` to inspect managed worktrees, including cross-session orphans, whose canonical source repositories are inside the session's cwd subtree. This is a new-process handoff, not an in-place move of the existing shell or Pi process.
 
 ---
+
+### Explicit worktree cleanup
+
+Parent sessions can call `worktree_remove({ target: "<path|branch|workspace-id>", preserve: true })` or `/worktree remove <target> [--preserve]`. Preservation is optional and never implied: dirty work is blocked unless explicitly committed first or preserved as a WIP commit. The result reports its SHA even if removal later fails or is refused. A failed preservation commit restores the pre-preservation index and never proceeds to removal. Inventory and removal reports disclose exact ignored-file counts: enumeration is streamed rather than buffered as one listing. Ignored files do not block cleanup and are not captured by preservation; failed counting still blocks removal.
+
+Eligibility is rechecked at removal time: canonical source-repository cwd containment, registered linked checkout, no detected process holder, known live child, or persistent lease, and clean Git state with no untracked files or conflicts. A successful launch from a linked checkout does not itself authorize its removal; cleanup uses the canonical principal/source repository under the invoking parent session's cwd, not `manifest.sourceCwd` or shared Git identity. Start the parent Pi session rooted at that principal checkout or an ancestor containing it, then use normal explicit cleanup; `cd` inside an existing Pi session does not change the session cwd. Unknown inspection, identity disagreements, detached HEAD, locked checkouts, and initialized submodules block removal. Out-of-scope repositories are never eligible. Open workspaces use Herdr removal; orphans use Git removal and registration pruning after checkout absence is verified. Owned reachable manifests are marked `removed`; manifests from other sessions are not required or rewritten. Stale removed manifests never govern a recreated checkout. Missing or dangling manifest paths do not affect unrelated checkouts; undecidable or conflicting manifest identity still blocks removal. A failed manifest update after removal is reported as a warning. Symlinked ancestors are supported; checkout symlinks escaping the canonical managed root are blocked. Process inspection covers observable same-user processes across sessions, regardless of runtime name, exempting only Herdr-confirmed idle retained shells, never runtimes at the same PID. Unreadable individual process details produce non-blocking warnings without an override flag; scanning continues so another observable holder still blocks removal. Human and structured inventory/removal results disclose incomplete coverage, including warnings seen before a later recheck or failure. Same-user inspection is permission-limited, and other-user processes are not inspected: a protected process could hold the checkout undetected. Warnings aggregate counts and bounded PID samples, not commands or environments. Linux uses `/proc`; macOS uses same-user `lsof` cwd records and warns for unreadable individual records. Unsupported platforms, failed global enumeration (including a failed `lsof` with partial output), and other unverifiable eligibility evidence still block removal. Cleanup Git and Herdr calls have 30-second timeouts.
+
+Cleanup never deletes or rewrites branches, uses force flags, or runs automatically. Session startup does not scan worktree inventory, avoiding blocking Pi initialization; use `/worktree list` or `worktree_list` for an explicit inventory. Child sessions retain `/worktree list` and `/worktree <name>`, but receive neither cleanup tools nor the remove subcommand. Their repository-local listing labels detached entries `(detached HEAD)`; a detached sibling does not prevent inspection of named branches. See [cleanup and recovery](docs/worktree-subagents.md#cleanup) for details.
 
 ## Custom Agents
 
@@ -857,7 +950,7 @@ Choose how a subagent session starts:
 
 `lineage-only` is useful when you want session discovery and fork lineage UX to show the relationship later, but you do **not** want the child to inherit the parent's turns.
 
-`fork: true` on the tool call always forces the `fork` mode for that specific spawn. `/iterate` uses this explicit override on purpose.
+`fork: true` on the tool call forces `fork` mode; `fork: false` forces `standalone` mode. Omitting `fork` inherits the agent's frontmatter `session-mode`. `/iterate` uses the explicit `true` override on purpose.
 
 ```yaml
 ---
@@ -992,13 +1085,10 @@ spawning: false
 
 ## Tools Widget
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+Every sub-agent session displays a compact one-line tools widget summarizing available and denied tools:
 
 ```
-[scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
-[scout] — 12 available  (Ctrl+J to collapse)          ← expanded
-  read, bash, edit, write, ...
-  denied: subagent, subagents_list, ...
+[scout] — 12 tools · 4 denied
 ```
 
 ---
