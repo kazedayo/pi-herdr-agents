@@ -26,7 +26,12 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { getProviderRequests, resetProviderRequests } from "./fake-provider.ts";
+import {
+	getProviderRequests,
+	pauseProviderFailures,
+	resetProviderRequests,
+} from "./fake-provider.ts";
+import { inspectPane } from "../../maestro/surfaces/herdr/terminal.ts";
 import {
 	getAvailableBackends,
 	setBackend,
@@ -34,7 +39,6 @@ import {
 	createTestEnv,
 	cleanupTestEnv,
 	createTrackedSurface,
-	focusSurface,
 	startPi,
 	waitForScreen,
 	waitForFile,
@@ -69,77 +73,45 @@ it("dirty cleanup warning matcher rejects stale inventory", () => {
 	);
 });
 
-const backends = getAvailableBackends();
-
-function getWorkspaceActiveTab(workspaceId: string): string | null {
-	const workspaces: Array<{
-		workspace_id: string;
-		active_tab_id?: string;
-	}> = JSON.parse(
-		execFileSync("herdr", ["workspace", "list"], { encoding: "utf8" }),
-	).result.workspaces;
-	return (
-		workspaces.find((workspace) => workspace.workspace_id === workspaceId)
-			?.active_tab_id ?? null
-	);
-}
-
-function getPaneTab(paneId: string): string | null {
-	return (
-		JSON.parse(
-			execFileSync("herdr", ["pane", "get", paneId], {
-				encoding: "utf8",
-			}),
-		).result.pane?.tab_id ?? null
-	);
-}
-
-function listBtwPanes(workspaceId: string): string[] {
-	const tabs: Array<{ label: string; tab_id: string }> = JSON.parse(
-		execFileSync("herdr", ["tab", "list", "--workspace", workspaceId], {
-			encoding: "utf8",
-		}),
-	).result.tabs;
-	const btwTabIds = new Set(
-		tabs.filter((tab) => tab.label === "BTW").map((tab) => tab.tab_id),
-	);
-	const panes: Array<{ pane_id: string; tab_id: string }> = JSON.parse(
-		execFileSync("herdr", ["pane", "list", "--workspace", workspaceId], {
-			encoding: "utf8",
-		}),
-	).result.panes;
-	return panes
-		.filter((pane) => btwTabIds.has(pane.tab_id))
-		.map((pane) => pane.pane_id);
-}
-
-async function waitForBtwPane(
-	workspaceId: string,
-	previousPane?: string,
-	timeout = PI_TIMEOUT,
-): Promise<string> {
-	const startedAt = Date.now();
-	while (Date.now() - startedAt < timeout) {
-		const panes = listBtwPanes(workspaceId);
-		if (panes.length === 1 && panes[0] !== previousPane) return panes[0];
-		await sleep(500);
-	}
-	throw new Error(`Timeout waiting for BTW pane in workspace ${workspaceId}`);
-}
-
-async function waitForNoBtwPane(
-	workspaceId: string,
-	timeout = PI_TIMEOUT,
+async function waitForObservation(
+	observe: () => boolean | Promise<boolean>,
+	what: string,
+	timeout: number = PI_TIMEOUT,
 ): Promise<void> {
-	const startedAt = Date.now();
-	while (Date.now() - startedAt < timeout) {
-		if (listBtwPanes(workspaceId).length === 0) return;
-		await sleep(500);
+	const deadline = Date.now() + timeout;
+	while (!(await observe())) {
+		if (Date.now() > deadline)
+			throw new Error(`Timeout (${timeout}ms) waiting for ${what}`);
+		await sleep(250);
 	}
-	throw new Error(
-		`Timeout waiting for BTW pane cleanup in workspace ${workspaceId}`,
+}
+
+function parentTurnSettledAfterLaunch(sessionFile: string): boolean {
+	if (!existsSync(sessionFile)) return false;
+	const messages = readFileSync(sessionFile, "utf8")
+		.trim()
+		.split("\n")
+		.map((line) => JSON.parse(line))
+		.filter((entry) => entry.type === "message")
+		.map((entry) => entry.message);
+	const launched = messages.findIndex(
+		(message) =>
+			message.role === "toolResult" &&
+			message.toolName === "subagent" &&
+			message.details?.status === "started",
+	);
+	return (
+		launched >= 0 &&
+		messages
+			.slice(launched + 1)
+			.some(
+				(message) =>
+					message.role === "assistant" && message.stopReason === "stop",
+			)
 	);
 }
+
+const backends = getAvailableBackends();
 
 if (backends.length === 0) {
 	console.log(
@@ -167,75 +139,6 @@ for (const backend of backends) {
 		});
 
 		// ── Basic spawn + completion ──
-
-		it("opens, replaces, and closes a context-aware BTW pane without steering the parent", async () => {
-			const id = uniqueId();
-			const contextMarker = `SECRET_${id}`;
-			const expectedAnswer = new RegExp(`BTW_CONFIRMED_(?:SECRET_)?${id}`);
-			const parentSession = join(env.dir, `btw-parent-${id}.jsonl`);
-			const surface = createTrackedSurface(env, `btw-parent-${id}`);
-			await waitForPaneReady(surface);
-			const parentTab = getPaneTab(surface);
-			assert.ok(parentTab, "parent pane must belong to a Herdr tab");
-
-			startPi(surface, env.dir, `Reply with only ${contextMarker}.`, {
-				extraArgs: `--session ${shellQuote(parentSession)}`,
-			});
-			await waitForScreen(surface, new RegExp(contextMarker), PI_TIMEOUT);
-			await waitForFile(parentSession, PI_TIMEOUT, new RegExp(contextMarker));
-			const parentBefore = readFileSync(parentSession, "utf8");
-
-			focusSurface(backend, surface);
-			assert.equal(getWorkspaceActiveTab(env.workspaceId), parentTab);
-
-			runInPane(surface, "/btw Say FIRST and wait for another question");
-			const firstBtwPane = await waitForBtwPane(env.workspaceId);
-			assert.equal(
-				getWorkspaceActiveTab(env.workspaceId),
-				parentTab,
-				"opening BTW must not change the workspace's active tab",
-			);
-
-			runInPane(
-				surface,
-				"/btw Read the previous assistant answer. Reply with BTW_CONFIRMED_ followed by its secret code, with no spaces.",
-			);
-			const secondBtwPane = await waitForBtwPane(env.workspaceId, firstBtwPane);
-			assert.notEqual(
-				secondBtwPane,
-				firstBtwPane,
-				"second /btw should replace the first pane",
-			);
-			assert.equal(
-				getWorkspaceActiveTab(env.workspaceId),
-				parentTab,
-				"replacing BTW must not change the workspace's active tab",
-			);
-
-			try {
-				await waitForScreen(secondBtwPane, expectedAnswer, PI_TIMEOUT);
-			} catch (error) {
-				let childScreen = "<pane unavailable>";
-				try {
-					childScreen = readPane(secondBtwPane, 200);
-				} catch {
-					// Keep the original wait error when diagnostic screen capture fails.
-				}
-				throw new Error(
-					`${error instanceof Error ? error.message : String(error)}\n` +
-						`Parent screen:\n${readPane(surface, 200)}\n` +
-						`Child screen:\n${childScreen}`,
-				);
-			}
-			assert.equal(
-				readFileSync(parentSession, "utf8"),
-				parentBefore,
-				"BTW must not alter parent history",
-			);
-
-			runInPane(surface, "/btw-close");
-			await waitForNoBtwPane(env.workspaceId);
-		});
 
 		it("spawns a subagent that writes a file and verifies the session", async () => {
 			const id = uniqueId();
@@ -389,7 +292,7 @@ for (const backend of backends) {
 				[
 					"Call the subagent tool with these EXACT parameters:",
 					`  name: "${coordinatorName}"`,
-					'  agent: "adversarial-reviewer"',
+					'  agent: "test-coordinator"',
 					`  task: "${marker}"`,
 					"Do not do anything else. Just call the subagent tool once.",
 					`After completion, say PARENT_MULTI_WAVE_${id}.`,
@@ -509,22 +412,26 @@ for (const backend of backends) {
 				extraArgs: `-e ${shellQuote(decoyExtension)}`,
 			});
 
-			let worktree:
-				| { path: string; branch: string; open_workspace_id: string }
-				| undefined;
-			const startedAt = Date.now();
-			while (!worktree && Date.now() - startedAt < PI_TIMEOUT) {
-				const output = execFileSync(
-					"herdr",
-					["worktree", "list", "--cwd", env.dir, "--json"],
-					{
-						encoding: "utf8",
-					},
-				);
-				worktree = JSON.parse(output).result.worktrees.find(
+			type ListedWorktree = {
+				path: string;
+				branch: string;
+				open_workspace_id?: string;
+			};
+			const findWorktree = (): ListedWorktree | undefined =>
+				JSON.parse(
+					execFileSync(
+						"herdr",
+						["worktree", "list", "--cwd", env.dir, "--json"],
+						{ encoding: "utf8" },
+					),
+				).result.worktrees.find(
 					(candidate: { branch?: string }) => candidate.branch === branch,
 				);
-				if (!worktree) await sleep(250);
+			let worktree = findWorktree();
+			const startedAt = Date.now();
+			while (!worktree && Date.now() - startedAt < PI_TIMEOUT) {
+				await sleep(250);
+				worktree = findWorktree();
 			}
 			assert.ok(
 				worktree,
@@ -559,8 +466,11 @@ for (const backend of backends) {
 					}),
 					new RegExp(`Implement ${id}`),
 				);
+				// Herdr can list a new checkout before it opens the workspace, so the
+				// row found above may predate the workspace id.
+				worktree = findWorktree();
 				assert.ok(
-					worktree.open_workspace_id,
+					worktree?.open_workspace_id,
 					"Completed worktree workspace should remain open",
 				);
 				// The completed child's processes may briefly hold the checkout, and
@@ -637,13 +547,14 @@ for (const backend of backends) {
 					}),
 					new RegExp(`Implement ${id}`),
 				);
+				const removedWorkspaceId = worktree.open_workspace_id;
 				const remaining = JSON.parse(
 					execFileSync("herdr", ["workspace", "list"], { encoding: "utf8" }),
 				).result.workspaces;
 				assert.equal(
 					remaining.some(
 						(workspace: { workspace_id: string }) =>
-							workspace.workspace_id === worktree.open_workspace_id,
+							workspace.workspace_id === removedWorkspaceId,
 					),
 					false,
 				);
@@ -1034,7 +945,7 @@ for (const backend of backends) {
 			const sessionFile = join(env.dir, `resume-child-${id}.jsonl`);
 			const seedSurface = createTrackedSurface(env, `resume-seed-${id}`);
 			await waitForPaneReady(seedSurface);
-			startPi(seedSurface, env.dir, "BTW question: Say FIRST", {
+			startPi(seedSurface, env.dir, "Reply with only SEED_FIRST", {
 				extraArgs: `--print --session ${shellQuote(sessionFile)}`,
 			});
 			await waitForScreen(seedSurface, /FIRST/);
@@ -1268,6 +1179,91 @@ for (const backend of backends) {
 			assert.match(
 				result.content,
 				/Model used: pi-integration\/fallback-secondary/,
+			);
+		});
+
+		it("falls back through the live parent context after a parent reload", async () => {
+			const id = uniqueId();
+			const markerFile = `/tmp/pi-integ-reload-fallback-${id}.txt`;
+			const parentSession = join(env.dir, `reload-fallback-parent-${id}.jsonl`);
+			trackTempFile(env, markerFile);
+			const surface = createTrackedSurface(env, `reload-fallback-${id}`);
+			await waitForPaneReady(surface);
+			const releaseFailures = pauseProviderFailures();
+			let reloadedAt = 0;
+			try {
+				startPi(
+					surface,
+					env.dir,
+					[
+						`Call subagent once with name: "ReloadFallback-${id}".`,
+						`agent: "test-echo".`,
+						`model: "pi-integration/fallback-primary, pi-integration/fallback-secondary".`,
+						`task: "Run: echo 'RELOAD_FALLBACK_${id}' > '${markerFile}'".`,
+					].join("\n"),
+					{ extraArgs: `--session ${shellQuote(parentSession)}` },
+				);
+				await waitForObservation(
+					() =>
+						getProviderRequests().some(
+							(request) => request.model === "fallback-primary",
+						),
+					"the held primary-model request",
+				);
+				await waitForObservation(
+					() => parentTurnSettledAfterLaunch(parentSession),
+					"the parent's final assistant turn after the launch",
+				);
+				await waitForObservation(async () => {
+					const pane = await inspectPane(surface);
+					return pane.kind === "present" && pane.agentStatus === "idle";
+				}, "an idle parent pane");
+				runInPane(surface, "/reload");
+				await waitForScreen(surface, /Reloaded keybindings/, PI_TIMEOUT);
+				reloadedAt = Date.now();
+			} finally {
+				releaseFailures();
+			}
+			await waitForFile(
+				parentSession,
+				PI_TIMEOUT,
+				/"customType":"subagent_result"/,
+			);
+			const results = readFileSync(parentSession, "utf8")
+				.trim()
+				.split("\n")
+				.map((line) => JSON.parse(line))
+				.filter(
+					(entry) =>
+						entry.type === "custom_message" &&
+						entry.customType === "subagent_result",
+				);
+			assert.equal(results.length, 1);
+			const [result] = results;
+			assert.equal(result.details.errorMessage, undefined);
+			assert.match(
+				await waitForFile(markerFile, PI_TIMEOUT),
+				new RegExp(`RELOAD_FALLBACK_${id}`),
+			);
+			assert.deepEqual(result.details.fallbackAttempts, [
+				"pi-integration/fallback-primary",
+				"pi-integration/fallback-secondary",
+			]);
+			assert.equal(
+				result.details.runtimePlan.model,
+				"pi-integration/fallback-secondary",
+			);
+			assert.match(
+				result.details.fallbackFailures[0].error,
+				/deterministic fallback provider failure/,
+			);
+			assert.ok(
+				getProviderRequests().some(
+					(request) =>
+						request.model === "fallback-secondary" &&
+						request.status === 200 &&
+						(request.at ?? 0) > reloadedAt,
+				),
 			);
 		});
 

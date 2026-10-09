@@ -10,19 +10,28 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { once } from "node:events";
 import {
+	isExpectedPiProcess,
+	launchOperationsFromSurface,
+	PI_LAUNCH_SESSION_ENV,
 	launchPiSubagent,
 	launchPiWorktreeHandoff,
 	type FreshPiLaunchRequest,
 	type PiLaunchOperations,
 	type ResumePiLaunchRequest,
-} from "../pi-extension/subagents/launch.ts";
-import { createSubagentPaneFactory } from "../pi-extension/subagents/pane-config.ts";
+	type WorktreeSurfaceForLaunch,
+} from "../maestro/adapters/pi/launch.ts";
+import { createWorktreeOperations } from "../maestro/runtime/worktree-operations.ts";
+import { createSubagentPaneFactory } from "../maestro/core/config/pane-config.ts";
+import { FakeSurfaceProvider } from "../maestro/surfaces/fake/fake-surface-provider.ts";
+import type { SurfaceProvider } from "../maestro/core/surface-provider.ts";
+import { WorktreeProvisioningError } from "../maestro/core/surface-provider.ts";
 import {
 	readSubagentSessionPolicy,
 	writeSubagentSessionPolicy,
-} from "../pi-extension/subagents/session.ts";
+} from "../maestro/adapters/pi/session.ts";
 
 function expectedShellQuote(value: string): string {
 	return `'${value.replaceAll("'", "'\\''")}'`;
@@ -128,7 +137,434 @@ function writePublicResumePolicy(sessionFile: string): void {
 	});
 }
 
+function deferred<T = void>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((innerResolve) => {
+		resolve = innerResolve;
+	});
+	return { promise, resolve };
+}
+
+function providerWithOverrides(
+	base: FakeSurfaceProvider,
+	overrides: Partial<SurfaceProvider>,
+): SurfaceProvider {
+	return {
+		name: base.name,
+		isAvailable: () => base.isAvailable(),
+		createSurface: (opts) => base.createSurface(opts),
+		runCommand: (surface, command) => base.runCommand(surface, command),
+		readScreen: (surface, lines) => base.readScreen(surface, lines),
+		closeSurface: (surface) => base.closeSurface(surface),
+		listSurfaces: () => base.listSurfaces(),
+		attachSurface: (surface) => base.attachSurface(surface),
+		createWorktreeSurface: (opts) => base.createWorktreeSurface(opts),
+		removeWorktreeSurface: (workspace) => base.removeWorktreeSurface(workspace),
+		setupHint: () => base.setupHint(),
+		runScript: (surface, command, options) =>
+			base.runScript(surface, command, options),
+		inspectSurface: (surface) => base.inspectSurface(surface),
+		sendKeys: (surface, keys) => base.sendKeys(surface, keys),
+		getProcessInfo: (surface) => base.getProcessInfo(surface),
+		waitForShellReady: (surface) => base.waitForShellReady(surface),
+		waitForSurfaceAbsence: (surface, opts) =>
+			base.waitForSurfaceAbsence(surface, opts),
+		listWorktreeSurfaces: (opts) => base.listWorktreeSurfaces(opts),
+		reportOpenedPrimaryWorkspace: (input) =>
+			base.reportOpenedPrimaryWorkspace(input),
+		focusWorkspace: (workspace) => base.focusWorkspace(workspace),
+		setTitle: (target, title) => base.setTitle(target, title),
+		...overrides,
+	};
+}
+
 describe("Pi launch", () => {
+	it("launchOperationsFromSurface maps createPane to the provider's grouped placement", async () => {
+		const provider = new FakeSurfaceProvider();
+		const operations = launchOperationsFromSurface(provider, {
+			mode: "grouped",
+			direction: "right",
+			maxPerTab: 4,
+		});
+
+		const surface = await operations.createPane("x", process.cwd());
+
+		assert.equal(surface, "fake-surface-1");
+		assert.equal((await provider.listSurfaces())[0]?.name, "x");
+	});
+
+	it("launchOperationsFromSurface awaits deferred cleanup before reporting a failed ordinary launch", async () => {
+		await withFixture(async ({ request }) => {
+			const fake = new FakeSurfaceProvider();
+			const closeEntered = deferred();
+			const closeGate = deferred();
+			let settled = false;
+			const provider = providerWithOverrides(fake, {
+				name: "async-fake",
+				async createSurface(opts) {
+					return fake.createSurface(opts);
+				},
+				async closeSurface(surface) {
+					closeEntered.resolve();
+					await closeGate.promise;
+					fake.closeSurface(surface);
+				},
+				runScript() {
+					throw new Error("script rejected");
+				},
+			});
+			const operations = launchOperationsFromSurface(provider, {
+				mode: "grouped",
+				direction: "right",
+				maxPerTab: 4,
+			});
+
+			const launch = launchPiSubagent(request, operations);
+			const observedRejection = assert.rejects(launch, /script rejected/);
+			launch
+				.finally(() => {
+					settled = true;
+				})
+				.catch(() => {});
+
+			await closeEntered.promise;
+			await new Promise((resolve) => setImmediate(resolve));
+			try {
+				assert.equal(settled, false);
+				assert.equal((await provider.listSurfaces()).length, 1);
+			} finally {
+				closeGate.resolve();
+			}
+			await observedRejection;
+			assert.deepEqual(await provider.listSurfaces(), []);
+		});
+	});
+
+	async function assertPiReady(
+		processInfo: SurfaceProvider["getProcessInfo"] extends (
+			...args: any[]
+		) => infer Result
+			? Awaited<Result>
+			: never,
+	) {
+		const provider = new FakeSurfaceProvider();
+		provider.createSurface({ name: "ready", cwd: "/repo" });
+		const operations = launchOperationsFromSurface(
+			providerWithOverrides(provider, {
+				getProcessInfo: async () => processInfo,
+			}),
+			{ mode: "grouped", direction: "right", maxPerTab: 4 },
+		);
+		assert.ok(operations.waitForPiReady);
+		await operations.waitForPiReady(
+			"fake-surface-1",
+			"/tmp/child.jsonl",
+			"/repo",
+		);
+	}
+
+	async function assertPiReadyRejects(
+		processInfo: SurfaceProvider["getProcessInfo"] extends (
+			...args: any[]
+		) => infer Result
+			? Awaited<Result>
+			: never,
+		reason = /expected Pi process not observed/,
+	) {
+		const provider = new FakeSurfaceProvider();
+		provider.createSurface({ name: "ready", cwd: "/repo" });
+		const operations = launchOperationsFromSurface(
+			providerWithOverrides(provider, {
+				getProcessInfo: () => processInfo,
+			}),
+			{ mode: "grouped", direction: "right", maxPerTab: 4 },
+		);
+		const originalNow = Date.now;
+		const times = [0, 0, 10_001];
+		Date.now = () => times.shift() ?? 10_001;
+		try {
+			assert.ok(operations.waitForPiReady);
+			await assert.rejects(
+				operations.waitForPiReady(
+					"fake-surface-1",
+					"/tmp/child.jsonl",
+					"/repo",
+				),
+				new RegExp(
+					`Timed out waiting for Pi session /tmp/child\\.jsonl in Herdr pane fake-surface-1: ${reason.source}`,
+				),
+			);
+		} finally {
+			Date.now = originalNow;
+		}
+	}
+
+	/** A live process whose exec-time environment names one launched session. */
+	async function withLaunchedSessionProcess(
+		sessionFile: string | undefined,
+		run: (pid: number) => Promise<void>,
+	) {
+		const env = { ...process.env };
+		delete env[PI_LAUNCH_SESSION_ENV];
+		if (sessionFile !== undefined) env[PI_LAUNCH_SESSION_ENV] = sessionFile;
+		const child = spawn(
+			process.execPath,
+			["-e", "setInterval(() => {}, 1e3)"],
+			{
+				env,
+				stdio: "ignore",
+			},
+		);
+		try {
+			await once(child, "spawn");
+			assert.ok(child.pid);
+			await run(child.pid);
+		} finally {
+			child.kill("SIGKILL");
+		}
+	}
+
+	const linuxOnly = { skip: process.platform !== "linux" };
+
+	it("Pi readiness matches the launched session by environment, not rewritten argv", () => {
+		// Herdr 0.9.3 pane process-info for a live Pi: its title rewrite leaves no `--session`.
+		const herdrReported = {
+			pid: 42,
+			name: "pi",
+			argv: ["pi"],
+			cwd: "/repo",
+		};
+		const environments = new Map([
+			[42, new Map([[PI_LAUNCH_SESSION_ENV, "/tmp/child.jsonl"]])],
+			[43, new Map([[PI_LAUNCH_SESSION_ENV, "/tmp/other.jsonl"]])],
+			[44, new Map<string, string>()],
+		]);
+		const read = (pid: number) => environments.get(pid);
+		assert.equal(
+			isExpectedPiProcess(herdrReported, "/tmp/child.jsonl", "/repo", read),
+			true,
+		);
+		for (const process of [
+			{ ...herdrReported, pid: 43 },
+			{ ...herdrReported, pid: 44 },
+			{ ...herdrReported, pid: 45 },
+			{
+				...herdrReported,
+				pid: 43,
+				argv: ["pi", "--session", "/tmp/child.jsonl"],
+			},
+			{ ...herdrReported, cwd: "/wrong" },
+			{ ...herdrReported, name: "node" },
+		]) {
+			assert.equal(
+				isExpectedPiProcess(process, "/tmp/child.jsonl", "/repo", read),
+				false,
+				JSON.stringify(process),
+			);
+		}
+	});
+
+	it(
+		'provider Pi readiness accepts a Pi whose argv was rewritten to ["pi"]',
+		linuxOnly,
+		async () => {
+			await withLaunchedSessionProcess("/tmp/child.jsonl", async (pid) => {
+				await assertPiReady({
+					pids: [pid],
+					foregroundProcesses: [
+						{ pid, name: "pi", argv: ["pi"], cwd: "/repo" },
+					],
+				});
+				await assertPiReady({
+					pids: [pid],
+					foregroundProcesses: [
+						{ pid, argv0: "/usr/local/bin/pi", argv: ["pi"], cwd: "/repo" },
+					],
+				});
+				await assertPiReady({
+					pids: [pid],
+					foregroundProcesses: [
+						{ pid, name: "pi", argv0: "/not/pi/", argv: ["pi"], cwd: "/repo" },
+					],
+				});
+			});
+		},
+	);
+
+	it(
+		"provider Pi readiness never accepts another session's Pi",
+		linuxOnly,
+		async () => {
+			await withLaunchedSessionProcess("/tmp/other.jsonl", async (pid) => {
+				for (const argv of [["pi"], ["pi", "--session", "/tmp/child.jsonl"]]) {
+					await assertPiReadyRejects({
+						pids: [pid],
+						foregroundProcesses: [{ pid, name: "pi", argv, cwd: "/repo" }],
+					});
+				}
+			});
+			await withLaunchedSessionProcess(undefined, async (pid) => {
+				await assertPiReadyRejects({
+					pids: [pid],
+					foregroundProcesses: [
+						{ pid, name: "pi", argv: ["pi"], cwd: "/repo" },
+					],
+				});
+			});
+		},
+	);
+
+	it("provider Pi readiness treats an unreadable environment as unproven without hiding a match", {
+		skip: process.platform !== "linux" || process.getuid?.() === 0,
+	}, async () => {
+		// PID 1 belongs to root, so its environment is EACCES, as for an exiting Pi.
+		const unreadable = { pid: 1, name: "pi", argv: ["pi"], cwd: "/repo" };
+		await assertPiReadyRejects(
+			{ pids: [1], foregroundProcesses: [unreadable] },
+			/EACCES/,
+		);
+		await withLaunchedSessionProcess("/tmp/child.jsonl", async (pid) => {
+			await assertPiReady({
+				pids: [1, pid],
+				foregroundProcesses: [
+					unreadable,
+					{ pid, name: "pi", argv: ["pi"], cwd: "/repo" },
+				],
+			});
+		});
+	});
+
+	it(
+		"provider Pi readiness rejects each identity mismatch independently",
+		linuxOnly,
+		async () => {
+			await withLaunchedSessionProcess("/tmp/child.jsonl", async (pid) => {
+				const correct = {
+					pid,
+					name: "pi",
+					argv0: "/usr/local/bin/pi",
+					argv: ["pi"],
+					cwd: "/repo",
+				};
+				for (const process of [
+					{ ...correct, cwd: "/wrong" },
+					{ ...correct, name: undefined, argv0: "/usr/local/bin/python" },
+					{ ...correct, name: undefined, argv0: "/usr/local/bin/pi/" },
+				]) {
+					await assertPiReadyRejects({
+						pids: [process.pid],
+						foregroundProcesses: [process],
+					});
+				}
+			});
+		},
+	);
+
+	it("records recovered worktree metadata from provider provisioning errors", async () => {
+		await withFixture(async ({ request, project, sessionDir, root }) => {
+			initializeGitRepository(project);
+			writeFileSync(join(project, "base.txt"), "base\n");
+			commitAll(project, "base");
+			const provider = new FakeSurfaceProvider();
+			const operations = launchOperationsFromSurface(
+				providerWithOverrides(provider, {
+					createWorktreeSurface() {
+						throw new WorktreeProvisioningError("partial provisioning", {
+							path: join(root, "partial-tree"),
+							branch: "issue/partial",
+							workspaceId: "workspace-partial",
+						});
+					},
+				}),
+				{ mode: "grouped", direction: "right", maxPerTab: 4 },
+				createWorktreeOperations(),
+			);
+
+			await assert.rejects(
+				launchPiSubagent(
+					{ ...request, worktree: { branch: "issue/partial" } },
+					operations,
+				),
+				/partial provisioning/,
+			);
+			const manifest = JSON.parse(
+				readFileSync(
+					join(
+						sessionDir,
+						"artifacts",
+						"parent",
+						"worktree-runs",
+						"child-1.json",
+					),
+					"utf8",
+				),
+			);
+			assert.equal(manifest.state, "failed");
+			assert.equal(manifest.path, join(root, "partial-tree"));
+			assert.equal(manifest.branch, "issue/partial");
+			assert.equal(manifest.workspaceId, "workspace-partial");
+		});
+	});
+
+	for (const failed of [true, false]) {
+		it(`${failed ? "reports" : "omits"} launch diagnostics without writing claims to the manifest`, async () => {
+			await withFixture(async ({ request, project, sessionDir, root }) => {
+				initializeGitRepository(project);
+				writeFileSync(join(project, "base.txt"), "base\n");
+				commitAll(project, "base");
+				const worktreePath = join(root, "diagnostic-tree");
+				const manifestFile = join(
+					sessionDir,
+					"artifacts",
+					"parent",
+					"worktree-runs",
+					"child-1.json",
+				);
+				const diagnostics = [
+					"Primary workspace snapshot (before create) failed: x",
+				];
+				const running = await launchPiSubagent(
+					{ ...request, worktree: { branch: "issue/diagnostic" } },
+					{
+						worktree: createWorktreeOperations(),
+						createPane() {
+							throw new Error("unexpected pane creation");
+						},
+						createWorktree(_name, cwd, branch, base) {
+							execFileSync(
+								"git",
+								["worktree", "add", "-q", "-b", branch, worktreePath, base],
+								{ cwd },
+							);
+							const surface: WorktreeSurfaceForLaunch = {
+								path: worktreePath,
+								branch,
+								workspaceId: "workspace-1",
+								paneId: "root-pane-1",
+							};
+							if (failed) surface.diagnostics = diagnostics;
+							return surface;
+						},
+						async waitForShellReady() {},
+						runScript: (_surface, _value, options) => options.scriptPath,
+						closePane() {},
+					},
+				);
+				assert.deepEqual(
+					running.worktree?.diagnostics,
+					failed ? diagnostics : undefined,
+				);
+				const manifest = JSON.parse(readFileSync(manifestFile, "utf8"));
+				assert.deepEqual(
+					Object.keys(manifest).filter((key) =>
+						key.startsWith("openedPrimary"),
+					),
+					[],
+				);
+			});
+		});
+	}
+
 	it("launches an ordinary child through one transaction", async () => {
 		await withFixture(async ({ request, project, agentDir }) => {
 			const projectAgentDir = join(project, ".pi", "agent");
@@ -138,6 +574,7 @@ describe("Pi launch", () => {
 			let command = "";
 			let scriptPath = "";
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane(name, cwd) {
 					assert.equal(name, "Worker");
 					assert.equal(cwd, project, "placement must use the child's checkout");
@@ -185,6 +622,13 @@ describe("Pi launch", () => {
 			assert.doesNotMatch(command, /subagent_done/);
 			assert.match(command, /PI_DENY_TOOLS='subagent,subagent_resume'/);
 			assert.match(command, /PI_SUBAGENT_AUTO_EXIT=1/);
+			// Documented child-context hint: fresh children receive PI_SUBAGENT_ID.
+			assert.match(command, /PI_SUBAGENT_ID='child-1'/);
+			assert.ok(
+				command.includes(
+					`${PI_LAUNCH_SESSION_ENV}=${expectedShellQuote(running.sessionFile)}`,
+				),
+			);
 			assert.match(command, /'' '\/skill:tdd' '@[^']+\.md'/);
 
 			const taskPath = command.match(/'@([^']+\.md)'/)?.[1];
@@ -208,6 +652,7 @@ describe("Pi launch", () => {
 		await withFixture(async ({ request, project }) => {
 			let worktreeCreationAttempts = 0;
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane(name, cwd) {
 					assert.equal(name, "Worker");
 					assert.equal(cwd, project);
@@ -220,11 +665,16 @@ describe("Pi launch", () => {
 				async waitForShellReady(surface) {
 					assert.equal(surface, "pane-null-worktree");
 				},
-				runScript(_surface, _command, options) {
+				runScript(_surface, value, options) {
+					command = value;
 					return options.scriptPath;
 				},
 				closePane() {},
+				captureProcessIdentity() {
+					throw new Error("an ordinary pane captures no process identity");
+				},
 			};
+			let command = "";
 
 			const running = await launchPiSubagent(
 				{ ...request, worktree: null },
@@ -234,6 +684,9 @@ describe("Pi launch", () => {
 			assert.equal(worktreeCreationAttempts, 0);
 			assert.equal(running.surface, "pane-null-worktree");
 			assert.equal(running.worktree, undefined);
+			assert.doesNotMatch(command, /PI_SUBAGENT_PROCESS_FILE/);
+			assert.equal(running.processIdentityFile, undefined);
+			assert.equal(running.processIdentityCapture, undefined);
 		});
 	});
 
@@ -262,6 +715,7 @@ describe("Pi launch", () => {
 								};
 					const expectedError = `${kind} ${failurePoint} failed`;
 					const operations: PiLaunchOperations = {
+						worktree: createWorktreeOperations(),
 						createPane: () => pane,
 						createWorktree: () => {
 							throw new Error("unexpected worktree creation");
@@ -295,6 +749,7 @@ describe("Pi launch", () => {
 			const childPane = "split-child-pane";
 			const closed: string[] = [];
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: createSubagentPaneFactory(
 					{ mode: "split", direction: "down", maxPerTab: 4 },
 					() => {
@@ -335,6 +790,7 @@ describe("Pi launch", () => {
 			writeFileSync(blockedSessionDir, "not a directory\n");
 			const closed: string[] = [];
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => "pane-artifact-failure",
 				createWorktree: () => {
 					throw new Error("unexpected worktree creation");
@@ -365,6 +821,7 @@ describe("Pi launch", () => {
 		await withFixture(async ({ request }) => {
 			const closed: string[] = [];
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => {
 					throw new Error("pane creation failed");
 				},
@@ -394,6 +851,7 @@ describe("Pi launch", () => {
 		await withFixture(async ({ request }) => {
 			let cleanupAttempts = 0;
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => "pane-cleanup-error",
 				createWorktree: () => {
 					throw new Error("unexpected worktree creation");
@@ -404,7 +862,7 @@ describe("Pi launch", () => {
 				runScript: () => {
 					throw new Error("must not run");
 				},
-				closePane: () => {
+				async closePane() {
 					cleanupAttempts++;
 					throw new Error("cleanup error");
 				},
@@ -422,6 +880,7 @@ describe("Pi launch", () => {
 		await withFixture(async ({ request }) => {
 			const closed: string[] = [];
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => {
 					throw new Error("must not create a pane");
 				},
@@ -452,6 +911,7 @@ describe("Pi launch", () => {
 			const preambles: string[] = [];
 			let pane = 0;
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane: () => `pane-${++pane}`,
 				createWorktree: () => {
 					throw new Error("unexpected worktree creation");
@@ -653,6 +1113,11 @@ describe("Pi launch", () => {
 				/'@[^']+\.md'/,
 				"fork mode must use direct delivery, not artifact-backed",
 			);
+			assert.match(
+				command,
+				/PI_SUBAGENT_ID='child-1'/,
+				"forked children receive the same child-context hint as standalone children",
+			);
 		});
 	});
 
@@ -662,8 +1127,8 @@ describe("Pi launch", () => {
 			const running = await launchPiSubagent(
 				{
 					...request,
-					name: "Adversarial review",
-					agent: "adversarial-reviewer",
+					name: "Coordinator",
+					agent: "test-coordinator",
 					behavior: {
 						...request.behavior,
 						tools: "read,bash,grep,find,ls",
@@ -725,6 +1190,7 @@ describe("Pi launch", () => {
 					parent: { sessionId: "parent", sessionDir },
 				};
 				const operations: PiLaunchOperations = {
+					worktree: createWorktreeOperations(),
 					createPane(name, cwd) {
 						assert.equal(name, "Resume worker");
 						assert.equal(cwd, project);
@@ -780,6 +1246,7 @@ describe("Pi launch", () => {
 						`PI_SUBAGENT_SESSION=${expectedShellQuote(sessionFile)}`,
 					),
 				);
+				// Documented child-context hint: resumed children receive a new ID.
 				assert.match(command, /PI_SUBAGENT_ID='resume-1'/);
 				assert.match(command, /PI_SUBAGENT_ACTIVITY_FILE='/);
 				assert.match(command, /PI_SUBAGENT_AUTO_EXIT=1/);
@@ -884,9 +1351,21 @@ describe("Pi launch", () => {
 			);
 			const events: string[] = [];
 			let command = "";
+			const identity = {
+				pid: 4321,
+				startTime: "987",
+				bootId: "boot",
+				pidNamespace: "pid:[1]",
+			};
+			const captures: unknown[] = [];
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
+				},
+				async captureProcessIdentity(surface, expected) {
+					captures.push({ surface, ...expected });
+					return identity;
 				},
 				createWorktree(name, cwd, branch, base) {
 					assert.equal(name, "Worker");
@@ -944,6 +1423,25 @@ describe("Pi launch", () => {
 			assert.equal(manifest.state, "running");
 			assert.equal(manifest.owner, "pi-herdr-subagents");
 			assert.equal(manifest.paneId, "root-pane-1");
+			// The child records its own identity beside its session; the parent
+			// verifies it against this run, session, and root pane at readiness.
+			const processFile = `${running.sessionFile}.process.json`;
+			assert.equal(running.processIdentityFile, processFile);
+			assert.ok(
+				command.includes(
+					`PI_SUBAGENT_PROCESS_FILE=${expectedShellQuote(processFile)}`,
+				),
+			);
+			assert.deepEqual(await running.processIdentityCapture, identity);
+			assert.deepEqual(running.processIdentity, identity);
+			assert.deepEqual(captures, [
+				{
+					surface: "root-pane-1",
+					file: processFile,
+					id: running.id,
+					sessionFile: running.sessionFile,
+				},
+			]);
 		});
 	});
 
@@ -965,6 +1463,7 @@ describe("Pi launch", () => {
 			);
 			let command = "";
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
 				},
@@ -1003,6 +1502,13 @@ describe("Pi launch", () => {
 
 			const running = await launchPiSubagent(worktreeRequest, operations);
 
+			// Without a capture operation the identity is never guessed.
+			assert.equal(running.processIdentity, undefined);
+			assert.equal(running.processIdentityCapture, undefined);
+			assert.equal(
+				running.processIdentityError,
+				"process identity capture is unavailable",
+			);
 			assert.equal(running.worktree?.baseSha, linkedSha);
 			assert.equal(running.worktree?.path, worktreePath);
 			assert.equal(
@@ -1071,6 +1577,7 @@ describe("Pi launch", () => {
 				"child-1.json",
 			);
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
 				},
@@ -1197,6 +1704,7 @@ describe("Pi launch", () => {
 			const events: string[] = [];
 			let command = "";
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
 				},
@@ -1264,9 +1772,16 @@ describe("Pi launch", () => {
 			assert.ok(
 				command.startsWith(`cd ${expectedShellQuote(worktreePath)} && `),
 			);
+			// A user-driven worktree handoff is a normal interactive Pi session,
+			// not a subagent: it receives no PI_SUBAGENT_ID or child protocol.
 			assert.doesNotMatch(
 				command,
 				/subagent-done|PI_SUBAGENT_|__SUBAGENT_DONE_/,
+			);
+			assert.ok(
+				command.includes(
+					`${PI_LAUNCH_SESSION_ENV}=${expectedShellQuote(result.running.sessionFile)}`,
+				),
 			);
 			assert.doesNotMatch(command, /Implement the bounded change/);
 			const child = JSON.parse(
@@ -1349,6 +1864,7 @@ describe("Pi launch", () => {
 						handoff: { leafId: "ready-assistant" },
 					},
 					{
+						worktree: createWorktreeOperations(),
 						createPane: () => {
 							throw new Error("unexpected pane creation");
 						},
@@ -1455,6 +1971,7 @@ describe("Pi launch", () => {
 						handoff: { leafId: "startup-assistant" },
 					},
 					{
+						worktree: createWorktreeOperations(),
 						createPane: () => {
 							throw new Error("unexpected pane creation");
 						},
@@ -1550,6 +2067,7 @@ describe("Pi launch", () => {
 				"child-1.json",
 			);
 			const operations: PiLaunchOperations = {
+				worktree: createWorktreeOperations(),
 				createPane() {
 					throw new Error("unexpected pane creation");
 				},

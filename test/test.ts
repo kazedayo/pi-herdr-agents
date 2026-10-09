@@ -1,3 +1,9 @@
+import {
+	captureWorktreeHandoff,
+	writeWorktreeManifest,
+	createWorktreeOperations,
+} from "../maestro/runtime/worktree-operations.ts";
+import { buildSubagentToolAllowlist } from "../maestro/adapters/pi/launch.ts";
 import "./isolated-agent-dir.ts";
 import { describe, it, before, after } from "node:test";
 import { cleanupFixture } from "./worktree-cleanup-fixture.ts";
@@ -19,7 +25,8 @@ import {
 	getSubagentsConfigExamplePath,
 	getSubagentsPackageRoot,
 } from "../pi-extension/subagents/config-path.ts";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import childProcess, { execFileSync, spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
@@ -29,12 +36,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { Value } from "@sinclair/typebox/value";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import * as hostModule from "../pi-extension/subagents/index.ts";
 import {
 	isPlainObject,
 	isRecord,
 	isString,
-} from "../pi-extension/subagents/type-guards.ts";
+} from "../maestro/core/config/type-guards.ts";
 import rolePackExample from "../examples/role-pack/extension.ts";
 import {
 	cleanupSubagentsForShutdown,
@@ -54,7 +61,6 @@ import {
 	copySessionFile,
 	mergeNewEntries,
 	seedSubagentSessionFile,
-	createBtwSessionSnapshot,
 	createWorktreeSessionFork,
 	getSubagentSessionPolicyFile,
 	readSubagentSessionPolicy,
@@ -67,41 +73,45 @@ import {
 	writePersistentTaskInbox,
 	consumePersistentTaskInbox,
 	type SessionEntry,
-} from "../pi-extension/subagents/session.ts";
+} from "../maestro/adapters/pi/session.ts";
 
 import {
 	isHerdrAvailable,
 	waitForProcessesExit,
 	__herdrTest__,
-} from "../pi-extension/subagents/herdr.ts";
+} from "../maestro/surfaces/herdr/herdr.ts";
 import {
+	computeConfigRevision,
+	getConfigWriteLockPath,
 	loadModelConfig,
 	parseModelConfig,
+	readConfigRevision,
 	resolveModelDefault,
+	TaskModelConfigWriteError,
 	writeTaskModelConfig,
-} from "../pi-extension/subagents/model-config.ts";
+} from "../maestro/core/config/model-config.ts";
 import {
 	loadRoleConfig,
 	parseRoleConfig,
-} from "../pi-extension/subagents/role-config.ts";
+} from "../maestro/core/config/role-config.ts";
 import {
 	createSubagentPaneFactory,
 	loadPaneConfig,
 	parsePaneConfig,
-} from "../pi-extension/subagents/pane-config.ts";
+} from "../maestro/core/config/pane-config.ts";
 import {
 	loadPersistentConfig,
 	parsePersistentConfig,
-} from "../pi-extension/subagents/persistent-config.ts";
+} from "../maestro/core/config/persistent-config.ts";
 import {
 	loadSupervisionConfig,
 	parseSupervisionConfig,
-} from "../pi-extension/subagents/supervision-config.ts";
-import { FileWakeRegistry } from "../pi-extension/subagents/wake.ts";
+} from "../maestro/core/config/supervision-config.ts";
+import { FileWakeRegistry } from "../maestro/core/wake.ts";
 import {
 	POLLING_INTERVAL_MS,
 	SupervisionCoordinator,
-} from "../pi-extension/subagents/supervision.ts";
+} from "../maestro/core/supervision.ts";
 import {
 	advanceStatusState,
 	capStatusLines,
@@ -114,13 +124,14 @@ import {
 	observeStatus,
 	loadStatusConfig,
 	parseStatusConfig,
-} from "../pi-extension/subagents/status.ts";
+} from "../maestro/core/status.ts";
 import {
 	createSubagentActivityRecorder,
 	getSubagentActivityFile,
 	readSubagentActivityFile,
-	type SubagentActivityState,
-} from "../pi-extension/subagents/activity.ts";
+} from "../maestro/adapters/pi/activity-file.ts";
+import type { SubagentActivityState } from "../maestro/core/types.ts";
+import { projectActivity } from "../maestro/core/activity.ts";
 import subagentDoneExtension, {
 	shouldMarkUserTookOver,
 	shouldAutoExitOnAgentEnd,
@@ -128,11 +139,11 @@ import subagentDoneExtension, {
 	buildCompletionSidecar,
 	buildPersistentTaskEvent,
 	isPersistentStopDirective,
-} from "../pi-extension/subagents/subagent-done.ts";
+} from "../maestro/adapters/pi/child/subagent-done.ts";
 import {
 	interpretExitSidecar,
 	waitForCompletion,
-} from "../pi-extension/subagents/completion.ts";
+} from "../maestro/adapters/pi/completion.ts";
 import {
 	createLifecycle,
 	lifecycleTransition,
@@ -144,12 +155,21 @@ import {
 	observePaneInspection,
 	projectLifecycle,
 	type SubagentLifecycle,
-} from "../pi-extension/subagents/lifecycle.ts";
-import { launchPiSubagent } from "../pi-extension/subagents/launch.ts";
+} from "../maestro/core/lifecycle.ts";
 import {
-	buildAuthenticatedModelCatalog,
-	wrapPiModelRegistry,
-} from "../pi-extension/subagents/runtime-routing.ts";
+	launchPiSubagent,
+	launchOperationsFromSurface,
+} from "../maestro/adapters/pi/launch.ts";
+import { HerdrSurfaceProvider } from "../maestro/surfaces/herdr/herdr-surface-provider.ts";
+import {
+	createDefaultRunSession,
+	type PiPersistentIO,
+	type PiRunSession,
+	type PiRunRecord,
+} from "../maestro/runtime/index.ts";
+import { buildAuthenticatedModelCatalog } from "../maestro/core/routing.ts";
+import { wrapPiModelRegistry } from "../maestro/adapters/pi/model-registry.ts";
+import { FakeSurfaceProvider } from "../maestro/surfaces/fake/fake-surface-provider.ts";
 
 // Tool-registration behavior is environment-sensitive for child subagents.
 // Isolate the unit suite from inherited parent/child capability variables.
@@ -250,11 +270,14 @@ function restoreEnvVar(name: string, value: string | undefined) {
 	process.env[name] = value;
 }
 
-function withMockedNow<T>(now: number, fn: () => T): T {
+async function withMockedNowAsync<T>(
+	now: number,
+	fn: () => Promise<T>,
+): Promise<T> {
 	const originalNow = Date.now;
 	Date.now = () => now;
 	try {
-		return fn();
+		return await fn();
 	} finally {
 		Date.now = originalNow;
 	}
@@ -354,7 +377,2141 @@ const TOOL_RESULT: SessionEntry = {
 	},
 };
 
+// Persistent policy fixtures inject the production I/O implementation, obtained
+// through an actual Pi composition acquisition. No session helper is laundered
+// through the host or runtime barrel just for these tests.
+async function persistentFixtureIO(): Promise<PiPersistentIO> {
+	const dir = createTestDir();
+	const surface = new FakeSurfaceProvider();
+	const ops = launchOperationsFromSurface(surface, {
+		mode: "tab",
+		direction: "right",
+		maxPerTab: 4,
+	});
+	ops.waitForShellReady = async () => {};
+	ops.runScript = (_id, _command, options) => options.scriptPath;
+	const supervision = new SupervisionCoordinator(
+		async () => ({ complete: true, panes: [] }),
+		(id) => surface.inspectSurface(id),
+	);
+	let captured!: PiPersistentIO;
+	const session = createDefaultRunSession({
+		configDir: dir,
+		configExamplePath: getSubagentsConfigExamplePath(),
+		roles: [],
+		forcePolling: false,
+		infrastructure: {
+			surfaceProvider: surface,
+			launchOperations: ops,
+			supervision,
+		},
+		getLaunchSnapshot: () => ({
+			parent: {
+				cwd: dir,
+				sessionFile: "",
+				sessionId: "fixture",
+				sessionDir: dir,
+				agentDir: dir,
+			},
+			modelRegistry: {
+				find: (provider, id) => ({ provider, id, reasoning: true }),
+				available: () => [],
+				hasConfiguredAuth: () => true,
+				supportedThinkingLevels: () => [
+					"off",
+					"minimal",
+					"low",
+					"medium",
+					"high",
+				],
+				clampThinkingLevel: (_model, level) => level,
+			},
+			paneConfig: { mode: "tab", direction: "right", maxPerTab: 4 },
+		}),
+		hooks: { onSettled() {} },
+		persistent: {
+			send(_r, _text, io) {
+				captured = io;
+				return { error: "fixture captures I/O only" };
+			},
+			stop() {
+				return { error: "unused" };
+			},
+			drain() {},
+		},
+	});
+	try {
+		await session.spawnPi({
+			task: {
+				id: "io-fixture",
+				name: "fixture",
+				prompt: "first",
+				role: "",
+				cwd: dir,
+				behavior: { persistent: true },
+			},
+			role: {
+				name: "",
+				version: "1",
+				description: "fixture",
+				systemPrompt: "",
+				allowedTools: [],
+			},
+			plans: [
+				{
+					provider: "fake",
+					modelId: "fixture",
+					model: "fake/fixture",
+					thinking: "off",
+					modelSource: "request",
+					thinkingSource: "request",
+				},
+			],
+			resolved: {},
+			identity: {
+				id: "public-io",
+				logicalId: "logical-io",
+				generationId: "generation-io",
+				taskId: "task-io",
+			},
+		});
+		await session.sendPersistent("io-fixture", "capture");
+		return captured;
+	} finally {
+		await session.shutdown("quit");
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+const testIO = await persistentFixtureIO();
+const subagentsModule = {
+	...hostModule,
+	__test__: {
+		...hostModule.__test__,
+		handleSubagentSend: (
+			params: Parameters<typeof hostModule.__test__.handleSubagentSend>[0],
+		) => hostModule.__test__.handleSubagentSend(params, testIO),
+		handleSubagentStop: (
+			params: Parameters<typeof hostModule.__test__.handleSubagentStop>[0],
+			api: Parameters<typeof hostModule.__test__.handleSubagentStop>[1],
+			timeout = 15_000,
+		) => hostModule.__test__.handleSubagentStop(params, api, timeout, testIO),
+		deliverPersistentTaskEvent: (
+			record: Parameters<
+				typeof hostModule.__test__.deliverPersistentTaskEvent
+			>[0],
+			event: Parameters<
+				typeof hostModule.__test__.deliverPersistentTaskEvent
+			>[1],
+			api: Parameters<typeof hostModule.__test__.deliverPersistentTaskEvent>[2],
+			ledger?: ReturnType<PiPersistentIO["readLedger"]>,
+		) =>
+			hostModule.__test__.deliverPersistentTaskEvent(
+				record,
+				event,
+				api,
+				testIO,
+				ledger,
+			),
+		drainPersistentTaskEvents: (
+			record: Parameters<
+				typeof hostModule.__test__.drainPersistentTaskEvents
+			>[0],
+			api: Parameters<typeof hostModule.__test__.drainPersistentTaskEvents>[1],
+			readLedger = readPersistentDeliveryLedger,
+		) =>
+			hostModule.__test__.drainPersistentTaskEvents(record, api, {
+				...testIO,
+				readLedger: (r) => readLedger(r.sessionFile),
+			}),
+		notifyPersistentCrash: (
+			record: Parameters<typeof hostModule.__test__.notifyPersistentCrash>[0],
+			api: Parameters<typeof hostModule.__test__.notifyPersistentCrash>[1],
+		) => hostModule.__test__.notifyPersistentCrash(record, api, testIO),
+		evaluateNoProgressAdvisory: (
+			...args: [
+				Parameters<typeof hostModule.__test__.evaluateNoProgressAdvisory>[0],
+				Parameters<typeof hostModule.__test__.evaluateNoProgressAdvisory>[1],
+				number,
+				number,
+			]
+		) =>
+			hostModule.__test__.evaluateNoProgressAdvisory(...args, (r) =>
+				inspectNoProgressSessionTail(r.sessionFile),
+			),
+	},
+};
+
 // --- Tests ---
+
+// Keep the real host/adapter/launch/sidecar path; fake only Herdr and starting Pi.
+async function withAdapterHost(run: (f: any) => Promise<void>) {
+	await withIsolatedAgentEnv(async (paths) => {
+		// SAFETY: this process-local extension runtime is owned by index.ts.
+		const runtime = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+		const previous = {
+			pi: runtime.pi,
+			latestCtx: runtime.latestCtx,
+			session: runtime.session,
+		};
+		runtime.session = undefined;
+		const surface = new FakeSurfaceProvider();
+		const restorers: Array<() => void> = [];
+		const commands: string[] = [];
+		const closed: string[] = [];
+		let registrations = 0;
+		const wake = new FileWakeRegistry();
+		const supervision = new SupervisionCoordinator(
+			async () => ({
+				complete: true,
+				panes: surface
+					.listSurfaces()
+					.map((s) => ({ paneId: s.id, workspaceId: "fixture" })),
+			}),
+			(id) => surface.inspectSurface(id),
+			false,
+			wake,
+		);
+		const register = supervision.register.bind(supervision);
+		supervision.register = (...args) => {
+			registrations++;
+			return register(...args);
+		};
+		const launchOperations = launchOperationsFromSurface(surface, {
+			mode: "tab",
+			direction: "right",
+			maxPerTab: 4,
+		});
+		const infrastructure = {
+			surfaceProvider: surface,
+			launchOperations,
+			supervision,
+		};
+		function patch(target: any, name: string, value: any) {
+			const original = target[name];
+			target[name] = value;
+			restorers.push(() => {
+				target[name] = original;
+			});
+		}
+		function patchTransport() {
+			patch(surface, "isAvailable", () => true);
+			const close = surface.closeSurface.bind(surface);
+			patch(surface, "closeSurface", async (id: string) => {
+				closed.push(id);
+				await close(id);
+			});
+			patch(launchOperations, "createPane", (name: string, cwd?: string) =>
+				surface.createSurface({
+					name,
+					cwd: cwd ?? paths.projectDir,
+					placement: { kind: "tab" },
+				}),
+			);
+			patch(launchOperations, "waitForShellReady", async () => {});
+			patch(surface, "waitForShellReady", async () => {});
+			patch(
+				surface,
+				"runScript",
+				(_id: string, command: string, opts: { scriptPath: string }) => {
+					commands.push(command);
+					mkdirSync(dirname(opts.scriptPath), { recursive: true });
+					writeFileSync(opts.scriptPath, command);
+					return opts.scriptPath;
+				},
+			);
+			patch(
+				launchOperations,
+				"runScript",
+				(_id: string, command: string, opts: any) => {
+					commands.push(command);
+					return opts.scriptPath;
+				},
+			);
+		}
+		patchTransport();
+		const mock = createMockExtensionApi();
+		const apis = [mock];
+		mock.api.getThinkingLevel = () => "high";
+		subagentsModule.default(mock.api, { infrastructure });
+		const sessionDir = join(paths.projectDir, "parent-sessions");
+		mkdirSync(sessionDir);
+		const sessionFile = createSessionFile(sessionDir, [
+			{ type: "session", version: 3, id: "parent", cwd: paths.projectDir },
+		]);
+		const ctx = {
+			cwd: paths.projectDir,
+			model: { provider: "fake", id: "parent" },
+			modelRegistry: {
+				find: (provider: string, id: string) => ({
+					provider,
+					id,
+					reasoning: id !== "plain",
+				}),
+				hasConfiguredAuth: () => true,
+			},
+			sessionManager: {
+				getSessionFile: () => sessionFile,
+				getSessionId: () => "parent",
+				getSessionDir: () => sessionDir,
+			},
+		};
+		const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
+		async function launch(params: any, api = mock, context: any = ctx) {
+			const signal = new AbortController();
+			const result = await api.registeredTools
+				.find((t: any) => t.name === "subagent")
+				.execute("call", params, signal.signal, undefined, context);
+			signal.abort(); // Tool cancellation must not cancel the independent watcher.
+			return runtime.runningSubagents.get(result.details.id);
+		}
+		async function finish(
+			child: any,
+			result: {
+				type: "done" | "error" | "ping";
+				errorMessage?: string;
+				name?: string;
+				message?: string;
+			} = { type: "done" },
+		) {
+			writeFileSync(`${child.sessionFile}.exit`, JSON.stringify(result));
+			// Observe this actual attempt, not the logical producer that may continue
+			// through another candidate. The real adapter/coordinator still reads it.
+			const deadline = Date.now() + 3_000;
+			while (
+				child.lifecycle.process.kind !== "completed" &&
+				child.lifecycle.process.kind !== "failed"
+			) {
+				assert.ok(Date.now() < deadline, "actual Pi attempt did not settle");
+				await turn();
+			}
+			await turn();
+		}
+		try {
+			await run({
+				...paths,
+				runtime,
+				mock,
+				ctx,
+				surface,
+				commands,
+				closed,
+				launch,
+				finish,
+				turn,
+				patchTransport,
+				patch,
+				apis,
+				launchOperations,
+				infrastructure,
+				handle: (child: any) =>
+					runtime.session.getHandle(runtime.session.getControlTaskId(child.id)),
+				registrations: () => registrations,
+			});
+		} finally {
+			for (const child of runtime.runningSubagents.values()) {
+				runtime.session.suppress(runtime.session.getControlTaskId(child.id));
+				if (child.stopTimeout) clearTimeout(child.stopTimeout);
+			}
+			await turn();
+			for (const api of apis)
+				for (const handler of api.eventHandlers.get("session_shutdown") ?? [])
+					await handler({ reason: "quit" }, { ui: { setWidget() {} } });
+			supervision.close();
+			wake.close();
+			runtime.runningSubagents.clear();
+			for (const restore of restorers.reverse()) restore();
+			Object.assign(runtime, previous);
+		}
+	});
+}
+
+async function until(f: any, predicate: () => boolean, what: string) {
+	const deadline = Date.now() + 8_000;
+	while (!predicate()) {
+		assert.ok(Date.now() < deadline, `timed out waiting for ${what}`);
+		await f.turn();
+	}
+}
+
+/** Mirrors Pi: a context throws on every read once its session is replaced. */
+function invalidatableContext<
+	T extends {
+		cwd: string;
+		model: object;
+		modelRegistry: object;
+		sessionManager: object;
+	},
+>(ctx: T) {
+	let stale = false;
+	const assertLive = () => {
+		if (stale)
+			throw new Error(
+				"This extension ctx is stale after session replacement or reload.",
+			);
+	};
+	return {
+		ctx: {
+			get hasUI() {
+				assertLive();
+				return false;
+			},
+			get cwd() {
+				assertLive();
+				return ctx.cwd;
+			},
+			get model() {
+				assertLive();
+				return ctx.model;
+			},
+			get modelRegistry() {
+				assertLive();
+				return ctx.modelRegistry;
+			},
+			get sessionManager() {
+				assertLive();
+				return ctx.sessionManager;
+			},
+		},
+		invalidate() {
+			stale = true;
+		},
+	};
+}
+
+describe("host adapter migration", () => {
+	it("quit then a second host load creates a healthy coordinator without resetting the global session", async () =>
+		withAdapterHost(async (f) => {
+			const first = f.runtime.session;
+			let finishShutdown!: () => void;
+			const shutdownGate = new Promise<void>((resolve) => {
+				finishShutdown = resolve;
+			});
+			const closeFirst = first.shutdown.bind(first);
+			// Hold the old owner's asynchronous shutdown open across a second load.
+			f.patch(first, "shutdown", async (reason: any) => {
+				await closeFirst(reason);
+				await shutdownGate;
+			});
+			const shutdown = f.mock.eventHandlers.get("session_shutdown")[0];
+			const quitting = shutdown({ reason: "quit" }, { ui: { setWidget() {} } });
+			const wake = new FileWakeRegistry();
+			const supervision = new SupervisionCoordinator(
+				async () => ({
+					complete: true,
+					panes: f.surface
+						.listSurfaces()
+						.map((s: any) => ({ paneId: s.id, workspaceId: "fixture" })),
+				}),
+				(id) => f.surface.inspectSurface(id),
+				false,
+				wake,
+			);
+			try {
+				const next = createMockExtensionApi();
+				f.apis.push(next);
+				next.api.getThinkingLevel = () => "high";
+				// No withAdapterHost reset between quit and this actual second load.
+				hostModule.default(next.api, {
+					infrastructure: { ...f.infrastructure, supervision },
+				});
+				const child = await f.launch(
+					{ name: "after-quit", task: "bounded" },
+					next,
+				);
+				assert.notEqual(f.runtime.session, first);
+				assert.deepEqual(f.runtime.session.diagnostics(), {
+					mode: "wake+batch",
+					watcherCount: 1,
+				});
+				assert.deepEqual(supervision.diagnostics(), {
+					mode: "wake+batch",
+					watcherCount: 1,
+				});
+				const second = f.runtime.session;
+				finishShutdown();
+				await quitting;
+				assert.equal(
+					f.runtime.session,
+					second,
+					"an old shutdown must not clear the replacement after await",
+				);
+				await f.finish(child);
+				assert.equal(next.sentMessages.length, 1);
+			} finally {
+				finishShutdown();
+				await quitting;
+				supervision.close();
+				wake.close();
+			}
+		}));
+
+	it("local evidence keeps the host presentation cold while pane observations still redraw", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({ name: "cold-widget", task: "bounded" });
+			let widgets = 0;
+			f.ctx.hasUI = true;
+			f.ctx.ui = {
+				setWidget() {
+					widgets++;
+				},
+			};
+			const owner =
+				f.runtime.session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+			const onObserved = owner.options.hooks.onObserved;
+			const observation = {
+				observedAt: Date.now(),
+				lifecycle: child.lifecycle,
+				projection: projectLifecycle(child.lifecycle, Date.now()),
+			};
+			onObserved(child, { ...observation, kind: "local-evidence" });
+			assert.equal(widgets, 0);
+			onObserved(child, { ...observation, kind: "pane" });
+			assert.equal(widgets, 1);
+			await f.finish(child);
+		}));
+
+	it("final quit suppresses and aborts unowned legacy rows synchronously", async () =>
+		withAdapterHost(async (f) => {
+			const abortController = new AbortController();
+			const legacy = {
+				id: "legacy",
+				lifecycle: createLifecycle(0),
+				abortController,
+			};
+			f.runtime.runningSubagents.set(legacy.id, legacy);
+			let gatedAtAbort = false;
+			abortController.signal.addEventListener("abort", () => {
+				gatedAtAbort = legacy.lifecycle.delivery === "suppressed";
+			});
+			const shutdown = f.mock.eventHandlers.get("session_shutdown")[0](
+				{ reason: "quit" },
+				{ ui: { setWidget() {} } },
+			);
+			assert.equal(gatedAtAbort, true);
+			assert.equal(abortController.signal.aborted, true);
+			assert.equal(f.runtime.runningSubagents.size, 0);
+			await shutdown;
+		}));
+
+	it("public launch owns the four-argument advisory route and keeps duplicate and fresh evaluations cold", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({ name: "advisory", task: "bounded" });
+			const session = f.runtime.session;
+			const control = session.getControlTaskId(child.id);
+			assert.equal(control, session.getTask(control).id);
+			assert.equal(session.getRecord(control), child);
+			const inspect = session.inspectProgress.bind(session);
+			let inspections = 0;
+			f.patch(session, "inspectProgress", (id: string) => {
+				assert.equal(id, control);
+				assert.equal(session.getRecord(id), child);
+				inspections++;
+				return inspect(id);
+			});
+			writeFileSync(
+				child.sessionFile,
+				JSON.stringify({
+					type: "message",
+					message: {
+						role: "assistant",
+						content: [{ type: "toolCall", id: "call", name: "bash" }],
+						stopReason: "toolUse",
+					},
+				}) + "\n",
+			);
+			utimesSync(child.sessionFile, 0, 0);
+			child.lifecycle = observePaneInspection(
+				createLifecycle(0),
+				{ kind: "present", observedAt: 1, agentStatus: "working" },
+				1,
+			);
+			const now = 120_000;
+			const evaluate = (at: number) =>
+				hostModule.__test__.evaluateNoProgressAdvisory(
+					child,
+					projectLifecycle(child.lifecycle, at),
+					at,
+					1,
+				);
+			const advisory = evaluate(now)!;
+			assert.equal(advisory.classification, "blocked-tool");
+			assert.equal(advisory.lastEntryKind, "assistant");
+			assert.equal(advisory.notify, true);
+			assert.equal(inspections, 1);
+			assert.equal(evaluate(now + 1000), undefined);
+			utimesSync(child.sessionFile, 0, (now + 2000) / 1000);
+			assert.equal(evaluate(now + 2000)?.kind, "recovered");
+			assert.equal(evaluate(now + 3000), undefined);
+			assert.equal(inspections, 1);
+			await f.finish(child);
+		}));
+
+	for (const boundary of ["adapter", "finalizer"])
+		for (const accepted of [true, false])
+			it(`ordinary ${boundary} transcript failure preserves Stage3 payload and ${accepted ? "nonblocking close" : "rejected-send manual retention"}`, async () =>
+				withAdapterHost(async (f) => {
+					writeAgentFile(
+						f.projectAgentsDir,
+						"error-role",
+						"spawning: false\nauto-exit: true",
+						"Bounded identity",
+					);
+					const child = await f.launch({
+						name: "processing",
+						agent: "error-role",
+						task: "bounded",
+						model: "fake/first, fake/second",
+					});
+					child.startTime = Date.now() - 12000;
+					assert.deepEqual(child.runtimePlan, {
+						provider: "fake",
+						modelId: "first",
+						model: "fake/first",
+						thinking: "high",
+						modelSource: "request",
+						thinkingSource: "parent",
+						requestedModel: "fake/first",
+					});
+					const session = f.runtime.session;
+					const controlTaskId = session.getControlTaskId(child.id);
+					const owner =
+						session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+					const observed = owner.options.hooks.onObserved;
+					const completions: any[] = [];
+					owner.options.hooks.onObserved = (record: any, observation: any) => {
+						observed(record, observation);
+						if (observation.kind !== "completion") return;
+						completions.push({
+							record,
+							process: record.lifecycle.process.kind,
+						});
+						if (boundary === "finalizer") {
+							rmSync(child.sessionFile);
+							mkdirSync(child.sessionFile);
+						}
+					};
+					const sends: any[] = [];
+					const send = f.mock.api.sendMessage;
+					f.mock.api.sendMessage = (...args: any[]) => {
+						sends.push({
+							message: args[0],
+							options: args[1],
+							delivery: child.lifecycle.delivery,
+							tracked: f.runtime.runningSubagents.has(child.id),
+							closes: f.closed.length,
+						});
+						if (!accepted) throw new Error("ordinary error send rejected");
+						send(...args);
+					};
+					let releaseClose!: () => void;
+					const closeWait = new Promise<void>((resolve) => {
+						releaseClose = resolve;
+					});
+					const close = f.surface.closeSurface.bind(f.surface);
+					let closeStarted = false;
+					f.patch(f.surface, "closeSurface", async (id: string) => {
+						closeStarted = true;
+						await closeWait;
+						await close(id);
+					});
+					try {
+						if (boundary === "adapter") mkdirSync(child.sessionFile);
+						else
+							writeFileSync(
+								child.sessionFile,
+								JSON.stringify({
+									type: "session",
+									version: 3,
+									id: child.id,
+									cwd: f.projectDir,
+								}) + "\n",
+							);
+						writeFileSync(
+							`${child.sessionFile}.exit`,
+							JSON.stringify({
+								type: "error",
+								errorMessage: "real provider evidence",
+							}),
+						);
+						const deadline = Date.now() + 3000;
+						while (session.getTask(controlTaskId)) {
+							assert.ok(Date.now() < deadline);
+							await f.turn();
+						}
+						await f.turn();
+						assert.equal(completions.length, boundary === "finalizer" ? 1 : 0);
+						if (boundary === "finalizer") {
+							assert.equal(completions[0].record, child);
+							assert.equal(completions[0].process, "finalizing");
+						}
+						assert.equal(sends.length, 1);
+						assert.equal(sends[0].delivery, "delivered");
+						assert.equal(sends[0].tracked, false);
+						assert.equal(sends[0].closes, 0);
+						assert.equal(
+							owner.entries.size,
+							0,
+							"retirement must precede close resolution, without Pi getters",
+						);
+						assert.equal(f.commands.length, 1);
+						assert.equal(f.registrations(), 1);
+						assert.equal(closeStarted, accepted);
+						assert.equal(
+							f.closed.length,
+							0,
+							"ordinary close is still unresolved",
+						);
+						const { message, options } = sends[0];
+						assert.equal(message.customType, "subagent_result");
+						assert.equal(message.display, true);
+						assert.deepEqual(options, {
+							triggerTurn: true,
+							deliverAs: "steer",
+						});
+						assert.ok(Number.isInteger(message.details.elapsed));
+						assert.ok(
+							message.details.elapsed >= 12 && message.details.elapsed <= 14,
+						);
+						// Stage3 watchSubagent catch -> fallback wrapper -> ordinary .then:
+						// no result runtimePlan/session/errorMessage; details retain the live plan.
+						const rawError = `EISDIR: illegal operation on a directory, read`;
+						const resultContent = `Sub-agent "processing" failed (exit code 1).\n\nSubagent error: ${rawError}\n\nRequested model: fake/first`;
+						assert.deepEqual(message.details, {
+							name: "processing",
+							task: "bounded",
+							agent: "error-role",
+							exitCode: 1,
+							elapsed: message.details.elapsed,
+							sessionFile: undefined,
+							fallbackAttempts: ["fake/first"],
+							fallbackFailures: [],
+							runtimePlan: child.runtimePlan,
+							resultContent,
+						});
+						assert.equal(message.details.resultContent, resultContent);
+						assert.equal(
+							message.content,
+							`${resultContent}\n\nParent action: Continue the parent task using this result; do not return an empty response.`,
+						);
+						assert.equal(f.mock.sentMessages.length, accepted ? 1 : 0);
+					} finally {
+						releaseClose();
+						await f.turn();
+					}
+					assert.equal(f.closed.length, accepted ? 1 : 0);
+					assert.equal(f.surface.listSurfaces().length, accepted ? 0 : 1);
+				}));
+	it("preserves clamped runtime provenance, bare identity and omitted cwd configuration", async () =>
+		withAdapterHost(async (f) => {
+			mkdirSync(join(f.projectDir, ".pi", "agent"), { recursive: true });
+			const child = await f.launch({
+				name: "bare",
+				task: "bounded",
+				model: "fake/plain",
+				systemPrompt: "Bare identity",
+			});
+			assert.ok(
+				f.handle(child),
+				"composition retains the actual handle for completion and reload",
+			);
+			assert.equal(
+				f.runtime.session.getRecord(
+					f.runtime.session.getControlTaskId(child.id),
+				),
+				child,
+			);
+			assert.equal(f.handle(child).sessionId, child.sessionFile);
+			assert.equal(child.agent, undefined);
+			assert.equal(child.interactive, false);
+			assert.deepEqual(child.runtimePlan, {
+				provider: "fake",
+				modelId: "plain",
+				model: "fake/plain",
+				thinking: "off",
+				modelSource: "request",
+				thinkingSource: "parent",
+				requestedModel: "fake/plain",
+				thinkingAdjustment: {
+					from: "high",
+					to: "off",
+					reason: "non-reasoning",
+				},
+			});
+			assert.ok(child.sessionFile.startsWith(join(f.globalDir, "sessions")));
+			assert.deepEqual(
+				readSubagentSessionPolicy(child.sessionFile).tools,
+				null,
+			);
+			assert.ok(f.commands[0].includes("PI_SUBAGENT_AUTO_EXIT=1"));
+			assert.ok(
+				!f.commands[0].includes(
+					`PI_CODING_AGENT_DIR='${join(f.projectDir, ".pi", "agent")}'`,
+				),
+			);
+			await f.finish(child);
+			assert.equal(f.registrations(), 1);
+			assert.equal(f.closed.length, 1);
+			assert.deepEqual(
+				f.mock.sentMessages.at(-1).message.details.runtimePlan,
+				child.runtimePlan,
+			);
+		}));
+	it("normalizes named identity, full spawning denial, role cwd, tools and skills before spawn", async () =>
+		withAdapterHost(async (f) => {
+			const roleCwd = join(f.globalDir, "role-folder");
+			mkdirSync(join(roleCwd, ".pi", "agent"), { recursive: true });
+			writeAgentFile(
+				f.projectAgentsDir,
+				"host-role",
+				"cwd: role-folder\nspawning: false\nskills: role-skill\ntools: read, bash\nsession-mode: lineage-only\nsystem-prompt: replace",
+				"Named identity",
+			);
+			const child = await f.launch({
+				name: "named",
+				agent: "host-role",
+				task: "bounded",
+				systemPrompt: "Ignored bare identity",
+				skills: "one, two",
+				tools: "read",
+			});
+			assert.ok(f.handle(child));
+			assert.equal(child.agent, "host-role");
+			assert.equal(child.interactive, true);
+			assert.equal(f.handle(child).cwd, roleCwd);
+			const policy = readSubagentSessionPolicy(child.sessionFile);
+			assert.deepEqual(policy.tools, ["read"]);
+			assert.ok(policy.deniedTools.includes("subagents_write_task_models"));
+			assert.ok(
+				f.commands[0].includes(
+					`PI_CODING_AGENT_DIR='${join(roleCwd, ".pi", "agent")}'`,
+				),
+			);
+			assert.match(f.commands[0], /\/skill:one.*\/skill:two/);
+			assert.ok(!f.commands[0].includes("PI_SUBAGENT_AUTO_EXIT=1"));
+			const identityPath = f.commands[0].match(
+				/--system-prompt '([^']+)'/,
+			)?.[1];
+			assert.ok(identityPath);
+			assert.equal(readFileSync(identityPath, "utf8").trim(), "Named identity");
+			assert.equal(
+				getNewEntries(child.sessionFile, 0)[0].parentSession,
+				f.ctx.sessionManager.getSessionFile(),
+			);
+			await f.finish(child);
+			mkdirSync(join(f.projectDir, ".pi", "agent"), { recursive: true });
+			const explicit = await f.launch({
+				name: "explicit",
+				task: "bounded",
+				cwd: ".",
+			});
+			assert.equal(f.handle(explicit).cwd, f.projectDir);
+			assert.ok(
+				f.commands[1].includes(
+					`PI_CODING_AGENT_DIR='${join(f.projectDir, ".pi", "agent")}'`,
+				),
+			);
+			await f.finish(explicit);
+		}));
+	for (const mode of [undefined, "append", "replace"]) {
+		it(`passes caller systemPrompt through a frontmatter-only named role (${mode ?? "task wrapper"})`, async () =>
+			withAdapterHost(async (f) => {
+				writeAgentFile(
+					f.projectAgentsDir,
+					"frontmatter-only",
+					`auto-exit: true${mode ? `\nsystem-prompt: ${mode}` : ""}`,
+					"",
+				);
+				const child = await f.launch({
+					name: "fallback",
+					agent: "frontmatter-only",
+					task: "bounded",
+					systemPrompt: "Caller fallback identity",
+				});
+				assert.ok(child);
+				assert.equal(child.agent, "frontmatter-only");
+				const command = f.commands[0];
+				const promptPath = mode
+					? command.match(
+							mode === "replace"
+								? /--system-prompt '([^']+)'/
+								: /--append-system-prompt '([^']+)'/,
+						)?.[1]
+					: command.match(/'@([^']+)'/)?.[1];
+				assert.ok(
+					promptPath,
+					"child command must reference the prompt artifact",
+				);
+				const prompt = readFileSync(promptPath, "utf8");
+				if (mode) assert.equal(prompt, "Caller fallback identity");
+				else assert.ok(prompt.startsWith("\n\nCaller fallback identity\n\n"));
+				await f.finish(child);
+			}));
+	}
+	it("launches a frontmatter-only named role without a caller systemPrompt", async () =>
+		withAdapterHost(async (f) => {
+			writeAgentFile(
+				f.projectAgentsDir,
+				"no-identity",
+				"auto-exit: true\nsystem-prompt: replace",
+				"",
+			);
+			const child = await f.launch({
+				name: "no-fallback",
+				agent: "no-identity",
+				task: "bounded",
+			});
+			assert.ok(child);
+			assert.doesNotMatch(f.commands[0], /--(?:append-)?system-prompt/);
+			const promptPath = f.commands[0].match(/'@([^']+)'/)?.[1];
+			assert.ok(promptPath);
+			assert.equal(
+				readFileSync(promptPath, "utf8"),
+				"\n\nComplete your task autonomously.\n\nbounded\n\nYour FINAL assistant message should summarize what you accomplished.",
+			);
+			await f.finish(child);
+		}));
+	it("shares persistent task state and the raw generation cursor with one watcher and one initial ledger row", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "specialist",
+				task: "first",
+				persistent: true,
+			});
+			assert.ok(f.handle(child));
+			assert.equal(
+				f.runtime.session.getRecord(
+					f.runtime.session.getControlTaskId(child.id),
+				),
+				child,
+			);
+			assert.equal(readPersistentDeliveryLedger(child.sessionFile).length, 1);
+			assert.equal(f.registrations(), 1);
+			appendPersistentTaskEvent(child.sessionFile, {
+				type: "task-done",
+				task: "stale",
+				generation: "other-generation",
+			});
+			appendPersistentTaskEvent(child.sessionFile, {
+				type: "task-done",
+				task: child.taskId,
+				generation: child.generationId,
+			});
+			let rejected!: () => void;
+			let delivered!: () => void;
+			const rejection = new Promise<void>((resolve) => {
+				rejected = resolve;
+			});
+			const delivery = new Promise<void>((resolve) => {
+				delivered = resolve;
+			});
+			const send = f.mock.api.sendMessage;
+			let attempts = 0;
+			let allowDelivery = false;
+			f.mock.api.sendMessage = (...args: any[]) => {
+				attempts++;
+				if (!allowDelivery) {
+					rejected();
+					throw new Error("transient parent delivery failure");
+				}
+				send(...args);
+				delivered();
+			};
+			await rejection;
+			await f.turn();
+			assert.ok(
+				child.taskId,
+				"failed delivery must keep the assigned task for retry",
+			);
+			assert.equal(child.observedTaskEvents, 0);
+			allowDelivery = true;
+			appendPersistentTaskEvent(child.sessionFile, {
+				type: "task-done",
+				task: "wake-again",
+				generation: "other-generation",
+			});
+			await delivery;
+			await f.turn();
+			assert.equal(child.taskId, undefined);
+			assert.equal(child.tasksCompleted, 1);
+			assert.equal(child.observedTaskEvents, 3);
+			assert.ok(attempts >= 2);
+			assert.equal(f.mock.sentMessages.length, 1);
+			assert.equal(readPersistentDeliveryLedger(child.sessionFile).length, 2);
+			assert.deepEqual(child.activityRead, {
+				ok: false,
+				reason: "missing",
+				error: undefined,
+			});
+			assert.equal(
+				f.runtime.session.getRecord(
+					f.runtime.session.getControlTaskId(child.id),
+				).tasksCompleted,
+				1,
+			);
+			child.stopState = "requested";
+			await f.finish(child);
+			assert.equal(f.registrations(), 1);
+			assert.equal(f.closed.length, 1);
+		}));
+	it("retains each owning adapter and watcher through reload while new launches use the new parent snapshot", async () =>
+		withAdapterHost(async (f) => {
+			const old = await f.launch({ name: "old", task: "bounded" });
+			assert.ok(f.handle(old));
+			const owner = f.runtime.session;
+			const oldHandle = f.handle(old);
+			const reloaded = await import(
+				`../pi-extension/subagents/index.ts?task11-${Date.now()}`
+			);
+			const replacement = createMockExtensionApi();
+			f.apis.push(replacement);
+			replacement.api.getThinkingLevel = () => "low";
+			reloaded.default(replacement.api, { infrastructure: f.infrastructure });
+			f.ctx.model = { provider: "fake", id: "replacement" };
+			const next = await f.launch(
+				{ name: "new", task: "bounded" },
+				replacement,
+			);
+			assert.equal(owner.getRecord(owner.getControlTaskId(old.id)), old);
+			assert.equal(f.handle(old), oldHandle);
+			assert.notEqual(f.handle(next), oldHandle);
+			assert.deepEqual(next.runtimePlan, {
+				provider: "fake",
+				modelId: "replacement",
+				model: "fake/replacement",
+				thinking: "low",
+				modelSource: "parent",
+				thinkingSource: "parent",
+			});
+			assert.equal(f.registrations(), 2);
+			await f.finish(old);
+			await f.finish(next);
+			assert.equal(replacement.sentMessages.length, 2);
+			assert.equal(f.mock.sentMessages.length, 0);
+			assert.equal(f.registrations(), 2);
+			assert.equal(f.closed.length, 2);
+		}));
+	it("retains all ordinary retry panes until accepted final delivery with distinct owning adapters", async () =>
+		withAdapterHost(async (f) => {
+			const first = await f.launch({
+				name: "fallback",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			assert.ok(f.handle(first));
+			let launched!: () => void;
+			const secondLaunch = new Promise<void>((resolve) => {
+				launched = resolve;
+			});
+			const runScript = f.launchOperations.runScript;
+			f.patch(f.launchOperations, "runScript", (...args: any[]) => {
+				const script = runScript(...args);
+				launched();
+				return script;
+			});
+			await f.finish(first, {
+				type: "error",
+				errorMessage: "first account rejected",
+			});
+			await secondLaunch;
+			await f.turn();
+			const second = f.runtime.runningSubagents.get(first.id);
+			assert.equal(second.id, first.id);
+			assert.notEqual(second.sessionFile, first.sessionFile);
+			assert.equal(
+				f.runtime.session.getHandle(
+					f.runtime.session.getControlTaskId(first.id),
+				).sessionId,
+				second.sessionFile,
+			);
+			assert.equal(
+				f.runtime.session.getControlTaskId(second.id),
+				f.runtime.session.getControlTaskId(first.id),
+			);
+			assert.equal(f.closed.length, 0);
+			assert.equal(f.surface.listSurfaces().length, 2);
+			await f.finish(second);
+			const details = f.mock.sentMessages.at(-1).message.details;
+			assert.deepEqual(details.fallbackAttempts, ["fake/first", "fake/second"]);
+			assert.deepEqual(details.fallbackFailures, [
+				{ model: "fake/first", error: "first account rejected" },
+			]);
+			assert.equal(f.closed.length, 2);
+			assert.equal(f.registrations(), 2);
+		}));
+	for (const cwd of [undefined, "work"])
+		it(`launches a fallback through the replacement parent after reload in the invocation's ${cwd ? "relative tool cwd" : "parent cwd"}`, async () =>
+			withAdapterHost(async (f) => {
+				mkdirSync(join(f.projectDir, "work"));
+				const invoking = invalidatableContext(f.ctx);
+				const first = await f.launch(
+					{
+						name: "fallback",
+						task: "bounded",
+						model: "fake/first, fake/second",
+						cwd,
+					},
+					f.mock,
+					invoking.ctx,
+				);
+				const expectedCwd = cwd ? join(f.projectDir, cwd) : f.projectDir;
+				assert.equal(f.handle(first).cwd, expectedCwd);
+
+				const reloaded = await import(
+					`../pi-extension/subagents/index.ts?reload-fallback-${Date.now()}`
+				);
+				const elsewhere = join(f.projectDir, "elsewhere");
+				mkdirSync(elsewhere);
+				const sessionDir = join(f.projectDir, "replacement-sessions");
+				mkdirSync(sessionDir);
+				const sessionFile = createSessionFile(sessionDir, [
+					{ type: "session", version: 3, id: "replacement", cwd: elsewhere },
+				]);
+				let registryReads = 0;
+				const live = {
+					cwd: elsewhere,
+					model: { provider: "fake", id: "replacement" },
+					get modelRegistry() {
+						registryReads++;
+						return f.ctx.modelRegistry;
+					},
+					sessionManager: {
+						getSessionFile: () => sessionFile,
+						getSessionId: () => "replacement",
+						getSessionDir: () => sessionDir,
+					},
+					ui: { notify() {}, setWidget() {} },
+				};
+				for (const shutdown of f.mock.eventHandlers.get("session_shutdown") ??
+					[])
+					await shutdown({ reason: "reload" }, {});
+				invoking.invalidate();
+				process.chdir(elsewhere);
+				const replacement = createMockExtensionApi();
+				f.apis.push(replacement);
+				replacement.api.getThinkingLevel = () => "low";
+				reloaded.default(replacement.api, { infrastructure: f.infrastructure });
+				for (const start of replacement.eventHandlers.get("session_start") ??
+					[])
+					await start({ reason: "reload" }, live);
+				const registryReadsBeforeFallback = registryReads;
+
+				await f.finish(first, {
+					type: "error",
+					errorMessage: "first account rejected",
+				});
+				await until(f, () => f.commands.length === 2, "the fallback launch");
+				const second = f.runtime.runningSubagents.get(first.id);
+				assert.notEqual(second.sessionFile, first.sessionFile);
+				assert.ok(registryReads > registryReadsBeforeFallback);
+				assert.ok(
+					second.activityFile.startsWith(
+						join(sessionDir, "artifacts", "replacement"),
+					),
+				);
+				assert.equal(f.handle(second).cwd, expectedCwd);
+				assert.ok(f.commands[1].includes(`cd '${expectedCwd}' && `));
+				assert.deepEqual(second.runtimePlan, {
+					provider: "fake",
+					modelId: "second",
+					model: "fake/second",
+					thinking: "high",
+					modelSource: "request",
+					thinkingSource: "parent",
+					requestedModel: "fake/second",
+				});
+
+				await f.finish(second);
+				assert.equal(f.mock.sentMessages.length, 0);
+				assert.equal(replacement.sentMessages.length, 1);
+				const details = replacement.sentMessages[0].message.details;
+				assert.equal(details.errorMessage, undefined);
+				assert.deepEqual(details.fallbackAttempts, [
+					"fake/first",
+					"fake/second",
+				]);
+				assert.deepEqual(details.fallbackFailures, [
+					{ model: "fake/first", error: "first account rejected" },
+				]);
+				assert.equal(f.closed.length, 2);
+				assert.equal(f.surface.listSurfaces().length, 0);
+				assert.equal(f.runtime.runningSubagents.size, 0);
+			}));
+	it("fails a fallback explicitly without launching when no live parent context exists", async () =>
+		withAdapterHost(async (f) => {
+			const invoking = invalidatableContext(f.ctx);
+			const first = await f.launch(
+				{ name: "fallback", task: "bounded", model: "fake/first, fake/second" },
+				f.mock,
+				invoking.ctx,
+			);
+			invoking.invalidate();
+			f.runtime.latestCtx = undefined;
+			await f.finish(first, {
+				type: "error",
+				errorMessage: "first account rejected",
+			});
+			await until(
+				f,
+				() => f.mock.sentMessages.length > 0,
+				"the failed result delivery",
+			);
+			await f.turn();
+			assert.equal(f.commands.length, 1);
+			assert.equal(f.mock.sentMessages.length, 1);
+			const details = f.mock.sentMessages[0].message.details;
+			assert.deepEqual(details.fallbackAttempts, ["fake/first", "fake/second"]);
+			assert.deepEqual(details.fallbackFailures, [
+				{ model: "fake/first", error: "first account rejected" },
+				{
+					model: "fake/second",
+					error: "No live parent context for the fallback launch",
+				},
+			]);
+			assert.equal(f.closed.length, 1);
+			assert.equal(f.surface.listSurfaces().length, 0);
+			assert.equal(f.runtime.runningSubagents.size, 0);
+		}));
+	for (const accepted of [true, false])
+		it(`ordinary completion ${accepted ? "closes only after accepted delivery" : "retains the pane after rejected delivery"}`, async () =>
+			withAdapterHost(async (f) => {
+				const child = await f.launch({ name: "delivery", task: "bounded" });
+				assert.ok(f.handle(child));
+				let closesAtDelivery = -1;
+				const send = f.mock.api.sendMessage;
+				f.mock.api.sendMessage = (...args: any[]) => {
+					closesAtDelivery = f.closed.length;
+					if (!accepted) throw new Error("parent rejected delivery");
+					send(...args);
+				};
+				await f.finish(child);
+				assert.equal(closesAtDelivery, 0);
+				assert.equal(f.closed.length, accepted ? 1 : 0);
+				assert.equal(f.surface.listSurfaces().length, accepted ? 0 : 1);
+			}));
+	for (const warning of [false, true])
+		it(`finalizes the retained worktree manifest before delivery without closing its root pane${warning ? " and preserves manifest warnings" : ""}`, async () =>
+			withAdapterHost(async (f) => {
+				execFileSync("git", ["init", "-q"], { cwd: f.projectDir });
+				writeFileSync(join(f.projectDir, "tracked"), "base");
+				execFileSync("git", ["add", "tracked"], { cwd: f.projectDir });
+				execFileSync(
+					"git",
+					[
+						"-c",
+						"user.name=Test",
+						"-c",
+						"user.email=test@example.com",
+						"-c",
+						"commit.gpgsign=false",
+						"commit",
+						"-qm",
+						"fixture",
+					],
+					{ cwd: f.projectDir },
+				);
+				const retained = join(f.globalDir, "retained");
+				execFileSync("git", ["clone", "-q", f.projectDir, retained]);
+				f.patch(f.launchOperations, "createWorktree", () => ({
+					path: retained,
+					workspaceId: "owned-workspace",
+					paneId: f.surface.createSurface({
+						name: "worktree-root",
+						cwd: retained,
+					}),
+					branch: "bounded-worktree",
+				}));
+				const child = await f.launch({
+					name: "worktree",
+					task: "bounded",
+					worktree: { branch: "bounded-worktree" },
+				});
+				assert.ok(f.handle(child).worktree);
+				if (warning) {
+					rmSync(child.worktree.manifestFile);
+					mkdirSync(child.worktree.manifestFile);
+				}
+				const deliveredStates: string[] = [];
+				const send = f.mock.api.sendMessage;
+				f.mock.api.sendMessage = (...args: any[]) => {
+					deliveredStates.push(
+						warning
+							? args[0].details.worktree.gitError
+							: JSON.parse(readFileSync(child.worktree.manifestFile, "utf8"))
+									.state,
+					);
+					send(...args);
+				};
+				await f.finish(child);
+				if (warning) assert.match(deliveredStates[0], /Manifest update failed/);
+				else assert.deepEqual(deliveredStates, ["ready_for_review"]);
+				const handoff = f.mock.sentMessages.at(-1).message.details.worktree;
+				assert.equal(handoff.workspaceId, "owned-workspace");
+				assert.equal(handoff.paneId, child.surface);
+				assert.equal(f.closed.length, 0);
+				assert.equal(f.surface.listSurfaces().length, 1);
+				assert.equal(
+					f.mock.sentMessages.at(-1).message.details.worktree.clean,
+					true,
+				);
+			}));
+	it("fails a missing named role before any pane or worktree and never launches it bare", async () =>
+		withAdapterHost(async (f) => {
+			let worktrees = 0;
+			f.patch(f.launchOperations, "createWorktree", () => {
+				worktrees++;
+				throw new Error("must not create a worktree");
+			});
+			for (const worktree of [undefined, { branch: "missing-role" }])
+				for (const agent of ["scout", "missing-fixture-role"])
+					await assert.rejects(
+						f.launch({ name: "missing", task: "bounded", agent, worktree }),
+						new RegExp(
+							`Agent "${agent}" was not found\\. pi-herdr-agents ships no roles`,
+						),
+					);
+			assert.equal(worktrees, 0);
+			assert.equal(f.commands.length, 0);
+			assert.equal(f.surface.listSurfaces().length, 0);
+			assert.equal(f.runtime.runningSubagents.size, 0);
+			assert.equal(f.registrations(), 0);
+		}));
+	it("public resume prelaunch transcript rejection acquires nothing", async () =>
+		withAdapterHost(async (f) => {
+			const path = join(f.projectDir, "unreadable.jsonl");
+			mkdirSync(path);
+			const tool = f.mock.registeredTools.find(
+				(t: any) => t.name === "subagent_resume",
+			);
+			await assert.rejects(
+				tool.execute(
+					"resume",
+					{ sessionPath: path },
+					new AbortController().signal,
+					undefined,
+					f.ctx,
+				),
+				/EISDIR/,
+			);
+			const owner =
+				f.runtime.session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+			assert.equal(owner.entries.size, 0);
+			assert.equal(f.runtime.runningSubagents.size, 0);
+			assert.equal(f.registrations(), 0);
+			assert.equal(f.commands.length, 0);
+			assert.equal(f.closed.length, 0);
+			assert.equal(f.surface.listSurfaces().length, 0);
+			assert.equal(f.mock.sentMessages.length, 0);
+		}));
+
+	for (const boundary of ["adapter", "finalizer"])
+		for (const recover of [false, "output", "empty"])
+			it(`public resume ${boundary} failure ${recover ? `recovers at the late read (${recover})` : "silently retains its manual pane"} after delivered/map-delete`, async () =>
+				withAdapterHost(async (f) => {
+					const path = join(f.projectDir, "saved.jsonl");
+					const header =
+						JSON.stringify({
+							type: "session",
+							version: 3,
+							id: "saved",
+							cwd: f.projectDir,
+						}) + "\n";
+					writeFileSync(path, header);
+					writeSubagentSessionPolicy(path, {
+						owner: "public",
+						deniedTools: [],
+					});
+					const tool = f.mock.registeredTools.find(
+						(t: any) => t.name === "subagent_resume",
+					);
+					const started = await tool.execute(
+						"resume",
+						{ name: "resumed", sessionPath: path, message: "followup" },
+						new AbortController().signal,
+						undefined,
+						f.ctx,
+					);
+					const child = f.runtime.runningSubagents.get(started.details.id);
+					const session = f.runtime.session;
+					const control = session.getControlTaskId(child.id);
+					const owner =
+						session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+					const corrupt = () => {
+						rmSync(path);
+						mkdirSync(path);
+					};
+					let completions = 0;
+					const observed = owner.options.hooks.onObserved;
+					owner.options.hooks.onObserved = (record: any, observation: any) => {
+						observed(record, observation);
+						if (observation.kind === "completion") {
+							completions++;
+							if (boundary === "finalizer") corrupt();
+						}
+					};
+					const late: any[] = [];
+					let readError: unknown;
+					const settled = owner.options.hooks.onSettled;
+					owner.options.hooks.onSettled = (
+						record: any,
+						result: any,
+						task: any,
+						io: any,
+					) => {
+						if (recover) {
+							rmSync(path, { recursive: true });
+							writeFileSync(
+								path,
+								recover === "empty"
+									? header
+									: header +
+											JSON.stringify({
+												type: "message",
+												message: {
+													role: "assistant",
+													content: [
+														{ type: "text", text: "Recovered new output" },
+													],
+												},
+											}) +
+											"\n",
+							);
+						}
+						const read = io.readResumeResult;
+						const scopedIO = { ...io };
+						if (read)
+							scopedIO.readResumeResult = () => {
+								late.push({
+									delivery: child.lifecycle.delivery,
+									tracked: f.runtime.runningSubagents.has(child.id),
+									sends: f.mock.sentMessages.length,
+									closes: f.closed.length,
+								});
+								try {
+									return read();
+								} catch (error) {
+									readError = error;
+									throw error;
+								}
+							};
+						return settled(record, result, task, scopedIO);
+					};
+					if (boundary === "adapter") corrupt();
+					writeFileSync(`${path}.exit`, JSON.stringify({ type: "done" }));
+					const deadline = Date.now() + 3000;
+					while (session.getTask(control)) {
+						assert.ok(Date.now() < deadline);
+						await f.turn();
+					}
+					assert.equal(
+						owner.entries.size,
+						0,
+						"retire without Pi metadata getters",
+					);
+					assert.deepEqual(late, [
+						{ delivery: "delivered", tracked: false, sends: 0, closes: 0 },
+					]);
+					assert.equal(child.lifecycle.delivery, "delivered");
+					assert.equal(completions, boundary === "finalizer" ? 1 : 0);
+					assert.equal(f.registrations(), 1);
+					assert.equal(f.commands.length, 1);
+					assert.equal(f.mock.sentMessages.length, recover ? 1 : 0);
+					assert.equal(f.closed.length, recover ? 1 : 0);
+					assert.equal(f.surface.listSurfaces().length, recover ? 0 : 1);
+					if (recover) {
+						assert.equal(readError, undefined);
+						assert.deepEqual(f.mock.sentMessages[0].message.details, {
+							name: "resumed",
+							task: "followup",
+							exitCode: 1,
+							elapsed: f.mock.sentMessages[0].message.details.elapsed,
+							sessionFile: path,
+							resultContent: `Sub-agent "resumed" failed (exit code 1).\n\n${recover === "empty" ? "Resumed session exited with code 1" : "Recovered new output"}\n\nSession: ${path}\nResume: pi --session ${path}`,
+						});
+					} else assert.match(String(readError), /EISDIR/);
+				}));
+
+	for (const scenario of [
+		"fresh",
+		"empty",
+		"provider-error",
+		"rejected-send",
+		"ping",
+		"suppressed",
+	])
+		it(`public resume ${scenario} preserves late-read demand and delivery retention`, async () =>
+			withAdapterHost(async (f) => {
+				const path = join(f.projectDir, "saved.jsonl");
+				const header =
+					JSON.stringify({
+						type: "session",
+						version: 3,
+						id: "saved",
+						cwd: f.projectDir,
+					}) + "\n";
+				const old =
+					JSON.stringify({
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "Old output" }],
+						},
+					}) + "\n";
+				writeFileSync(path, header + old);
+				writeSubagentSessionPolicy(path, { owner: "public", deniedTools: [] });
+				const started = await f.mock.registeredTools
+					.find((t: any) => t.name === "subagent_resume")
+					.execute(
+						"resume",
+						{ name: "resumed", sessionPath: path },
+						new AbortController().signal,
+						undefined,
+						f.ctx,
+					);
+				const child = f.runtime.runningSubagents.get(started.details.id);
+				const session = f.runtime.session;
+				const control = session.getControlTaskId(child.id);
+				const owner = session[Symbol.for("pi-herdr-agents/PiRunSession-owner")];
+				const settled = owner.options.hooks.onSettled;
+				const late: any[] = [],
+					sends: any[] = [],
+					summaries: string[] = [];
+				owner.options.hooks.onSettled = (
+					record: any,
+					result: any,
+					task: any,
+					io: any,
+				) => {
+					if (scenario === "ping") {
+						rmSync(path);
+						mkdirSync(path);
+					}
+					if (scenario === "fresh" || scenario === "rejected-send")
+						writeFileSync(
+							path,
+							header +
+								old +
+								JSON.stringify({
+									type: "message",
+									message: {
+										role: "assistant",
+										content: [{ type: "text", text: "Late fresh output" }],
+									},
+								}) +
+								"\n",
+						);
+					const read = io.readResumeResult;
+					const scopedIO = { ...io };
+					if (read)
+						scopedIO.readResumeResult = () => {
+							late.push({
+								delivery: child.lifecycle.delivery,
+								tracked: f.runtime.runningSubagents.has(child.id),
+								sends: sends.length,
+							});
+							const value = read();
+							summaries.push(value.summary);
+							return value;
+						};
+					return settled(record, result, task, scopedIO);
+				};
+				const send = f.mock.api.sendMessage;
+				f.mock.api.sendMessage = (...args: any[]) => {
+					sends.push(args);
+					if (scenario === "rejected-send")
+						throw new Error("resume send rejected");
+					send(...args);
+				};
+				let releaseClose!: () => void;
+				const closeWait = new Promise<void>((resolve) => {
+					releaseClose = resolve;
+				});
+				const close = f.surface.closeSurface.bind(f.surface);
+				let closes = 0;
+				f.patch(f.surface, "closeSurface", async (id: string) => {
+					closes++;
+					await closeWait;
+					await close(id);
+				});
+				try {
+					if (scenario === "suppressed") session.suppress(control);
+					else
+						writeFileSync(
+							`${path}.exit`,
+							JSON.stringify(
+								scenario === "ping"
+									? { type: "ping", name: "resumed", message: "help" }
+									: scenario === "provider-error"
+										? { type: "error", errorMessage: "account rejected" }
+										: { type: "done" },
+							),
+						);
+					const deadline = Date.now() + 3000;
+					while (session.getTask(control)) {
+						assert.ok(Date.now() < deadline);
+						await f.turn();
+					}
+					assert.equal(
+						owner.entries.size,
+						0,
+						"retire even while close is unresolved",
+					);
+					assert.deepEqual(
+						late,
+						["ping", "suppressed"].includes(scenario)
+							? []
+							: [{ delivery: "delivered", tracked: false, sends: 0 }],
+					);
+					assert.equal(sends.length, scenario === "suppressed" ? 0 : 1);
+					assert.equal(closes, scenario === "rejected-send" ? 0 : 1);
+					assert.equal(f.closed.length, 0);
+					assert.equal(f.registrations(), 1);
+					assert.equal(f.commands.length, 1);
+					if (scenario !== "suppressed") {
+						assert.equal(child.lifecycle.delivery, "delivered");
+						const message = sends[0][0];
+						assert.deepEqual(sends[0][1], {
+							triggerTurn: true,
+							deliverAs: "steer",
+						});
+						assert.equal(message.details.sessionFile, path);
+						assert.equal(Object.hasOwn(message.details, "agent"), false);
+						assert.doesNotMatch(message.content, /Old output/);
+						if (scenario === "ping")
+							assert.equal(message.customType, "subagent_ping");
+						else {
+							assert.deepEqual(summaries, [
+								scenario === "empty"
+									? "Resumed session exited without new output"
+									: scenario === "provider-error"
+										? "Subagent error: account rejected"
+										: "Late fresh output",
+							]);
+							assert.match(
+								message.content,
+								scenario === "empty"
+									? /Resumed session exited without new output/
+									: scenario === "provider-error"
+										? /Error: account rejected/
+										: /Late fresh output/,
+							);
+						}
+					}
+				} finally {
+					releaseClose();
+					await f.turn();
+				}
+				assert.equal(f.closed.length, scenario === "rejected-send" ? 0 : 1);
+			}));
+
+	it("public resume retains its actual adapter ID and delivers only post-resume output", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "before",
+				task: "bounded",
+				tools: "read",
+			});
+			assert.ok(f.handle(child));
+			writeFileSync(
+				child.sessionFile,
+				JSON.stringify({
+					type: "session",
+					version: 3,
+					id: "saved",
+					cwd: f.projectDir,
+				}) +
+					"\n" +
+					JSON.stringify(ASSISTANT_MSG) +
+					"\n",
+			);
+			await f.finish(child);
+			rmSync(`${child.sessionFile}.exit`, { force: true });
+			const tool = f.mock.registeredTools.find(
+				(t: any) => t.name === "subagent_resume",
+			);
+			const result = await tool.execute(
+				"resume",
+				{ sessionPath: child.sessionFile, name: "after" },
+				new AbortController().signal,
+				undefined,
+				f.ctx,
+			);
+			const resumed = f.runtime.runningSubagents.get(result.details.id);
+			assert.ok(f.handle(resumed));
+			assert.equal(result.details.id, f.handle(resumed).id);
+			assert.equal(
+				f.runtime.session.getRecord(
+					f.runtime.session.getControlTaskId(resumed.id),
+				),
+				resumed,
+			);
+			assert.deepEqual(readSubagentSessionPolicy(resumed.sessionFile).tools, [
+				"read",
+			]);
+			await f.finish(resumed);
+			assert.match(
+				f.mock.sentMessages.at(-1).message.content,
+				/without new output/,
+			);
+			assert.doesNotMatch(
+				f.mock.sentMessages.at(-1).message.content,
+				/Here is my plan/,
+			);
+			assert.equal(f.closed.length, 2);
+		}));
+});
+
+describe("subagent_cancel public tool", { timeout: 20_000 }, () => {
+	const cancel = (f: any, params: { id?: string; name?: string }) =>
+		f.mock.registeredTools
+			.find((tool: any) => tool.name === "subagent_cancel")
+			.execute(
+				"cancel",
+				params,
+				new AbortController().signal,
+				undefined,
+				f.ctx,
+			);
+	const results = (f: any) =>
+		f.mock.sentMessages.filter(
+			(sent: any) => sent.message.customType === "subagent_result",
+		);
+	async function worktreeHost(f: any) {
+		const git = (cwd: string, ...args: string[]) =>
+			execFileSync(
+				"git",
+				[
+					"-c",
+					"user.name=Test",
+					"-c",
+					"user.email=test@example.com",
+					"-c",
+					"commit.gpgsign=false",
+					...args,
+				],
+				{ cwd, encoding: "utf8" },
+			).trim();
+		git(f.projectDir, "init", "-q");
+		writeFileSync(join(f.projectDir, "tracked"), "base");
+		git(f.projectDir, "add", "tracked");
+		git(f.projectDir, "commit", "-qm", "fixture");
+		const retained = join(f.globalDir, "retained");
+		execFileSync("git", ["clone", "-q", f.projectDir, retained]);
+		f.patch(f.launchOperations, "createWorktree", () => ({
+			path: retained,
+			workspaceId: "owned-workspace",
+			paneId: f.surface.createSurface({ name: "worktree-root", cwd: retained }),
+			branch: "cancel-worktree",
+		}));
+		return { retained, git };
+	}
+
+	// A fake kernel for worktree cancel: launch capture yields pid 4242's
+	// identity; SIGTERM removes it from the table.
+	function identityKernel(f: any) {
+		const host = { bootId: "boot", pidNamespace: "pid:[1]" };
+		const table = new Map<number, any>();
+		const signals: number[] = [];
+		f.patch(f.launchOperations, "captureProcessIdentity", async () => ({
+			pid: 4242,
+			startTime: "5000",
+			...host,
+		}));
+		f.patch(f.infrastructure, "processProbe", {
+			host: () => host,
+			stat(pid: number) {
+				const entry = table.get(pid);
+				if (entry === "EACCES")
+					throw Object.assign(new Error("EACCES: permission denied"), {
+						code: "EACCES",
+					});
+				return entry;
+			},
+			terminate(pid: number) {
+				signals.push(pid);
+				table.delete(pid);
+			},
+		});
+		return { table, signals };
+	}
+
+	it("registers a parent tool, is spawning-gated, and is denied to restricted children", () => {
+		const { api, registeredTools } = createMockExtensionApi();
+		subagentsModule.default(api);
+		const tool = registeredTools.find((t) => t.name === "subagent_cancel");
+		assert.ok(tool);
+		assert.deepEqual(Object.keys(tool.parameters.properties).sort(), [
+			"id",
+			"name",
+		]);
+		for (const pattern of [
+			/terminal intent first/,
+			/exactly one cancelled result/,
+			/No model fallback, retry, or recovery/,
+			/keeps the workspace, checkout, commits, and manifest/,
+			/confirmed, requested .*unconfirmed .*already-terminal/,
+			/Persistent specialists are rejected; use subagent_stop/,
+			/Do not poll/,
+		])
+			assert.match(tool.description, pattern);
+		assert.equal(tool.promptSnippet, tool.description);
+		assert.equal(
+			subagentsModule.__test__
+				.resolveDenyTools({ spawning: false })
+				.has("subagent_cancel"),
+			true,
+		);
+		process.env.PI_SUBAGENT_ID = "child-test";
+		process.env.PI_DENY_TOOLS = "subagent_cancel";
+		try {
+			const child = createMockExtensionApi();
+			subagentsModule.default(child.api);
+			assert.equal(
+				child.registeredTools.some((t) => t.name === "subagent_cancel"),
+				false,
+			);
+			assert.equal(
+				child.registeredTools.some((t) => t.name === "subagent_interrupt"),
+				true,
+			);
+		} finally {
+			delete process.env.PI_SUBAGENT_ID;
+			delete process.env.PI_DENY_TOOLS;
+		}
+	});
+
+	it("negative control: closing a fallback-routed pane without cancel starts the next model", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "uncancelled",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			f.surface.closeSurface(child.surface);
+			await until(f, () => f.commands.length === 2, "the fallback launch");
+			assert.equal(results(f).length, 0);
+		}));
+
+	it("cancels a fallback-routed ordinary child once: no fallback, unrelated panes kept", async () =>
+		withAdapterHost(async (f) => {
+			const unrelated = f.surface.createSurface({
+				name: "user pane",
+				cwd: f.projectDir,
+			});
+			const other = await f.launch({ name: "other", task: "bounded" });
+			const child = await f.launch({
+				name: "target",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			const response = await cancel(f, { name: "target" });
+			assert.equal(response.details.status, "confirmed");
+			assert.equal(response.details.id, child.id);
+			assert.match(
+				response.content[0].text,
+				/pane was closed and Herdr confirmed it is gone\. No model fallback, retry, or recovery will start\./,
+			);
+			await until(f, () => results(f).length === 1, "the cancelled result");
+			const [delivered] = results(f);
+			const details = delivered.message.details;
+			assert.equal(details.name, "target");
+			assert.equal(details.error, "cancelled");
+			assert.equal(details.errorMessage, undefined);
+			assert.equal(details.cancellation.termination, "confirmed");
+			assert.deepEqual(details.fallbackAttempts, ["fake/first"]);
+			assert.equal(details.sessionFile, child.sessionFile);
+			assert.match(
+				delivered.message.content,
+				/Sub-agent "target" was cancelled by the parent after .*Termination was confirmed before this result; no model fallback, retry, or recovery was started\./,
+			);
+			assert.deepEqual(delivered.options, {
+				triggerTurn: true,
+				deliverAs: "steer",
+			});
+			// Give a late watcher/fallback every chance to misbehave.
+			for (let i = 0; i < 20; i++) await f.turn();
+			assert.equal(f.commands.length, 2, "no fallback attempt was launched");
+			assert.equal(results(f).length, 1);
+			assert.deepEqual([...new Set(f.closed)], [child.surface]);
+			assert.equal(f.runtime.runningSubagents.has(child.id), false);
+			assert.equal(f.runtime.runningSubagents.get(other.id), other);
+			const live = f.surface.listSurfaces().map((s: any) => s.id);
+			assert.ok(live.includes(unrelated) && live.includes(other.surface));
+			// Repeating the cancel by ID reports the retired run; by name it is gone.
+			const again = await cancel(f, { id: child.id });
+			assert.equal(again.details.status, "already-terminal");
+			assert.match(again.content[0].text, /nothing was cancelled/);
+			assert.match(
+				(await cancel(f, { name: "target" })).details.error,
+				/No running subagent named "target"/,
+			);
+			assert.equal(results(f).length, 1);
+			await f.finish(other);
+		}));
+
+	it("an unconfirmed termination keeps the run live and quiet until a retry confirms it", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "stubborn",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			const close = f.surface.closeSurface;
+			f.surface.closeSurface = async () => {
+				throw new Error("herdr pane close timed out");
+			};
+			const first = await cancel(f, { id: child.id });
+			assert.equal(first.details.status, "unconfirmed");
+			assert.match(first.details.error, /herdr pane close timed out/);
+			assert.match(first.content[0].text, /The run stays live and owned/);
+			assert.equal(f.runtime.runningSubagents.get(child.id), child);
+			assert.equal(child.cancelState, "unconfirmed");
+			assert.match(
+				subagentsModule.__test__
+					.renderSubagentWidgetLines([child], 100)
+					.join("\n"),
+				/cancel unconfirmed/,
+			);
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(results(f).length, 0);
+			assert.equal(f.commands.length, 1);
+			f.surface.closeSurface = close;
+			const retry = await cancel(f, { id: child.id });
+			assert.equal(retry.details.status, "confirmed");
+			assert.equal(retry.details.repeated, true);
+			assert.equal(retry.details.requestedAt, first.details.requestedAt);
+			await until(f, () => results(f).length === 1, "the cancelled result");
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(results(f).length, 1);
+			assert.equal(f.commands.length, 1);
+		}));
+
+	it("a cancel racing natural delivery is already-terminal and kills nothing", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "finisher",
+				task: "bounded",
+				model: "fake/first, fake/second",
+			});
+			const control = f.runtime.session.getControlTaskId(child.id);
+			let late: Promise<any> | undefined;
+			const send = f.mock.api.sendMessage;
+			f.mock.api.sendMessage = (...args: any[]) => {
+				// The natural result is being delivered; the run is not yet retired.
+				late ??= f.runtime.session.cancel(control);
+				send(...args);
+			};
+			await f.finish(child);
+			assert.deepEqual(await late, { status: "already-terminal" });
+			assert.equal(child.cancelState, undefined);
+			assert.equal(results(f).length, 1);
+			assert.equal(results(f)[0].message.details.error, undefined);
+			assert.equal(results(f)[0].message.details.cancellation, undefined);
+			assert.match(results(f)[0].message.content, /completed/);
+			assert.equal(f.commands.length, 1);
+			assert.deepEqual(
+				f.closed,
+				[child.surface],
+				"only the normal release close",
+			);
+		}));
+
+	it("cancels an interrupted child", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({ name: "paused", task: "bounded" });
+			const interrupted =
+				await subagentsModule.__test__.handleSubagentInterrupt({
+					id: child.id,
+				});
+			assert.equal(interrupted.details.status, "interrupt_requested");
+			assert.equal(
+				(await cancel(f, { id: child.id })).details.status,
+				"confirmed",
+			);
+			await until(f, () => results(f).length === 1, "the cancelled result");
+			assert.equal(results(f)[0].message.details.error, "cancelled");
+		}));
+
+	it("rejects a persistent specialist with a pointer to subagent_stop and changes nothing", async () =>
+		withAdapterHost(async (f) => {
+			const child = await f.launch({
+				name: "specialist",
+				task: "bounded",
+				persistent: true,
+			});
+			const response = await cancel(f, { name: "specialist" });
+			assert.match(
+				response.details.error,
+				new RegExp(
+					`persistent specialist; subagent_cancel does not stop it\\. Use subagent_stop\\(\\{ id: "${child.id}" \\}\\)`,
+				),
+			);
+			assert.equal(response.details.status, undefined);
+			assert.equal(child.cancelState, undefined);
+			assert.equal(child.stopState, undefined);
+			assert.deepEqual(f.closed, []);
+			assert.equal(f.runtime.runningSubagents.get(child.id), child);
+		}));
+
+	it("cancels a worktree child: stops only its process, retains workspace, commits, and handoff", async () =>
+		withAdapterHost(async (f) => {
+			const { retained, git } = await worktreeHost(f);
+			// The launch-verified identity of the child's Pi, and the kernel's view.
+			const kernel = identityKernel(f);
+			kernel.table.set(4242, "EACCES");
+			const child = await f.launch({
+				name: "writer",
+				task: "bounded",
+				worktree: { branch: "cancel-worktree" },
+			});
+			writeFileSync(join(retained, "work"), "committed work");
+			git(retained, "add", "work");
+			git(retained, "commit", "-qm", "child work");
+			const head = git(retained, "rev-parse", "HEAD");
+			// The identity is unreadable: never signal it, never guess it exited.
+			const first = await cancel(f, { id: child.id });
+			assert.equal(first.details.status, "unconfirmed");
+			assert.match(
+				first.details.error,
+				/process 4242 is unreadable: EACCES.*not signalled/,
+			);
+			assert.deepEqual(kernel.signals, []);
+			assert.equal(
+				JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state,
+				"running",
+			);
+			assert.equal(results(f).length, 0);
+			// The owned process is readable and alive: SIGTERM ends THAT identity.
+			kernel.table.set(4242, { state: "S", ppid: 10, startTime: "5000" });
+			const retry = await cancel(f, { id: child.id });
+			assert.deepEqual(kernel.signals, [4242]);
+			assert.equal(retry.details.status, "confirmed");
+			assert.match(
+				retry.content[0].text,
+				/Pi process exit is confirmed; the worktree workspace, checkout, commits, and manifest are retained/,
+			);
+			await until(f, () => results(f).length === 1, "the cancelled result");
+			const delivered = results(f)[0].message;
+			assert.equal(delivered.details.error, "cancelled");
+			assert.equal(delivered.details.worktree.headSha, head);
+			assert.equal(delivered.details.worktree.commitsAhead, 1);
+			assert.equal(delivered.details.worktree.workspaceId, "owned-workspace");
+			assert.match(delivered.content, /Worktree result retained for review:/);
+			assert.equal(
+				JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state,
+				"cancelled",
+			);
+			assert.deepEqual(f.closed, [], "no surface is closed for a worktree");
+			assert.ok(
+				f.surface.listSurfaces().some((s: any) => s.id === child.surface),
+			);
+			assert.equal(git(retained, "rev-parse", "HEAD"), head);
+			assert.equal(
+				readFileSync(join(retained, "work"), "utf8"),
+				"committed work",
+			);
+		}));
+
+	it("a worktree child without a captured process identity stays unconfirmed; shutdown never records cancelled", async () =>
+		withAdapterHost(async (f) => {
+			const { retained } = await worktreeHost(f);
+			// Herdr's idle shell is never exit evidence: only the identity is.
+			const kernel = identityKernel(f);
+			f.patch(f.launchOperations, "captureProcessIdentity", async () => {
+				throw new Error("Process identity not captured within 15000ms");
+			});
+			const child = await f.launch({
+				name: "uncaptured",
+				task: "bounded",
+				worktree: { branch: "cancel-worktree" },
+			});
+			f.patch(f.surface, "getProcessInfo", () => ({
+				shellPid: 10,
+				foregroundProcessGroupId: 10,
+				pids: [10],
+				foregroundProcesses: [],
+			}));
+			const manifest = () =>
+				JSON.parse(readFileSync(child.worktree.manifestFile, "utf8")).state;
+			const report = await cancel(f, { id: child.id });
+			assert.equal(report.details.status, "unconfirmed");
+			assert.match(
+				report.details.error,
+				/identity was not captured .*nothing was signalled: Process identity not captured/,
+			);
+			assert.deepEqual(kernel.signals, []);
+			assert.equal(child.cancelState, "unconfirmed");
+			assert.equal(manifest(), "running");
+			// Parent shutdown suppresses the unconfirmed run: it is not a cancellation.
+			f.runtime.session.suppress(f.runtime.session.getControlTaskId(child.id));
+			await until(f, () => manifest() !== "running", "the shutdown manifest");
+			assert.equal(manifest(), "failed");
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(results(f).length, 0);
+			assert.deepEqual(f.closed, []);
+			assert.ok(existsSync(retained));
+		}));
+
+	it("a fallback owner transferred after the cancel shows its own unconfirmed kill and stays live", async () =>
+		withAdapterHost(async (f) => {
+			const first = await f.launch({
+				name: "transferred",
+				task: "bounded",
+				model: "fake/first, fake/second, fake/third",
+			});
+			let launched!: () => void;
+			let release!: () => void;
+			const launching = new Promise<void>((resolve) => {
+				launched = resolve;
+			});
+			const gate = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const runScript = f.launchOperations.runScript;
+			f.patch(f.launchOperations, "runScript", async (...args: any[]) => {
+				launched();
+				await gate;
+				return runScript(...args);
+			});
+			await f.finish(first, {
+				type: "error",
+				errorMessage: "provider refused",
+			});
+			await launching;
+			const requested = await cancel(f, { id: first.id });
+			assert.equal(requested.details.status, "requested");
+			assert.equal(first.cancelState, "requested");
+			// The transferred owner's automatic kill cannot confirm termination.
+			f.patch(f.surface, "closeSurface", async () => {
+				throw new Error("herdr pane close timed out");
+			});
+			release();
+			let second: any;
+			await until(
+				f,
+				() => {
+					second = f.runtime.runningSubagents.get(first.id);
+					return second !== first && second?.cancelState === "unconfirmed";
+				},
+				"the transferred owner's unconfirmed cancel",
+			);
+			assert.match(
+				subagentsModule.__test__
+					.renderSubagentWidgetLines([second], 100)
+					.join("\n"),
+				/cancel unconfirmed/,
+			);
+			for (let i = 0; i < 10; i++) await f.turn();
+			assert.equal(
+				results(f).length,
+				0,
+				"nothing is delivered while unconfirmed",
+			);
+			assert.equal(f.commands.length, 2, "the third model is never launched");
+			assert.ok(
+				f.surface.listSurfaces().some((s: any) => s.id === second.surface),
+			);
+		}));
+});
 
 describe("session.ts", () => {
 	let dir: string;
@@ -1132,127 +3289,6 @@ describe("session.ts", () => {
 		});
 	});
 
-	describe("createBtwSessionSnapshot", () => {
-		it("copies only the selected active branch without changing the parent", () => {
-			const timestamp = "2026-07-31T00:00:00.000Z";
-			const parentFile = createSessionFile(dir, [
-				{ type: "session", version: 3, id: "btw-parent", timestamp, cwd: dir },
-				{
-					type: "message",
-					id: "root-user",
-					parentId: null,
-					timestamp,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "root" }],
-						timestamp: 1,
-					},
-				},
-				{
-					type: "message",
-					id: "root-assistant",
-					parentId: "root-user",
-					timestamp,
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: "base" }],
-						timestamp: 2,
-					},
-				},
-				{
-					type: "message",
-					id: "abandoned-user",
-					parentId: "root-assistant",
-					timestamp,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "abandoned" }],
-						timestamp: 3,
-					},
-				},
-				{
-					type: "message",
-					id: "abandoned-assistant",
-					parentId: "abandoned-user",
-					timestamp,
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: "old" }],
-						timestamp: 4,
-					},
-				},
-				{
-					type: "message",
-					id: "active-user",
-					parentId: "root-assistant",
-					timestamp,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "active" }],
-						timestamp: 5,
-					},
-				},
-				{
-					type: "message",
-					id: "active-assistant",
-					parentId: "active-user",
-					timestamp,
-					message: {
-						role: "assistant",
-						content: [{ type: "text", text: "current" }],
-						timestamp: 6,
-					},
-				},
-			]);
-			const parentBefore = readFileSync(parentFile, "utf8");
-
-			const childFile = createBtwSessionSnapshot(
-				parentFile,
-				"active-assistant",
-			);
-			const child = SessionManager.open(childFile);
-			const childIds = child.getEntries().map((entry) => entry.id);
-
-			assert.deepEqual(childIds, [
-				"root-user",
-				"root-assistant",
-				"active-user",
-				"active-assistant",
-			]);
-			assert.equal(child.getHeader()?.parentSession, parentFile);
-			assert.equal(readFileSync(parentFile, "utf8"), parentBefore);
-		});
-
-		it("fails when Pi does not persist the child snapshot", () => {
-			const timestamp = "2026-07-31T00:00:00.000Z";
-			const parentFile = createSessionFile(dir, [
-				{
-					type: "session",
-					version: 3,
-					id: "btw-user-only",
-					timestamp,
-					cwd: dir,
-				},
-				{
-					type: "message",
-					id: "only-user",
-					parentId: null,
-					timestamp,
-					message: {
-						role: "user",
-						content: [{ type: "text", text: "hello" }],
-						timestamp: 1,
-					},
-				},
-			]);
-
-			assert.throws(
-				() => createBtwSessionSnapshot(parentFile, "only-user"),
-				/did not persist/i,
-			);
-		});
-	});
-
 	describe("mergeNewEntries", () => {
 		it("appends new entries from source to target", () => {
 			// Source starts with same base (2 entries), then has 1 new entry
@@ -1469,7 +3505,7 @@ describe("status.ts", () => {
 		const examplePath = fileURLToPath(
 			new URL("../config.json.example", import.meta.url),
 		);
-		const config = loadStatusConfig(examplePath);
+		const config = loadStatusConfig(examplePath, examplePath);
 
 		assert.deepEqual(config, {
 			enabled: true,
@@ -1975,12 +4011,44 @@ describe("shared subagent configuration path", () => {
 						persistent: { maxAgents: 1 },
 					}),
 				);
-				assert.deepEqual(loadModelConfig(), { agents: {} });
-				assert.equal(loadRoleConfig().bundled, true);
-				assert.equal(loadPaneConfig().mode, "grouped");
-				assert.equal(loadSupervisionConfig().forcePolling, false);
-				assert.equal(loadPersistentConfig().maxAgents, 3);
-				assert.equal(loadStatusConfig().enabled, true);
+				assert.deepEqual(loadModelConfig(dirname(getSubagentsConfigPath())), {
+					agents: {},
+				});
+				assert.deepEqual(
+					loadRoleConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).deprecations,
+					[],
+				);
+				assert.equal(
+					loadPaneConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).mode,
+					"grouped",
+				);
+				assert.equal(
+					loadSupervisionConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).forcePolling,
+					false,
+				);
+				assert.equal(
+					loadPersistentConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).maxAgents,
+					3,
+				);
+				assert.equal(
+					loadStatusConfig(
+						getSubagentsConfigPath(),
+						getSubagentsConfigExamplePath(),
+					).enabled,
+					true,
+				);
 			} finally {
 				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
 				if (previousDecoy == null) rmSync(decoyPath, { force: true });
@@ -2007,16 +4075,299 @@ describe("shared subagent configuration path", () => {
 						persistent: { maxAgents: 2 },
 					}),
 				);
-				assert.equal(loadModelConfig().default, "fake/default");
-				assert.equal(loadRoleConfig().bundled, false);
-				assert.equal(loadPaneConfig().mode, "tab");
-				assert.equal(loadSupervisionConfig().forcePolling, true);
-				assert.equal(loadPersistentConfig().maxAgents, 2);
-				assert.equal(loadStatusConfig().enabled, false);
+				assert.equal(
+					loadModelConfig(dirname(getSubagentsConfigPath())).default,
+					"fake/default",
+				);
+				const [deprecation, ...extra] = loadRoleConfig(
+					dirname(getSubagentsConfigPath()),
+					getSubagentsConfigExamplePath(),
+				).deprecations;
+				assert.deepEqual(extra, []);
+				assert.ok(deprecation.includes(configPath));
+				assert.equal(
+					loadPaneConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).mode,
+					"tab",
+				);
+				assert.equal(
+					loadSupervisionConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).forcePolling,
+					true,
+				);
+				assert.equal(
+					loadPersistentConfig(
+						dirname(getSubagentsConfigPath()),
+						getSubagentsConfigExamplePath(),
+					).maxAgents,
+					2,
+				);
+				assert.equal(
+					loadStatusConfig(
+						getSubagentsConfigPath(),
+						getSubagentsConfigExamplePath(),
+					).enabled,
+					false,
+				);
 			} finally {
 				restoreEnvVar("PI_CODING_AGENT_DIR", previous);
 			}
 		});
+	});
+});
+
+describe("runtime reload configuration", () => {
+	const runtimeKey = Symbol.for("pi-subagents/runtime");
+	type ReloadRuntime = {
+		session?: PiRunSession;
+		runningSubagents?: Map<string, object>;
+		surfaceProvider?: object;
+		launchOperations?: {
+			createPane?: (name: string, cwd?: string) => string | Promise<string>;
+		};
+	};
+	type RuntimeSlot = typeof globalThis &
+		Record<symbol, ReloadRuntime | undefined>;
+
+	async function importReloadedSubagents() {
+		return import(
+			`../pi-extension/subagents/index.ts?reload-test-${Date.now()}-${Math.random()}`
+		);
+	}
+
+	it("refreshes pane-backed launch operations from the reloaded module config while preserving running children", async () => {
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		// SAFETY: pi-herdr-agents owns this process-local runtime symbol.
+		const runtimeSlot = globalThis as RuntimeSlot;
+		const beforeRuntime = runtimeSlot[runtimeKey];
+		const beforeSurfaceProvider = beforeRuntime?.surfaceProvider;
+		const beforeHadSurfaceProvider =
+			beforeRuntime !== undefined && "surfaceProvider" in beforeRuntime;
+		const beforeLaunchOperations = beforeRuntime?.launchOperations;
+		const beforeHadLaunchOperations =
+			beforeRuntime !== undefined && "launchOperations" in beforeRuntime;
+		const existingRunning = subagentsModule.__test__.runningSubagents;
+		existingRunning.set("reload-live", {
+			id: "reload-live",
+			name: "Reload live",
+			task: "still running",
+			surface: "pane-live",
+			startTime: 0,
+			sessionFile: "live.jsonl",
+			interactive: false,
+			runtimePlan: undefined,
+			lifecycle: createLifecycle(0),
+		});
+		const dir = createTestDir();
+		try {
+			process.env.PI_CODING_AGENT_DIR = dir;
+			const configPath = getSubagentsConfigPath();
+			mkdirSync(dirname(configPath), { recursive: true });
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					status: { enabled: true },
+					models: { agents: {} },
+					roles: { bundled: true },
+					persistent: { maxAgents: 3 },
+					supervision: { forcePolling: false, hangWarningMinutes: 15 },
+					panes: { mode: "tab" },
+				}),
+			);
+			const reloaded = await importReloadedSubagents();
+			assert.equal(reloaded.__test__.runningSubagents, existingRunning);
+			assert.equal(reloaded.__test__.runningSubagents.has("reload-live"), true);
+
+			const calls: string[][] = [];
+			await __herdrTest__.withMockHerdrExec(
+				(args) => {
+					calls.push(args);
+					if (args[0] === "pane" && args[1] === "current") {
+						return JSON.stringify({
+							result: {
+								pane: {
+									pane_id: "parent-pane",
+									tab_id: "parent-tab",
+									workspace_id: "workspace-1",
+								},
+							},
+						});
+					}
+					if (args[0] === "tab" && args[1] === "create") {
+						return JSON.stringify({
+							result: {
+								tab: { tab_id: "tab-new" },
+								root_pane: { pane_id: "pane-new" },
+							},
+						});
+					}
+					return JSON.stringify({ result: { ok: true } });
+				},
+				async () => {
+					assert.equal(
+						await launchOperationsFromSurface(
+							new HerdrSurfaceProvider({
+								paneConfig: loadPaneConfig(
+									dirname(getSubagentsConfigPath()),
+									getSubagentsConfigExamplePath(),
+								),
+							}),
+							loadPaneConfig(
+								dirname(getSubagentsConfigPath()),
+								getSubagentsConfigExamplePath(),
+							),
+						).createPane("reload-config", "/repo"),
+						"pane-new",
+					);
+				},
+			);
+			assert.deepEqual(
+				calls.find((args) => args[0] === "tab" && args[1] === "create"),
+				[
+					"tab",
+					"create",
+					"--workspace",
+					"workspace-1",
+					"--label",
+					"reload-config",
+					"--cwd",
+					"/repo",
+					"--no-focus",
+				],
+			);
+			assert.equal(
+				calls.some((args) => args[0] === "workspace" && args[1] === "list"),
+				false,
+			);
+		} finally {
+			existingRunning.delete("reload-live");
+			if (beforeRuntime) {
+				if (beforeHadSurfaceProvider) {
+					beforeRuntime.surfaceProvider = beforeSurfaceProvider;
+				} else {
+					delete beforeRuntime.surfaceProvider;
+				}
+				if (beforeHadLaunchOperations) {
+					beforeRuntime.launchOperations = beforeLaunchOperations;
+				} else {
+					delete beforeRuntime.launchOperations;
+				}
+			}
+			runtimeSlot[runtimeKey] = beforeRuntime;
+			try {
+				assert.equal(
+					runtimeSlot[runtimeKey]?.surfaceProvider,
+					beforeSurfaceProvider,
+				);
+				assert.equal(
+					runtimeSlot[runtimeKey]?.launchOperations,
+					beforeLaunchOperations,
+				);
+			} finally {
+				restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+				rmSync(dir, { recursive: true, force: true });
+			}
+		}
+	});
+
+	it("upgrades a pre-refresh runtime slot that lacks provider fields", async () => {
+		// SAFETY: pi-herdr-agents owns this process-local runtime symbol.
+		const runtimeSlot = globalThis as RuntimeSlot;
+		const beforeRuntime = runtimeSlot[runtimeKey];
+		const runningSubagents = new Map<string, object>();
+		runningSubagents.set("legacy-live", { id: "legacy-live" });
+		try {
+			runtimeSlot[runtimeKey] = { runningSubagents };
+			const reloaded = await importReloadedSubagents();
+			assert.equal(reloaded.__test__.runningSubagents, runningSubagents);
+			const mock = createMockExtensionApi();
+			reloaded.default(mock.api);
+			assert.ok(runtimeSlot[runtimeKey]?.session);
+		} finally {
+			runtimeSlot[runtimeKey] = beforeRuntime;
+		}
+	});
+
+	it("reports a legacy roles.bundled value once per parent load without rewriting config", async () => {
+		// SAFETY: pi-herdr-agents owns this process-local runtime symbol.
+		const runtimeSlot = globalThis as RuntimeSlot;
+		const beforeRuntime = runtimeSlot[runtimeKey];
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousId = process.env.PI_SUBAGENT_ID;
+		const dir = createTestDir();
+		const loaded: ReturnType<typeof createMockExtensionApi>[] = [];
+		const startSessions = async (
+			mock: ReturnType<typeof createMockExtensionApi>,
+			reasons: string[],
+		) => {
+			const notices: string[] = [];
+			const ctx = {
+				cwd: dir,
+				hasUI: true,
+				modelRegistry: { find: () => undefined, getAvailable: () => [] },
+				ui: {
+					notify: (text: string, level: string) =>
+						notices.push(`${level}: ${text}`),
+				},
+			};
+			for (const reason of reasons)
+				for (const handler of mock.eventHandlers.get("session_start") ?? [])
+					await handler({ reason }, ctx);
+			return notices;
+		};
+		try {
+			process.env.PI_CODING_AGENT_DIR = dir;
+			const configPath = getSubagentsConfigPath();
+			mkdirSync(dirname(configPath), { recursive: true });
+			for (const bundled of [true, false]) {
+				const raw = `${JSON.stringify(
+					{
+						...JSON.parse(
+							readFileSync(getSubagentsConfigExamplePath(), "utf8"),
+						),
+						roles: { bundled },
+					},
+					null,
+					2,
+				)}\n`;
+				writeFileSync(configPath, raw);
+
+				delete process.env.PI_SUBAGENT_ID;
+				const parent = createMockExtensionApi();
+				loaded.push(parent);
+				(await importReloadedSubagents()).default(parent.api);
+				const notices = await startSessions(parent, ["startup", "new"]);
+				assert.equal(notices.length, 1, notices.join("\n"));
+				assert.match(
+					notices[0],
+					new RegExp(
+						`^warning: Deprecated setting roles\\.bundled \\(${bundled}\\)`,
+					),
+				);
+				assert.ok(notices[0].includes(configPath));
+				assert.match(notices[0], /no longer ships bundled roles/);
+				assert.match(notices[0], /remove roles\.bundled/);
+				assert.equal(readFileSync(configPath, "utf8"), raw);
+
+				process.env.PI_SUBAGENT_ID = "legacy-config-child";
+				const child = createMockExtensionApi();
+				loaded.push(child);
+				(await importReloadedSubagents()).default(child.api);
+				assert.deepEqual(await startSessions(child, ["startup"]), []);
+			}
+		} finally {
+			for (const mock of loaded)
+				for (const handler of mock.eventHandlers.get("session_shutdown") ?? [])
+					await handler({ reason: "quit" }, { ui: { setWidget() {} } });
+			restoreEnvVar("PI_SUBAGENT_ID", previousId);
+			restoreEnvVar("PI_CODING_AGENT_DIR", previousAgentDir);
+			runtimeSlot[runtimeKey] = beforeRuntime;
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 
@@ -2046,11 +4397,14 @@ describe("pane configuration", () => {
 					persistent: { maxAgents: 9 },
 				}),
 			);
-			assert.deepEqual(loadPaneConfig(config), {
-				mode: "grouped",
-				direction: "right",
-				maxPerTab: 2,
-			});
+			assert.deepEqual(
+				loadPaneConfig(dirname(config), getSubagentsConfigExamplePath()),
+				{
+					mode: "grouped",
+					direction: "right",
+					maxPerTab: 2,
+				},
+			);
 			for (const maxPerTab of [
 				0,
 				-1,
@@ -2062,7 +4416,8 @@ describe("pane configuration", () => {
 			]) {
 				writeFileSync(config, JSON.stringify({ panes: { maxPerTab } }));
 				assert.throws(
-					() => loadPaneConfig(config),
+					() =>
+						loadPaneConfig(dirname(config), getSubagentsConfigExamplePath()),
 					/panes.maxPerTab must be a positive safe integer/,
 				);
 			}
@@ -2098,7 +4453,7 @@ describe("pane configuration", () => {
 				JSON.stringify({ panes: { mode: "split", direction: "down" } }),
 			);
 
-			assert.deepEqual(loadPaneConfig(join(dir, "config.json"), examplePath), {
+			assert.deepEqual(loadPaneConfig(dir, examplePath), {
 				mode: "split",
 				maxPerTab: 4,
 				direction: "down",
@@ -2154,9 +4509,7 @@ describe("model configuration", () => {
 	});
 
 	it("loads no model overrides when config.json is absent", () => {
-		const config = loadModelConfig(
-			join(createTestDir(), "missing-config.json"),
-		);
+		const config = loadModelConfig(createTestDir());
 		assert.deepEqual(config, { agents: {} });
 	});
 
@@ -2288,6 +4641,7 @@ describe("model configuration", () => {
 				tasks: { coding: ["fake/worker"] },
 				tasksMeta,
 				missingCategories: ["review", "recon", "qa", "architecture", "docs"],
+				configRevision: readConfigRevision(configPath),
 			});
 			const before = readFileSync(configPath, "utf8");
 			assert.throws(
@@ -2317,16 +4671,25 @@ describe("model configuration", () => {
 				(candidate) => candidate === "fake/worker",
 			);
 			assert.equal(
-				loadModelConfig(configPath).tasks?.coding?.[0],
+				loadModelConfig(dirname(configPath)).tasks?.coding?.[0],
 				"fake/worker",
 			);
-			assert.equal(loadRoleConfig(configPath, examplePath).bundled, true);
-			assert.equal(loadPaneConfig(configPath, examplePath).mode, "grouped");
+			assert.deepEqual(
+				loadRoleConfig(dirname(configPath), examplePath).deprecations,
+				[],
+			);
 			assert.equal(
-				loadSupervisionConfig(configPath, examplePath).forcePolling,
+				loadPaneConfig(dirname(configPath), examplePath).mode,
+				"grouped",
+			);
+			assert.equal(
+				loadSupervisionConfig(dirname(configPath), examplePath).forcePolling,
 				false,
 			);
-			assert.equal(loadPersistentConfig(configPath, examplePath).maxAgents, 3);
+			assert.equal(
+				loadPersistentConfig(dirname(configPath), examplePath).maxAgents,
+				3,
+			);
 			assert.equal(loadStatusConfig(configPath, examplePath).enabled, true);
 		});
 	});
@@ -2421,13 +4784,15 @@ describe("model configuration", () => {
 				{ generatedAt: "2026-09-17T00:00:00Z", method: "research" },
 				(candidate) => candidate === "fake/worker",
 				{
-					writeFileSync(path, data, options) {
-						writes.push({ path: String(path), options });
-						writeFileSync(path, data, options);
-					},
-					renameSync(from, to) {
-						renames.push({ from: String(from), to: String(to) });
-						renameSync(from, to);
+					fileOperations: {
+						writeFileSync(path, data, options) {
+							writes.push({ path: String(path), options });
+							writeFileSync(path, data, options);
+						},
+						renameSync(from, to) {
+							renames.push({ from: String(from), to: String(to) });
+							renameSync(from, to);
+						},
 					},
 				},
 			);
@@ -2497,6 +4862,512 @@ describe("model configuration", () => {
 	});
 });
 
+describe("conditional task model config writes", () => {
+	const tasksMeta = {
+		generatedAt: "2026-10-05T00:00:00Z",
+		method: "registry-only" as const,
+	};
+	const anyCandidate = () => true;
+	const write = (
+		configPath: string,
+		tasks: Record<string, string[]>,
+		options: Parameters<typeof writeTaskModelConfig>[5] = {},
+	) =>
+		writeTaskModelConfig(
+			configPath,
+			getSubagentsConfigExamplePath(),
+			tasks,
+			tasksMeta,
+			anyCandidate,
+			options,
+		);
+	const sha256 = (bytes: string | Buffer) =>
+		`sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+	const assertWriteError = (run: () => void, code: string, pattern?: RegExp) =>
+		assert.throws(run, (error: Error) => {
+			assert.ok(error instanceof TaskModelConfigWriteError);
+			assert.equal(error.code, code);
+			if (pattern) assert.match(error.message, pattern);
+			return true;
+		});
+	const siblings = (configPath: string) =>
+		readdirSync(dirname(configPath)).sort();
+
+	it("computes revisions over exact bytes, including whitespace, unrelated fields, and tasks", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			assert.equal(readConfigRevision(configPath), "missing");
+			const base = { keep: 1, models: { tasks: { coding: ["fake/a"] } } };
+			const variants = [
+				JSON.stringify(base),
+				JSON.stringify(base, null, 2),
+				JSON.stringify(base) + "\n",
+				JSON.stringify({ ...base, keep: 2 }),
+				JSON.stringify({ keep: 1, models: { tasks: { coding: ["fake/b"] } } }),
+			];
+			const revisions = variants.map((bytes) => {
+				writeFileSync(configPath, bytes);
+				const revision = readConfigRevision(configPath);
+				assert.match(revision, /^sha256:[0-9a-f]{64}$/);
+				assert.equal(revision, sha256(Buffer.from(bytes, "utf8")));
+				assert.equal(revision, computeConfigRevision(readFileSync(configPath)));
+				return revision;
+			});
+			assert.equal(new Set(revisions).size, variants.length);
+		});
+	});
+
+	it("writes when the exact-byte revision matches and returns the saved file's revision", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(
+				configPath,
+				'{"keep":{"secret":"unrelated"},  "models":{"default":"fake/default","tasks":{"qa":["fake/qa"]}}}',
+			);
+			const saved = write(
+				configPath,
+				{ coding: ["fake/worker"], qa: ["fake/qa"] },
+				{ expectedConfigRevision: readConfigRevision(configPath) },
+			);
+			const bytes = readFileSync(configPath);
+			assert.equal(saved.configRevision, sha256(bytes));
+			assert.equal(saved.configRevision, readConfigRevision(configPath));
+			assert.deepEqual(JSON.parse(bytes.toString("utf8")), {
+				keep: { secret: "unrelated" },
+				models: {
+					default: "fake/default",
+					tasks: { coding: ["fake/worker"], qa: ["fake/qa"] },
+					tasksMeta,
+				},
+			});
+			assert.deepEqual(siblings(configPath), ["config.json"]);
+			// The returned revision is a valid precondition for the next write.
+			write(
+				configPath,
+				{ coding: ["fake/next"] },
+				{ expectedConfigRevision: saved.configRevision },
+			);
+			assert.deepEqual(loadModelConfig(dir).tasks, { coding: ["fake/next"] });
+		});
+	});
+
+	it("refuses stale revisions after task, unrelated-field, or whitespace-only changes without leaking content", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			const original = JSON.stringify({
+				keep: "secret-value-1",
+				models: { tasks: { coding: ["fake/a"] } },
+			});
+			for (const changed of [
+				JSON.stringify({
+					keep: "secret-value-1",
+					models: { tasks: { coding: ["fake/a"], qa: ["fake/qa"] } },
+				}),
+				JSON.stringify({
+					keep: "secret-value-2",
+					models: { tasks: { coding: ["fake/a"] } },
+				}),
+				JSON.stringify(JSON.parse(original), null, 2),
+				original + "\n",
+			]) {
+				writeFileSync(configPath, original);
+				const proposalRevision = readConfigRevision(configPath);
+				writeFileSync(configPath, changed);
+				assertWriteError(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/new"] },
+							{ expectedConfigRevision: proposalRevision },
+						),
+					"stale-revision",
+					/bytes changed.*not replaced.*Re-read.*fresh proposal.*fresh approval/,
+				);
+				assert.throws(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/new"] },
+							{ expectedConfigRevision: proposalRevision },
+						),
+					(error: Error) => {
+						assert.doesNotMatch(
+							error.message,
+							/secret-value|fake\/qa|fake\/a\b/,
+						);
+						assert.equal(
+							error.message.includes(readConfigRevision(configPath)),
+							false,
+						);
+						return true;
+					},
+				);
+				assert.equal(readFileSync(configPath, "utf8"), changed);
+				assert.deepEqual(siblings(configPath), ["config.json"]);
+			}
+		});
+	});
+
+	it("handles created, deleted, and missing config file states", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "nested", "config.json");
+			const saved = write(
+				configPath,
+				{ coding: ["fake/worker"] },
+				{ expectedConfigRevision: "missing" },
+			);
+			// Missing-file writes keep seeding packaged defaults.
+			const written = JSON.parse(readFileSync(configPath, "utf8"));
+			const example = JSON.parse(
+				readFileSync(getSubagentsConfigExamplePath(), "utf8"),
+			);
+			for (const key of Object.keys(example).filter((key) => key !== "models"))
+				assert.deepEqual(written[key], example[key]);
+			assert.equal(saved.configRevision, readConfigRevision(configPath));
+
+			const existing = readFileSync(configPath, "utf8");
+			assertWriteError(
+				() =>
+					write(
+						configPath,
+						{ coding: ["fake/other"] },
+						{ expectedConfigRevision: "missing" },
+					),
+				"stale-revision",
+				/expected no config file, but one now exists/,
+			);
+			assert.equal(readFileSync(configPath, "utf8"), existing);
+
+			rmSync(configPath);
+			assertWriteError(
+				() =>
+					write(
+						configPath,
+						{ coding: ["fake/other"] },
+						{ expectedConfigRevision: saved.configRevision },
+					),
+				"stale-revision",
+				/expected an existing config file, but it is now missing/,
+			);
+			assert.equal(existsSync(configPath), false);
+			assert.deepEqual(readdirSync(dirname(configPath)), []);
+		});
+	});
+
+	it("rejects invalid revision strings before reading or replacing configuration", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(configPath, "{}");
+			const valid = readConfigRevision(configPath);
+			for (const invalid of [
+				"",
+				null,
+				42,
+				"MISSING",
+				" missing",
+				valid.toUpperCase(),
+				valid.replace("sha256:", "SHA256:"),
+				valid.slice(0, -1),
+				`${valid}0`,
+				`${valid} `,
+				valid.replace("sha256:", "sha1:"),
+				valid.slice("sha256:".length),
+			]) {
+				assertWriteError(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/worker"] },
+							// SAFETY: deliberately bypasses static typing to test the runtime boundary.
+							{ expectedConfigRevision: invalid as string },
+						),
+					"invalid-revision",
+					/Invalid expectedConfigRevision/,
+				);
+				assert.equal(readFileSync(configPath, "utf8"), "{}");
+				assert.deepEqual(siblings(configPath), ["config.json"]);
+			}
+		});
+	});
+
+	it("compares the revision before reporting malformed configuration and never replaces it", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			for (const malformed of ["{not json", "[]", "null"]) {
+				writeFileSync(configPath, malformed);
+				assert.throws(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/worker"] },
+							{ expectedConfigRevision: readConfigRevision(configPath) },
+						),
+					/Invalid JSON in subagent config/,
+				);
+				assertWriteError(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/worker"] },
+							{ expectedConfigRevision: sha256("other") },
+						),
+					"stale-revision",
+				);
+				assert.throws(
+					() => write(configPath, { coding: ["fake/worker"] }),
+					/Invalid JSON in subagent config/,
+				);
+				assert.equal(readFileSync(configPath, "utf8"), malformed);
+				assert.deepEqual(siblings(configPath), ["config.json"]);
+			}
+		});
+	});
+
+	it("keeps omitted revisions unconditional while preserving unrelated fields", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					keep: 1,
+					models: {
+						agents: { scout: "fake/scout" },
+						tasks: { qa: ["fake/qa"] },
+					},
+				}),
+			);
+			const saved = write(configPath, { coding: ["fake/worker"] });
+			assert.equal(saved.configRevision, readConfigRevision(configPath));
+			// Unconditional writes still replace the full task map, as before.
+			assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")), {
+				keep: 1,
+				models: {
+					agents: { scout: "fake/scout" },
+					tasks: { coding: ["fake/worker"] },
+					tasksMeta,
+				},
+			});
+		});
+	});
+
+	it("removes only its own temporary file and lock when publication fails", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(configPath, '{"keep":true}');
+			const foreign = join(dir, ".foreign-config.tmp");
+			writeFileSync(foreign, "not ours");
+			for (const fileOperations of [
+				{
+					writeFileSync() {
+						throw new Error("injected write failure");
+					},
+					renameSync,
+				},
+				{
+					writeFileSync(path: any, data: any, options: any) {
+						writeFileSync(path, data, options);
+						throw new Error("injected write failure");
+					},
+					renameSync,
+				},
+				{
+					writeFileSync,
+					renameSync() {
+						throw new Error("injected write failure");
+					},
+				},
+			]) {
+				assert.throws(
+					() =>
+						write(
+							configPath,
+							{ coding: ["fake/worker"] },
+							{
+								expectedConfigRevision: readConfigRevision(configPath),
+								// SAFETY: test doubles implement only the injected call shape.
+								fileOperations: fileOperations as any,
+							},
+						),
+					/injected write failure/,
+				);
+				assert.equal(readFileSync(configPath, "utf8"), '{"keep":true}');
+				assert.deepEqual(siblings(configPath), [
+					".foreign-config.tmp",
+					"config.json",
+				]);
+			}
+			write(configPath, { coding: ["fake/worker"] });
+			assert.deepEqual(siblings(configPath), [
+				".foreign-config.tmp",
+				"config.json",
+			]);
+		});
+	});
+
+	it("fails closed on held or stale locks and never removes another owner's lock", () => {
+		withTempDir((dir) => {
+			const configPath = join(dir, "config.json");
+			writeFileSync(configPath, '{"keep":true}');
+			const lockPath = getConfigWriteLockPath(configPath);
+			const deadPid = spawnSync(process.execPath, ["-e", ""]).pid;
+			for (const [contents, pattern] of [
+				[
+					JSON.stringify({
+						pid: deadPid,
+						hostname: hostname(),
+						token: "other",
+						createdAt: "2026-01-01T00:00:00.000Z",
+					}),
+					new RegExp(`pid ${deadPid}.*no longer running.*appears stale`),
+				],
+				[
+					JSON.stringify({
+						pid: process.pid,
+						hostname: hostname(),
+						token: "other",
+					}),
+					new RegExp(`pid ${process.pid}`),
+				],
+				["", /unidentified owner/],
+				["{corrupt", /unidentified owner/],
+			] as const) {
+				writeFileSync(lockPath, contents);
+				for (const expectedConfigRevision of [
+					undefined,
+					readConfigRevision(configPath),
+				]) {
+					assertWriteError(
+						() =>
+							write(
+								configPath,
+								{ coding: ["fake/worker"] },
+								{ expectedConfigRevision },
+							),
+						"busy",
+						pattern,
+					);
+					assertWriteError(
+						() => write(configPath, { coding: ["fake/worker"] }),
+						"busy",
+						/never broken automatically/,
+					);
+				}
+				assert.equal(readFileSync(lockPath, "utf8"), contents);
+				assert.equal(readFileSync(configPath, "utf8"), '{"keep":true}');
+				assert.deepEqual(siblings(configPath), [
+					"config.json",
+					"config.json.lock",
+				]);
+			}
+			rmSync(lockPath);
+			write(configPath, { coding: ["fake/worker"] });
+			assert.deepEqual(siblings(configPath), ["config.json"]);
+		});
+	});
+
+	it("serializes cooperating writers across processes and rejects the loser's stale revision", async () => {
+		const dir = createTestDir();
+		try {
+			const configPath = join(dir, "config.json");
+			writeFileSync(configPath, '{"keep":true}');
+			const proposalRevision = readConfigRevision(configPath);
+			const readyPath = join(dir, "ready");
+			const releasePath = join(dir, "release");
+			const moduleUrl = new URL(
+				"../maestro/core/config/model-config.ts",
+				import.meta.url,
+			).href;
+			const script = `
+				import { existsSync, renameSync, writeFileSync } from "node:fs";
+				import { writeTaskModelConfig } from ${JSON.stringify(moduleUrl)};
+				const env = process.env;
+				const sleeper = new Int32Array(new SharedArrayBuffer(4));
+				const saved = writeTaskModelConfig(
+					env.W2_CONFIG,
+					env.W2_EXAMPLE,
+					{ coding: ["fake/child"] },
+					${JSON.stringify(tasksMeta)},
+					() => true,
+					{
+						expectedConfigRevision: env.W2_REVISION,
+						fileOperations: {
+							renameSync,
+							writeFileSync(path, data, options) {
+								writeFileSync(env.W2_READY, "");
+								const deadline = Date.now() + 20000;
+								while (!existsSync(env.W2_RELEASE)) {
+									if (Date.now() > deadline) throw new Error("release timeout");
+									Atomics.wait(sleeper, 0, 0, 10);
+								}
+								writeFileSync(path, data, options);
+							},
+						},
+					},
+				);
+				process.stdout.write(JSON.stringify(saved));
+			`;
+			const child = childProcess.spawn(
+				process.execPath,
+				["--experimental-strip-types", "--input-type=module", "-e", script],
+				{
+					env: {
+						...process.env,
+						W2_CONFIG: configPath,
+						W2_EXAMPLE: getSubagentsConfigExamplePath(),
+						W2_REVISION: proposalRevision,
+						W2_READY: readyPath,
+						W2_RELEASE: releasePath,
+					},
+					stdio: ["ignore", "pipe", "pipe"],
+				},
+			);
+			let stdout = "";
+			let stderr = "";
+			child.stdout.on("data", (chunk) => (stdout += chunk));
+			child.stderr.on("data", (chunk) => (stderr += chunk));
+			const exited = new Promise<number | null>((resolve) =>
+				child.on("close", resolve),
+			);
+			const readyDeadline = Date.now() + 20_000;
+			while (!existsSync(readyPath)) {
+				assert.ok(Date.now() < readyDeadline, `child never locked: ${stderr}`);
+				await new Promise((resolve) => setTimeout(resolve, 10));
+			}
+			// The child holds the lock mid-publication: both kinds of parent write fail fast.
+			for (const options of [{}, { expectedConfigRevision: proposalRevision }])
+				assertWriteError(
+					() => write(configPath, { qa: ["fake/parent"] }, options),
+					"busy",
+					new RegExp(`pid ${child.pid}`),
+				);
+			assert.equal(readFileSync(configPath, "utf8"), '{"keep":true}');
+			writeFileSync(releasePath, "");
+			assert.equal(await exited, 0, stderr);
+			const saved = JSON.parse(stdout);
+			assert.equal(saved.configRevision, readConfigRevision(configPath));
+			assert.deepEqual(loadModelConfig(dir).tasks, { coding: ["fake/child"] });
+			// The parent's proposal was read before the child's write; retrying it is stale.
+			assertWriteError(
+				() =>
+					write(
+						configPath,
+						{ qa: ["fake/parent"] },
+						{ expectedConfigRevision: proposalRevision },
+					),
+				"stale-revision",
+			);
+			assert.deepEqual(loadModelConfig(dir).tasks, { coding: ["fake/child"] });
+			assert.deepEqual(readdirSync(dir).sort(), [
+				"config.json",
+				"ready",
+				"release",
+			]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("persistent specialist configuration", () => {
 	it("defaults absent configuration to three specialists and rejects unknown keys", () => {
 		assert.deepEqual(parsePersistentConfig({}), { maxAgents: 3 });
@@ -2518,10 +5389,9 @@ describe("persistent specialist configuration", () => {
 				examplePath,
 				JSON.stringify({ persistent: { maxAgents: 2 } }),
 			);
-			assert.deepEqual(
-				loadPersistentConfig(join(dir, "config.json"), examplePath),
-				{ maxAgents: 2 },
-			);
+			assert.deepEqual(loadPersistentConfig(dir, examplePath), {
+				maxAgents: 2,
+			});
 		});
 	});
 });
@@ -2561,10 +5431,10 @@ describe("supervision", () => {
 				example,
 				JSON.stringify({ supervision: { hangWarningMinutes: 20 } }),
 			);
-			assert.deepEqual(
-				loadSupervisionConfig(join(dir, "config.json"), example),
-				{ forcePolling: false, hangWarningMinutes: 20 },
-			);
+			assert.deepEqual(loadSupervisionConfig(dir, example), {
+				forcePolling: false,
+				hangWarningMinutes: 20,
+			});
 		});
 	});
 
@@ -2855,9 +5725,26 @@ describe("supervision", () => {
 });
 
 describe("role configuration", () => {
-	it("defaults bundled roles to enabled when omitted", () => {
-		assert.deepEqual(parseRoleConfig({}), { bundled: true });
-		assert.deepEqual(parseRoleConfig({ roles: {} }), { bundled: true });
+	it("has no deprecations when the legacy key is omitted", () => {
+		assert.deepEqual(parseRoleConfig({}), { deprecations: [] });
+		assert.deepEqual(parseRoleConfig({ roles: {} }), { deprecations: [] });
+	});
+
+	it("accepts both legacy bundled booleans as deprecated no-ops", () => {
+		for (const bundled of [true, false]) {
+			const { deprecations } = parseRoleConfig(
+				{ roles: { bundled } },
+				"/agent/herdr-agents/config.json",
+			);
+			assert.equal(deprecations.length, 1);
+			assert.match(
+				deprecations[0],
+				new RegExp(`roles\\.bundled \\(${bundled}\\).*is ignored`),
+			);
+			assert.match(deprecations[0], /\/agent\/herdr-agents\/config\.json/);
+			assert.match(deprecations[0], /Install a role pack/);
+			assert.match(deprecations[0], /The file was not changed/);
+		}
 	});
 
 	it("rejects explicit null and non-object role settings", () => {
@@ -2867,12 +5754,16 @@ describe("role configuration", () => {
 				/roles must be an object/,
 			);
 		}
-		for (const bundled of [null, "false", []]) {
+		for (const bundled of [null, "false", [], 0]) {
 			assert.throws(
 				() => parseRoleConfig({ roles: { bundled } }),
 				/roles\.bundled must be a boolean/,
 			);
 		}
+		assert.throws(
+			() => parseRoleConfig({ roles: { bundled: true, packs: [] } }),
+			/roles has unsupported key\(s\): packs/,
+		);
 	});
 
 	it("loads the shared example when local config is absent", () => {
@@ -2880,10 +5771,17 @@ describe("role configuration", () => {
 			const examplePath = join(dir, "config.json.example");
 			writeFileSync(examplePath, JSON.stringify({ roles: { bundled: false } }));
 
-			assert.deepEqual(loadRoleConfig(join(dir, "config.json"), examplePath), {
-				bundled: false,
-			});
+			const { deprecations } = loadRoleConfig(dir, examplePath);
+			assert.equal(deprecations.length, 1);
+			assert.ok(deprecations[0].includes(examplePath));
 		});
+	});
+
+	it("ships an example configuration without the legacy key", () => {
+		const example = JSON.parse(
+			readFileSync(getSubagentsConfigExamplePath(), "utf8"),
+		);
+		assert.equal(Object.hasOwn(example, "roles"), false);
 	});
 
 	it("rejects malformed bundled-role settings without falling back", () => {
@@ -2894,16 +5792,15 @@ describe("role configuration", () => {
 		withTempDir((dir) => {
 			const configPath = join(dir, "config.json");
 			const examplePath = join(dir, "config.json.example");
-			writeFileSync(
-				configPath,
-				JSON.stringify({ roles: { bundled: "false" } }),
-			);
+			const raw = JSON.stringify({ roles: { bundled: "false" } });
+			writeFileSync(configPath, raw);
 			writeFileSync(examplePath, JSON.stringify({ roles: { bundled: false } }));
 
 			assert.throws(
-				() => loadRoleConfig(configPath, examplePath),
+				() => loadRoleConfig(dirname(configPath), examplePath),
 				/roles\.bundled must be a boolean/,
 			);
+			assert.equal(readFileSync(configPath, "utf8"), raw);
 		});
 	});
 });
@@ -2911,33 +5808,33 @@ describe("role configuration", () => {
 describe("subagent discovery", () => {
 	const testApi = subagentsModule.__test__;
 
-	it("excludes bundled roles while retaining role-pack and override roles", async () => {
+	it("ships an empty role catalog and keeps project > global > role-pack precedence", async () => {
 		await withIsolatedAgentEnv(
 			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+				const emptyCatalog = testApi.discoverAgentCatalog();
+				assert.deepEqual(emptyCatalog, { agents: [], diagnostics: [] });
+				for (const name of [
+					"scout",
+					"planner",
+					"worker",
+					"reviewer",
+					"adversarial-reviewer",
+					"visual-tester",
+					"poteto",
+				])
+					assert.equal(
+						testApi.loadAgentDefaults(name),
+						null,
+						`the host must not ship ${name}`,
+					);
+
 				const rolesDir = join(projectDir, "scout-pack", "roles");
 				mkdirSync(rolesDir, { recursive: true });
 				writeFileSync(
 					join(rolesDir, "..", "package.json"),
 					JSON.stringify({ name: "@acme/scout-pack", version: "1.0.0" }),
 				);
-				writeAgentFile(
-					rolesDir,
-					"scout",
-					"description: Role-pack scout enabled without bundled roles",
-				);
-
-				const disabled = { bundled: false };
-				const emptyCatalog = testApi.discoverAgentCatalog(undefined, disabled);
-				assert.equal(
-					emptyCatalog.agents.some((agent) => agent.name === "scout"),
-					false,
-					"listing excludes bundled scouts when disabled",
-				);
-				assert.equal(
-					testApi.loadAgentDefaults("scout", undefined, disabled),
-					null,
-					"exact-name lookup cannot launch an omitted bundled scout",
-				);
+				writeAgentFile(rolesDir, "scout", "description: Role-pack scout");
 
 				const { api } = createMockExtensionApi();
 				api.events.on(
@@ -2945,32 +5842,15 @@ describe("subagent discovery", () => {
 					(request: { register(path: string): void }) =>
 						request.register(rolesDir),
 				);
-				const catalog = testApi.discoverAgentCatalog(api, disabled);
-				assert.equal(
-					catalog.agents.find((agent) => agent.name === "scout")?.provider,
-					"@acme/scout-pack",
-					"a role pack may supply a name that no enabled bundled role owns",
-				);
-				assert.equal(
-					catalog.diagnostics.some(
-						(diagnostic) => diagnostic.code === "bundled-role-collision",
-					),
-					false,
-				);
-				assert.equal(
-					testApi.loadAgentDefaults("worker", api, disabled),
-					null,
-					"exact-name lookup cannot launch an omitted bundled role",
-				);
-
-				writeAgentFile(
-					globalAgentsDir,
-					"global-scout",
-					"description: Global scout",
-				);
-				assert.equal(
-					testApi.loadAgentDefaults("global-scout", api, disabled)?.source,
-					"global",
+				const catalog = testApi.discoverAgentCatalog(api);
+				assert.deepEqual(catalog.diagnostics, []);
+				assert.deepEqual(
+					catalog.agents.map((agent) => [
+						agent.name,
+						agent.source,
+						agent.provider,
+					]),
+					[["scout", "package", "@acme/scout-pack"]],
 				);
 
 				writeAgentFile(
@@ -2979,9 +5859,9 @@ describe("subagent discovery", () => {
 					"description: Global scout override",
 				);
 				assert.equal(
-					testApi.loadAgentDefaults("scout", api, disabled)?.source,
+					testApi.loadAgentDefaults("scout", api)?.source,
 					"global",
-					"a global definition can supply a disabled bundled name",
+					"a global definition overrides a role-pack definition",
 				);
 				writeAgentFile(
 					projectAgentsDir,
@@ -2989,7 +5869,7 @@ describe("subagent discovery", () => {
 					"description: Project scout override",
 				);
 				assert.equal(
-					testApi.loadAgentDefaults("scout", api, disabled)?.source,
+					testApi.loadAgentDefaults("scout", api)?.source,
 					"project",
 					"a project definition retains precedence over a global definition",
 				);
@@ -3149,7 +6029,7 @@ describe("subagent discovery", () => {
 			false,
 		);
 
-		// Interactive fork workflows such as /iterate opt out explicitly.
+		// Interactive bare forks opt out explicitly.
 		assert.equal(
 			testApi.resolveEffectiveAutoExit(
 				{ name: "A", task: "T", fork: true, interactive: true },
@@ -3202,42 +6082,31 @@ describe("subagent discovery", () => {
 		);
 	});
 
-	it("bundled agents inherit the parent runtime and preserve interaction modes", async () => {
-		await withIsolatedAgentEnv(async () => {
-			const expectedInteraction = {
-				scout: false,
-				worker: false,
-				reviewer: false,
-				planner: true,
-				"visual-tester": false,
-			} as const;
-
-			for (const [name, interactive] of Object.entries(expectedInteraction)) {
+	it("lets model-neutral fixture roles inherit the parent runtime and keep interaction modes", async () => {
+		await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+			writeAgentFile(
+				projectAgentsDir,
+				"fixture-leaf",
+				["description: Autonomous fixture leaf", "auto-exit: true"].join("\n"),
+			);
+			writeAgentFile(
+				projectAgentsDir,
+				"fixture-interactive",
+				"description: Interactive fixture role",
+			);
+			for (const [name, interactive] of [
+				["fixture-leaf", false],
+				["fixture-interactive", true],
+			] as const) {
 				const defs = testApi.loadAgentDefaults(name);
-				assert.ok(defs, `expected bundled agent ${name} to load`);
-				assert.equal(
-					defs.model,
-					undefined,
-					`${name} should inherit the parent model`,
-				);
-				assert.equal(
-					defs.thinking,
-					undefined,
-					`${name} should inherit the parent thinking level`,
-				);
+				assert.ok(defs, `expected fixture role ${name} to load`);
+				assert.equal(defs.model, undefined);
+				assert.equal(defs.thinking, undefined);
 				assert.equal(
 					testApi.resolveEffectiveInteractive({ name, task: "" }, defs),
 					interactive,
-					`${name} should preserve its interaction mode`,
 				);
 			}
-
-			assert.equal(
-				testApi.loadAgentDefaults("visual-tester")?.skills,
-				"chrome-cdp",
-			);
-
-			assert.equal(testApi.loadAgentDefaults("claude-reviewer"), null);
 		});
 	});
 
@@ -3256,106 +6125,52 @@ describe("subagent discovery", () => {
 		});
 	});
 
-	it("gives bundled orchestrators the subagent tool they require", () => {
-		const poteto = testApi.loadAgentDefaults("poteto");
-		assert.ok(poteto, "expected bundled poteto agent to be discoverable");
-		assert.equal(poteto.spawning, true);
-		assert.ok(
-			new Set(
-				(poteto.tools ?? "").split(",").map((tool: string) => tool.trim()),
-			).has("subagent"),
-			"poteto must expose the subagent tool used by its workflow",
-		);
-
-		const adversarial = testApi.loadAgentDefaults("adversarial-reviewer");
-		assert.ok(
-			adversarial,
-			"expected bundled adversarial reviewer to be discoverable",
-		);
-
-		assert.equal(adversarial.spawning, true);
-		assert.equal(
-			adversarial.autoExit,
-			false,
-			"multi-wave coordinator must remain open after each child-result steer",
-		);
-		assert.equal(
-			adversarial.interactive,
-			false,
-			"automatic completion steers must wake the multi-wave coordinator",
-		);
-		assert.equal(
-			testApi.resolveEffectiveAutoExit(
-				{ name: "Adversarial review", task: "Review" },
-				adversarial,
-			),
-			false,
-		);
-		assert.equal(
-			testApi.resolveEffectiveInteractive(
-				{ name: "Adversarial review", task: "Review" },
-				adversarial,
-			),
-			false,
-		);
-		const adversarialTools = new Set(
-			(adversarial.tools ?? "").split(",").map((tool: string) => tool.trim()),
-		);
-		assert.equal(adversarialTools.has("subagent"), true);
-		for (const tool of ["read", "bash", "grep", "find", "ls"]) {
-			assert.equal(
-				adversarialTools.has(tool),
-				true,
-				`adversarial reviewer must expose ${tool}`,
+	it("keeps a non-auto-exit fixture coordinator open for completion steers", async () => {
+		await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+			writeAgentFile(
+				projectAgentsDir,
+				"fixture-coordinator",
+				[
+					"description: Multi-wave fixture coordinator",
+					"tools: read, bash, subagent",
+					"spawning: true",
+					"auto-exit: false",
+					"interactive: false",
+					"session-mode: fork",
+				].join("\n"),
 			);
-		}
-		assert.equal(
-			testApi.resolveEffectiveSessionMode(
-				{ name: "Adversarial review", task: "Review", fork: false },
-				adversarial,
-			),
-			"standalone",
-		);
-
-		const instructions = adversarial.body ?? "";
-		assert.match(instructions, /model-catalog source/i);
-		assert.match(instructions, /how authentication was\s+confirmed/i);
-		assert.doesNotMatch(
-			instructions,
-			/model:\s*["'][^"']+\/[^"']+["']/,
-			"adversarial reviewer must not hard-code provider model IDs",
-		);
-		assert.match(instructions, /project review rules/i);
-		assert.match(
-			instructions,
-			/Routine\s+risk uses two distinct eligible\s+exact model IDs/i,
-		);
-		assert.match(
-			instructions,
-			/High risk uses three distinct eligible IDs with lenses/i,
-		);
-		assert.match(instructions, /candidate-dependent/i);
-		assert.match(instructions, /different provider\/model family/i);
-		assert.doesNotMatch(
-			instructions,
-			/same-family.*fallback/i,
-			"adversarial reviewer must not allow same-family fallback",
-		);
-		assert.match(instructions, /fresh reviewer carrying alias\s+`S1`/i);
-		assert.match(instructions, /subagent_ping.*not a review report/is);
-		assert.match(instructions, /nonzero exit, provider error, launch error/i);
-		assert.match(instructions, /Never silently replace a\s+runtime/i);
-		assert.match(instructions, /16,000 characters/i);
-		assert.match(instructions, /call\s+`subagent_done`/i);
-		assert.match(
-			instructions,
-			/Never call it[\s\S]*lacks a terminal envelope/i,
-		);
-		assert.match(
-			instructions,
-			/Do not run verification that can generate\s+artifacts/i,
-		);
-		assert.doesNotMatch(instructions, /tools:\s*["']read,bash,write["']/);
+			const coordinator = testApi.loadAgentDefaults("fixture-coordinator");
+			assert.ok(coordinator);
+			assert.equal(coordinator.spawning, true);
+			assert.equal(
+				testApi.resolveEffectiveAutoExit(
+					{ name: "Coordinator", task: "Review" },
+					coordinator,
+				),
+				false,
+				"a multi-wave coordinator must remain open after each child-result steer",
+			);
+			assert.equal(
+				testApi.resolveEffectiveInteractive(
+					{ name: "Coordinator", task: "Review" },
+					coordinator,
+				),
+				false,
+				"automatic completion steers must wake the coordinator",
+			);
+			assert.equal(
+				testApi.resolveDenyTools(coordinator).has("subagent"),
+				false,
+			);
+			assert.equal(
+				testApi.resolveEffectiveSessionMode(
+					{ name: "Coordinator", task: "Review", fork: false },
+					coordinator,
+				),
+				"standalone",
+				"fork:false overrides a role's non-standalone session mode",
+			);
+		});
 	});
 
 	it("ignores invalid session-mode values", async () => {
@@ -3476,24 +6291,21 @@ describe("subagent discovery", () => {
 
 	it("buildSubagentToolAllowlist keeps explicit completion for interactive children", () => {
 		assert.equal(
-			testApi.buildSubagentToolAllowlist("read,bash,web_search"),
+			buildSubagentToolAllowlist("read,bash,web_search"),
 			"read,bash,web_search,caller_ping,subagent_done",
 		);
 	});
 
 	it("buildSubagentToolAllowlist omits explicit completion for auto-exit children", () => {
 		assert.equal(
-			testApi.buildSubagentToolAllowlist(
-				"read,bash,web_search,subagent_done",
-				true,
-			),
+			buildSubagentToolAllowlist("read,bash,web_search,subagent_done", true),
 			"read,bash,web_search,caller_ping",
 		);
 	});
 
 	it("buildSubagentToolAllowlist returns null without an explicit tool restriction", () => {
-		assert.equal(testApi.buildSubagentToolAllowlist(undefined), null);
-		assert.equal(testApi.buildSubagentToolAllowlist(""), null);
+		assert.equal(buildSubagentToolAllowlist(undefined), null);
+		assert.equal(buildSubagentToolAllowlist(""), null);
 	});
 
 	it("buildPiPromptArgs inserts separator for artifact-backed launches with skills", () => {
@@ -3654,7 +6466,7 @@ describe("subagent discovery", () => {
 			writeAgentFile(
 				firstRoles,
 				"scout",
-				"description: Attempts to replace the bundled scout",
+				"description: Single-pack scout with no host-owned competitor",
 			);
 
 			const { api, registeredTools, registeredCommands } =
@@ -3681,16 +6493,22 @@ describe("subagent discovery", () => {
 			assert.equal(
 				result.details.agents.find((agent: any) => agent.name === "scout")
 					?.provider,
-				undefined,
+				"@acme/first-roles",
+				"no host-shipped role protects a pack-contributed name",
 			);
 			assert.deepEqual(
-				new Set(
-					result.details.diagnostics.map((diagnostic: any) => diagnostic.code),
-				),
-				new Set(["duplicate-package-role", "bundled-role-collision"]),
+				result.details.diagnostics.map((diagnostic: any) => diagnostic.code),
+				["duplicate-package-role"],
 			);
 			assert.match(result.content[0].text, /multiple role packs/i);
-			assert.match(result.content[0].text, /cannot replace bundled role/i);
+			assert.match(
+				result.content[0].text,
+				/@acme\/first-roles, @acme\/second-roles/,
+			);
+			assert.match(
+				result.content[0].text,
+				/unavailable until only one pack provides it; use a global or project definition/,
+			);
 
 			const notifications: string[] = [];
 			const command = registeredCommands.find(
@@ -3756,7 +6574,14 @@ describe("subagent discovery", () => {
 
 	it("labels visible package, global, and project agents by source", async () => {
 		await withIsolatedAgentEnv(
-			async ({ projectAgentsDir, globalAgentsDir }) => {
+			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+				const rolesDir = join(projectDir, "list-pack", "roles");
+				mkdirSync(rolesDir, { recursive: true });
+				writeFileSync(
+					join(rolesDir, "..", "package.json"),
+					JSON.stringify({ name: "@acme/list-roles", version: "1.0.0" }),
+				);
+				writeAgentFile(rolesDir, "scout", "description: Pack scout");
 				writeAgentFile(
 					globalAgentsDir,
 					"global-discovery-test-agent",
@@ -3775,6 +6600,11 @@ describe("subagent discovery", () => {
 				);
 
 				const { api, registeredTools } = createMockExtensionApi();
+				api.events.on(
+					"pi-herdr-subagents:roles:discover:v1",
+					(request: { register(path: string): void }) =>
+						request.register(rolesDir),
+				);
 				subagentsModule.default(api);
 
 				const tool = registeredTools.find(
@@ -3794,7 +6624,10 @@ describe("subagent discovery", () => {
 					sourceByName.get("project-discovery-test-agent"),
 					"project",
 				);
-				assert.match(result.content[0].text, /scout \(package\)/);
+				assert.match(
+					result.content[0].text,
+					/scout \(package:@acme\/list-roles\)/,
+				);
 				assert.match(
 					result.content[0].text,
 					/global-discovery-test-agent \(global\)/,
@@ -3890,10 +6723,13 @@ describe("subagent discovery", () => {
 			] as const) {
 				writeAgentFile(projectAgentsDir, name, frontmatter);
 			}
+			// An invalid higher-precedence override fails closed instead of
+			// falling through to the valid lower-precedence role-pack definition.
+			writeAgentFile(rolesDir, "scout", "description: Valid pack scout");
 			writeAgentFile(
 				projectAgentsDir,
 				"scout",
-				["description: Invalid bundled override", "tools: []"].join("\n"),
+				["description: Invalid project override", "tools: []"].join("\n"),
 			);
 			writeAgentFile(
 				projectAgentsDir,
@@ -5801,7 +8637,14 @@ describe("completion.ts", () => {
 describe("commands", () => {
 	it("/subagent list labels every visible agent source without spawning one", async () => {
 		await withIsolatedAgentEnv(
-			async ({ projectAgentsDir, globalAgentsDir }) => {
+			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
+				const rolesDir = join(projectDir, "command-list-pack", "roles");
+				mkdirSync(rolesDir, { recursive: true });
+				writeFileSync(
+					join(rolesDir, "..", "package.json"),
+					JSON.stringify({ name: "@acme/command-roles", version: "1.0.0" }),
+				);
+				writeAgentFile(rolesDir, "scout", "description: Pack scout");
 				writeAgentFile(
 					globalAgentsDir,
 					"global-command-list-test-agent",
@@ -5821,6 +8664,11 @@ describe("commands", () => {
 
 				const { api, registeredCommands, sentUserMessages } =
 					createMockExtensionApi();
+				api.events.on(
+					"pi-herdr-subagents:roles:discover:v1",
+					(request: { register(path: string): void }) =>
+						request.register(rolesDir),
+				);
 				subagentsModule.default(api);
 				const subagent = registeredCommands.find(
 					(command) => command.name === "subagent",
@@ -5837,7 +8685,10 @@ describe("commands", () => {
 
 				assert.equal(notifications.length, 1);
 				assert.equal(notifications[0].level, "info");
-				assert.match(notifications[0].message, /scout \(package\)/);
+				assert.match(
+					notifications[0].message,
+					/scout \(package:@acme\/command-roles\)/,
+				);
 				assert.match(
 					notifications[0].message,
 					/global-command-list-test-agent \(global\)/,
@@ -6073,7 +8924,7 @@ describe("commands", () => {
 				"For ordinary review, prefer a different authenticated model family.",
 				"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 				"Disclose that this review is context-isolated, not cross-family independent.",
-				"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+				"Cross-family verification must not use this fallback.",
 			])
 				assert.ok(
 					normalizedPrompt.includes(clause),
@@ -6243,6 +9094,7 @@ describe("commands", () => {
 				tasks: { coding: ["fake/worker"] },
 				tasksMeta,
 				missingCategories: ["review", "recon", "qa", "architecture", "docs"],
+				configRevision: readConfigRevision(configPath),
 			});
 			assert.match(result.content[0].text, /Reload required/);
 			assert.ok(
@@ -6265,71 +9117,207 @@ describe("commands", () => {
 		}
 	});
 
-	it("registers direct BTW commands without steering the parent", async () => {
-		const { api, registeredCommands, sentUserMessages } =
-			createMockExtensionApi();
+	it("exposes an optional exact-byte expectedConfigRevision in the public writer schema", () => {
+		const { api, registeredTools } = createMockExtensionApi();
 		subagentsModule.default(api);
-
-		const btw = registeredCommands.find((command) => command.name === "btw");
-		const close = registeredCommands.find(
-			(command) => command.name === "btw-close",
+		const writer = registeredTools.find(
+			(tool) => tool.name === "subagents_write_task_models",
+		)!;
+		assert.equal(
+			writer.parameters.required.includes("expectedConfigRevision"),
+			false,
 		);
-		assert.ok(btw, "expected /btw to be registered");
-		assert.ok(close, "expected /btw-close to be registered");
-
-		const notifications: Array<{ message: string; level: string }> = [];
-		const ctx = {
-			ui: {
-				notify: (message: string, level: string) =>
-					notifications.push({ message, level }),
-			},
+		assert.match(writer.description, /expectedConfigRevision/);
+		assert.match(writer.description, /configRevision/);
+		const base = {
+			tasks: { coding: ["fake/worker"] },
+			tasksMeta: { generatedAt: "2026-10-05T00:00:00Z", method: "research" },
 		};
-		await btw.handler("  ", ctx);
-		await close.handler("", ctx);
-
-		assert.deepEqual(notifications, [
-			{ message: "Usage: /btw <question>", level: "warning" },
-			{ message: "No BTW session is open.", level: "info" },
-		]);
-		assert.equal(sentUserMessages.length, 0);
+		const hex = "0123456789abcdef".repeat(4);
+		assert.equal(Value.Check(writer.parameters, base), true);
+		for (const revision of ["missing", `sha256:${hex}`])
+			assert.equal(
+				Value.Check(writer.parameters, {
+					...base,
+					expectedConfigRevision: revision,
+				}),
+				true,
+			);
+		for (const revision of [
+			"",
+			null,
+			"MISSING",
+			`sha256:${hex.toUpperCase()}`,
+			`sha256:${hex.slice(1)}`,
+			`sha256:${hex}0`,
+			hex,
+		])
+			assert.equal(
+				Value.Check(writer.parameters, {
+					...base,
+					expectedConfigRevision: revision,
+				}),
+				false,
+				String(revision),
+			);
 	});
 
-	it("builds a standalone BTW command without worker control machinery", () => {
-		const command = subagentsModule.__test__.buildBtwLaunchCommand({
-			cwd: "/tmp/project path",
-			sessionFile: "/tmp/btw.jsonl",
-			question: "What does that API do?",
-			model: "openai-codex/gpt-5.6-sol",
-			thinking: "high",
-			agentDir: "/tmp/pi-agent",
+	it("refuses a conditional tool write after a later change to the approved config snapshot", async () => {
+		const dir = createTestDir();
+		const previous = process.env.PI_CODING_AGENT_DIR;
+		process.env.PI_CODING_AGENT_DIR = dir;
+		try {
+			const { api, registeredTools } = createMockExtensionApi();
+			subagentsModule.default(api);
+			const configPath = getSubagentsConfigPath();
+			mkdirSync(dirname(configPath), { recursive: true });
+			writeFileSync(
+				configPath,
+				JSON.stringify({
+					unrelated: { keep: 1 },
+					models: { tasks: { coding: ["fake/worker"] } },
+				}),
+			);
+			const writer = registeredTools.find(
+				(tool) => tool.name === "subagents_write_task_models",
+			)!;
+			const model = { provider: "fake", id: "worker", reasoning: false };
+			const ctx = {
+				modelRegistry: {
+					find: (provider: string, id: string) =>
+						provider === "fake" && id === "worker" ? model : undefined,
+					getAvailable: () => [model],
+					hasConfiguredAuth: () => true,
+				},
+			};
+			const tasksMeta = {
+				generatedAt: "2026-10-05T00:00:00Z",
+				method: "registry-only",
+			};
+			// Approval binds this exact snapshot; a later hook then adds qa.
+			const approvedRevision = readConfigRevision(configPath);
+			await writer.execute(
+				"later-hook",
+				{ tasks: { coding: ["fake/worker"], qa: ["fake/worker"] }, tasksMeta },
+				undefined,
+				undefined,
+				ctx,
+			);
+			const afterHook = readFileSync(configPath, "utf8");
+			await assert.rejects(
+				writer.execute(
+					"approved-write",
+					{
+						tasks: { coding: ["fake/worker"] },
+						tasksMeta,
+						expectedConfigRevision: approvedRevision,
+					},
+					undefined,
+					undefined,
+					ctx,
+				),
+				/Stale task model config revision.*not replaced/,
+			);
+			assert.equal(readFileSync(configPath, "utf8"), afterHook);
+			assert.deepEqual(loadModelConfig(dirname(configPath)).tasks, {
+				coding: ["fake/worker"],
+				qa: ["fake/worker"],
+			});
+			for (const invalid of [null, ""])
+				await assert.rejects(
+					writer.execute(
+						"invalid-write",
+						{
+							tasks: { coding: ["fake/worker"] },
+							tasksMeta,
+							expectedConfigRevision: invalid,
+						},
+						undefined,
+						undefined,
+						ctx,
+					),
+					/Invalid expectedConfigRevision/,
+				);
+			assert.equal(readFileSync(configPath, "utf8"), afterHook);
+			const fresh = await writer.execute(
+				"fresh-write",
+				{
+					tasks: {
+						coding: ["fake/worker"],
+						qa: ["fake/worker"],
+						docs: ["fake/worker"],
+					},
+					tasksMeta,
+					expectedConfigRevision: readConfigRevision(configPath),
+				},
+				undefined,
+				undefined,
+				ctx,
+			);
+			assert.equal(
+				fresh.details.configRevision,
+				readConfigRevision(configPath),
+			);
+			assert.ok(
+				fresh.content[0].text.includes(
+					`"configRevision": "${fresh.details.configRevision}"`,
+				),
+			);
+			assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")).unrelated, {
+				keep: 1,
+			});
+		} finally {
+			restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("registers only generic commands and no retired workflow commands", () => {
+		const previousId = process.env.PI_SUBAGENT_ID;
+		try {
+			for (const [childId, expected] of [
+				[undefined, ["subagent", "subagents-init", "worktree"]],
+				["command-inventory-child", ["subagent", "worktree"]],
+			] as const) {
+				restoreEnvVar("PI_SUBAGENT_ID", childId);
+				const { api, registeredCommands, sentUserMessages } =
+					createMockExtensionApi();
+				subagentsModule.default(api);
+				const names = registeredCommands.map((command) => command.name);
+				assert.deepEqual([...names].sort(), expected);
+				for (const retired of ["plan", "iterate", "btw", "btw-close"])
+					assert.equal(names.includes(retired), false, `/${retired}`);
+				assert.equal(sentUserMessages.length, 0);
+			}
+		} finally {
+			restoreEnvVar("PI_SUBAGENT_ID", previousId);
+		}
+	});
+
+	it("keeps direct interactive full-context forks available without /iterate", () => {
+		const testApi = subagentsModule.__test__;
+		const params = {
+			name: "Fork",
+			task: "Fix the bug",
+			fork: true,
+			interactive: true,
+		};
+		assert.deepEqual(testApi.resolveLaunchBehavior(params, null), {
+			sessionMode: "fork",
+			seededSessionMode: "fork",
+			inheritsConversationContext: true,
+			taskDelivery: "direct",
 		});
-
-		assert.match(command, /--session/);
-		assert.match(command, /--no-extensions/);
-		assert.match(command, /openai-codex\/gpt-5\.6-sol/);
-		assert.match(command, /BTW question:/);
-		assert.match(command, /What does that API do\?/);
-		assert.match(command, /PI_CODING_AGENT_DIR=/);
-		assert.doesNotMatch(command, /subagent-done|PI_SUBAGENT_|subagent_result/);
-	});
-
-	it("/iterate always emits a full-context fork tool call", () => {
-		const { api, registeredCommands, sentUserMessages } =
-			createMockExtensionApi();
-
-		subagentsModule.default(api);
-
-		const iterate = registeredCommands.find(
-			(command) => command.name === "iterate",
+		assert.equal(testApi.resolveEffectiveAutoExit(params, null), false);
+		assert.equal(testApi.resolveEffectiveInteractive(params, null), true);
+		assert.equal(
+			testApi.resolveEffectiveAutoExit(
+				{ ...params, interactive: undefined },
+				null,
+			),
+			true,
+			"bare forks without interactive remain autonomous",
 		);
-		assert.ok(iterate, "expected /iterate to be registered");
-
-		iterate.handler("Fix the bug", {});
-
-		assert.equal(sentUserMessages.length, 1);
-		assert.match(sentUserMessages[0], /fork: true/);
-		assert.match(sentUserMessages[0], /interactive: true/);
-		assert.match(sentUserMessages[0], /name: "Iterate"/);
 	});
 });
 
@@ -6595,7 +9583,20 @@ describe("worktree cleanup public surface", () => {
 				notices.at(-1),
 				"Worktree launch failed: fixture handoff creation stopped",
 			);
-			assert.equal(effects.length, 6);
+			// The extra Herdr call is the pre-create snapshot of the source primary workspace.
+			assert.equal(effects.length, 7);
+			assert.deepEqual(effects.at(-2), [
+				"herdr",
+				"worktree",
+				"list",
+				"--cwd",
+				"/repo",
+			]);
+			assert.deepEqual(effects.at(-1)?.slice(0, 3), [
+				"herdr",
+				"worktree",
+				"create",
+			]);
 			const manifestDir = join(dir, "artifacts", "child", "worktree-runs");
 			const manifests = readdirSync(manifestDir);
 			assert.equal(manifests.length, 1);
@@ -6724,7 +9725,7 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification must not use this fallback.",
 		];
 		for (const [label, taskPreferences] of [
 			["shortlist", { coding: ["fake/worker"] }],
@@ -6768,7 +9769,7 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification must not use this fallback.",
 		])
 			assert.ok(
 				guidelines.includes(clause),
@@ -6891,7 +9892,7 @@ describe("tool registration", () => {
 			"For ordinary review, prefer a different authenticated model family.",
 			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
 			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
+			"Cross-family verification must not use this fallback.",
 		])
 			assert.ok(
 				modelDesc.includes(clause),
@@ -6901,204 +9902,6 @@ describe("tool registration", () => {
 			modelDesc,
 			/when unavailable/i,
 			"model description must use the authenticated-family availability gate",
-		);
-	});
-
-	it("strict surfaces never permit same-family fallback", () => {
-		const orchestrateSkill = readFileSync(
-			join(getSubagentsPackageRoot(), "skills/orchestrate/SKILL.md"),
-			"utf8",
-		);
-		const adversarialProcedure = readFileSync(
-			join(
-				getSubagentsPackageRoot(),
-				"skills/orchestrate/adversarial-review.md",
-			),
-			"utf8",
-		);
-		const adversarialAgent = readFileSync(
-			join(getSubagentsPackageRoot(), "agents/adversarial-reviewer.md"),
-			"utf8",
-		);
-		const forbiddenOrdinaryReviewClauses = [
-			"For ordinary review, prefer a different authenticated model family.",
-			"When no other authenticated model family is available, ordinary review may use a same-family reviewer in a fresh standalone session.",
-			"Disclose that this review is context-isolated, not cross-family independent.",
-			"Cross-family verification, `/skill:orchestrate`, and `adversarial-reviewer` must not use this fallback.",
-		];
-		for (const [label, content] of [
-			["skills/orchestrate/SKILL.md", orchestrateSkill],
-			["skills/orchestrate/adversarial-review.md", adversarialProcedure],
-			["agents/adversarial-reviewer.md", adversarialAgent],
-		] as const) {
-			assert.doesNotMatch(
-				content,
-				/same-family[\s\S]{0,100}fallback/i,
-				`${label} must not contain same-family fallback language`,
-			);
-			assert.doesNotMatch(
-				content,
-				/context-isolated[\s\S]{0,60}review/i,
-				`${label} must not describe context-isolated review`,
-			);
-			assert.match(
-				content,
-				/different.*family/i,
-				`${label} must require different-family review`,
-			);
-			const compact = content.replace(/\s+/g, " ").trim();
-			for (const clause of forbiddenOrdinaryReviewClauses)
-				assert.ok(
-					!compact.includes(clause),
-					`${label} must not contain ordinary-review fallback clause: ${clause}`,
-				);
-		}
-	});
-
-	it("adversarial reviewer agent rejects multiline same-family fallback bypass", () => {
-		const agent = readFileSync(
-			join(getSubagentsPackageRoot(), "agents/adversarial-reviewer.md"),
-			"utf8",
-		);
-		assert.doesNotMatch(
-			agent,
-			/ordinary[\s\S]{0,200}same-family[\s\S]{0,200}fallback/i,
-			"adversarial reviewer must not contain any ordinary same-family fallback path",
-		);
-		assert.doesNotMatch(
-			agent,
-			/[Ww]hen no other.*family[\s\S]{0,200}same-family/,
-			"adversarial reviewer must not contain same-family availability gate",
-		);
-		assert.match(
-			agent,
-			/no model or tool fallback/,
-			"adversarial reviewer must explicitly state no fallback",
-		);
-	});
-
-	it("warns only when the resolved role is bundled", async () => {
-		const testApi = subagentsModule.__test__;
-		const worktree = { branch: "review/unneeded-worktree" };
-
-		await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
-			for (const [agent, expected] of [
-				["scout", /bundled scout role is read-only/i],
-				["reviewer", /bundled reviewer role is read-only/i],
-				[
-					"adversarial-reviewer",
-					/bundled adversarial-reviewer coordinates read-only reviewers/i,
-				],
-			] as const) {
-				assert.match(
-					testApi.resolveWorktreeLaunchWarning({ agent, worktree }) ?? "",
-					expected,
-				);
-			}
-
-			writeAgentFile(
-				projectAgentsDir,
-				"reviewer",
-				"description: Project-specific reviewer\ntools: read, bash",
-			);
-			assert.equal(
-				testApi.resolveWorktreeLaunchWarning({
-					agent: "reviewer",
-					worktree,
-				}),
-				undefined,
-			);
-		});
-
-		await withIsolatedAgentEnv(
-			async ({ projectDir, projectAgentsDir, globalAgentsDir }) => {
-				const namedRolesDir = join(projectDir, "named-pack", "roles");
-				const namelessRolesDir = join(projectDir, "nameless-pack", "roles");
-				mkdirSync(namedRolesDir, { recursive: true });
-				mkdirSync(namelessRolesDir, { recursive: true });
-				writeFileSync(
-					join(namedRolesDir, "..", "package.json"),
-					JSON.stringify({ name: "@acme/writing-roles" }),
-				);
-				writeAgentFile(
-					namedRolesDir,
-					"scout",
-					"description: Writing scout\ntools: write",
-				);
-				writeAgentFile(
-					namelessRolesDir,
-					"reviewer",
-					"description: Writing reviewer\ntools: write",
-				);
-				writeAgentFile(
-					namelessRolesDir,
-					"adversarial-reviewer",
-					"description: Writing adversarial reviewer\ntools: write",
-				);
-
-				const { api } = createMockExtensionApi();
-				api.events.on(
-					"pi-herdr-subagents:roles:discover:v1",
-					(request: { register(path: string): void }) => {
-						request.register(namedRolesDir);
-						request.register(namelessRolesDir);
-					},
-				);
-				const disabled = { bundled: false };
-				for (const agent of ["scout", "reviewer", "adversarial-reviewer"]) {
-					assert.equal(
-						testApi.resolveWorktreeLaunchWarning(
-							{ agent, worktree },
-							api,
-							disabled,
-						),
-						undefined,
-					);
-				}
-
-				writeAgentFile(
-					globalAgentsDir,
-					"scout",
-					"description: Global writing scout\ntools: write",
-				);
-				writeAgentFile(
-					projectAgentsDir,
-					"reviewer",
-					"description: Project writing reviewer\ntools: write",
-				);
-				assert.equal(
-					testApi.resolveWorktreeLaunchWarning(
-						{ agent: "scout", worktree },
-						api,
-						disabled,
-					),
-					undefined,
-				);
-				assert.equal(
-					testApi.resolveWorktreeLaunchWarning(
-						{ agent: "reviewer", worktree },
-						api,
-						disabled,
-					),
-					undefined,
-				);
-				assert.equal(
-					testApi.resolveWorktreeLaunchWarning(
-						{ agent: "unknown", worktree },
-						api,
-						disabled,
-					),
-					undefined,
-				);
-				assert.equal(
-					testApi.resolveWorktreeLaunchWarning(
-						{ agent: "scout" },
-						api,
-						disabled,
-					),
-					undefined,
-				);
-			},
 		);
 	});
 
@@ -7210,6 +10013,132 @@ describe("subagent parent lifecycle", () => {
 	});
 });
 
+describe("Task15 unowned host activity", () => {
+	it("refreshes without a session/context, hydrates legacy rows and retains successful activity", () => {
+		// SAFETY: this fixture saves/restores the extension-owned runtime slot to exercise pre-initialization.
+		const root = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+		const previous = { session: root.session, latestCtx: root.latestCtx };
+		root.session = undefined;
+		root.latestCtx = undefined;
+		try {
+			withTempDir((dir) => {
+				const file = join(dir, "activity.json");
+				const recorder = createSubagentActivityRecorder({
+					runningChildId: "unowned",
+					activityFile: file,
+					now: () => 100,
+				});
+				recorder.sessionStart();
+				recorder.toolExecutionStart("tool", "bash");
+				// SAFETY: a seeded legacy presentation row intentionally has no lifecycle before ensureLifecycle.
+				const row: any = {
+					id: "unowned",
+					name: "legacy",
+					task: "",
+					surface: "none",
+					startTime: 1,
+					sessionFile: "must-not-read",
+					interactive: false,
+					runtimePlan: undefined,
+					activityFile: file,
+				};
+				hostModule.__test__.observeRunningSubagent(row, 200);
+				assert.equal(projectLifecycle(row.lifecycle, 200).kind, "active");
+				assert.equal(row.lifecycle.activityDetail.label, "bash");
+				assert.deepEqual(row.activityRead, { ok: true });
+				const successful = row.activity;
+				writeFileSync(file, "{");
+				hostModule.__test__.observeRunningSubagent(row, 300);
+				assert.equal(row.activity, successful);
+				assert.equal(row.activityRead.reason, "invalid");
+				assert.ok(row.activityRead.error);
+				row.activityFile = join(dir, "missing");
+				hostModule.__test__.observeRunningSubagent(row, 400);
+				assert.equal(row.activity, successful);
+				assert.deepEqual(row.activityRead, {
+					ok: false,
+					reason: "missing",
+					error: undefined,
+				});
+				assert.ok(Object.hasOwn(row.activityRead, "error"));
+				for (const [statusState, kind] of [
+					[
+						{
+							phase: "active",
+							activeScope: "tool",
+							activityLabel: "read",
+							lastActivityAtMs: 50,
+							lastActivitySequence: 7,
+						},
+						"active",
+					],
+					[{ phase: "done", lastActivityAtMs: 50 }, "waiting"],
+					[
+						{
+							phase: "active",
+							activityLabel: "interrupted",
+							localOverrideAtMs: 50,
+						},
+						"interrupted",
+					],
+				] as const) {
+					delete row.lifecycle;
+					row.statusState = statusState;
+					hostModule.__test__.observeRunningSubagent(row, 500);
+					assert.equal(projectLifecycle(row.lifecycle, 500).kind, kind);
+				}
+			});
+		} finally {
+			Object.assign(root, previous);
+		}
+	});
+
+	it("does not acquire unowned or retired rows in a real initialized session", () =>
+		withAdapterHost(async (f) => {
+			const file = join(f.projectDir, "unowned.json");
+			const recorder = createSubagentActivityRecorder({
+				runningChildId: "unowned",
+				activityFile: file,
+				now: () => 100,
+			});
+			recorder.sessionStart();
+			recorder.toolExecutionStart("tool", "bash");
+			const row = {
+				id: "unowned",
+				name: "unowned",
+				task: "",
+				surface: "none",
+				startTime: 1,
+				sessionFile: "must-not-read",
+				interactive: false,
+				runtimePlan: undefined,
+				lifecycle: createLifecycle(1),
+				activityFile: file,
+			};
+			const commands = f.commands.length;
+			const registrations = f.registrations();
+			hostModule.__test__.observeRunningSubagent(row, 200);
+			assert.equal(projectLifecycle(row.lifecycle, 200).kind, "active");
+			assert.equal(f.runtime.session.getControlTaskId(row.id), undefined);
+			assert.equal(f.runtime.session.getTask(row.id), undefined);
+			assert.equal(f.runtime.session.getHandle(row.id), undefined);
+			assert.equal(f.commands.length, commands);
+			assert.equal(f.registrations(), registrations);
+			const child = await f.launch({ name: "retired", task: "bounded" });
+			const control = f.runtime.session.getControlTaskId(child.id);
+			await f.finish(child);
+			assert.equal(f.runtime.session.getControlTaskId(child.id), undefined);
+			assert.equal(f.runtime.session.getRecord(control), undefined);
+			const afterCommands = f.commands.length;
+			const afterRegistrations = f.registrations();
+			hostModule.__test__.observeRunningSubagent(child, 500);
+			assert.equal(f.runtime.session.getControlTaskId(child.id), undefined);
+			assert.equal(f.runtime.session.getRecord(control), undefined);
+			assert.equal(f.commands.length, afterCommands);
+			assert.equal(f.registrations(), afterRegistrations);
+		}));
+});
+
 describe("subagent activity snapshots", () => {
 	function validActivity(overrides: any = {}) {
 		return {
@@ -7227,6 +10156,115 @@ describe("subagent activity snapshots", () => {
 			...overrides,
 		};
 	}
+
+	it("Task15 projects validated activity by reference, not as a parser", () => {
+		assert.deepEqual(projectActivity(undefined), {
+			ok: false,
+			reason: "missing",
+		});
+		const state = validActivity();
+		const read = projectActivity(state);
+		assert.ok(read.ok);
+		assert.equal(read.activity, state);
+	});
+
+	it("Task15 preserves exact file validation order and real read errors", () => {
+		withTempDir((dir) => {
+			const file = join(dir, "activity.json");
+			assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+				ok: false,
+				reason: "missing",
+			});
+			for (const [value, error] of [
+				[42, "activity must be an object"],
+				[
+					{ version: 2, runningChildId: "other" },
+					"unsupported activity version",
+				],
+				[
+					validActivity({ runningChildId: 42 }),
+					"runningChildId must be a string",
+				],
+				[
+					validActivity({ latestEvent: "invalid", phase: "invalid" }),
+					"unknown latestEvent",
+				],
+				[
+					validActivity({ phase: "invalid", activeScope: "invalid" }),
+					"unknown activity phase",
+				],
+				[
+					validActivity({ activeScope: "invalid", createdAt: "invalid" }),
+					"unknown activeScope",
+				],
+				[
+					validActivity({ createdAt: "invalid", updatedAt: "invalid" }),
+					"createdAt must be finite",
+				],
+				[
+					validActivity({ toolName: "bad\nname" }),
+					"toolName must not contain newlines",
+				],
+			] as const) {
+				writeFileSync(file, JSON.stringify(value));
+				assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+					ok: false,
+					reason: "invalid",
+					error,
+				});
+			}
+			writeFileSync(
+				file,
+				JSON.stringify(
+					validActivity({ runningChildId: "other", latestEvent: "invalid" }),
+				),
+			);
+			assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+				ok: false,
+				reason: "wrong-id",
+			});
+			const nullable = validActivity({
+				activeScope: null,
+				activeSince: null,
+				waitingSince: null,
+				turnIndex: null,
+				toolName: null,
+				toolCallId: null,
+				messageEventType: null,
+				toolStartedAt: null,
+				toolEndedAt: null,
+			});
+			writeFileSync(file, JSON.stringify(nullable));
+			assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+				ok: true,
+				activity: nullable,
+			});
+			writeFileSync(file, "{");
+			let parseError = "";
+			try {
+				JSON.parse("{");
+			} catch (error) {
+				parseError = error instanceof Error ? error.message : String(error);
+			}
+			assert.deepEqual(readSubagentActivityFile(file, "child-1"), {
+				ok: false,
+				reason: "invalid",
+				error: parseError,
+			});
+			let directoryError = "";
+			try {
+				readFileSync(dir, "utf8");
+			} catch (error) {
+				directoryError = error instanceof Error ? error.message : String(error);
+			}
+			assert.ok(directoryError);
+			assert.deepEqual(readSubagentActivityFile(dir, "child-1"), {
+				ok: false,
+				reason: "invalid",
+				error: directoryError,
+			});
+		});
+	});
 
 	it("writes and validates activity files by running child id", () => {
 		withTempDir((dir) => {
@@ -7383,6 +10421,274 @@ describe("subagent activity snapshots", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+});
+
+describe("Task13 demand-driven persistent I/O", () => {
+	function drain(
+		record: PiRunRecord,
+		api: Parameters<typeof hostModule.__test__.drainPersistentTaskEvents>[1],
+		io: PiPersistentIO,
+	) {
+		// SAFETY: index.ts owns this process-local extension slot; fixture swaps only its delivery binding.
+		const root = (globalThis as any)[Symbol.for("pi-subagents/runtime")];
+		const previous = root.pi;
+		root.pi = api;
+		try {
+			hostModule.__test__.drainPersistentTaskEvents(record, api, io);
+		} finally {
+			root.pi = previous;
+		}
+	}
+	for (const kind of [
+		"quiet",
+		"irrelevant",
+		"behind-cursor",
+		"ledger-duplicate",
+		"help",
+		"done",
+	] as const)
+		it(`${kind} uses only the required raw/ledger/transcript reads and no Git capture`, () =>
+			withTempDir((dir) => {
+				const record: PiRunRecord = {
+					id: "io-count",
+					name: "io-count",
+					task: "first",
+					surface: "pane",
+					startTime: 0,
+					sessionFile: join(dir, "session.jsonl"),
+					launchScriptFile: "",
+					activityFile: "",
+					interactive: false,
+					runtimePlan: undefined,
+					lifecycle: createLifecycle(0),
+					persistent: true,
+					logicalId: "logical",
+					generationId: "generation",
+					policyHash: "a".repeat(64),
+					tasksCompleted: 0,
+					taskId: "task",
+					worktree: {
+						path: dir,
+						branch: "fixture",
+						baseRef: "HEAD",
+						baseSha: "not-inspected",
+						manifestFile: join(dir, "manifest"),
+						workspaceId: "fixture-workspace",
+						paneId: "pane",
+					},
+				};
+				writeFileSync(
+					record.sessionFile,
+					JSON.stringify({
+						type: "message",
+						message: {
+							role: "assistant",
+							content: [{ type: "text", text: "last nonempty" }],
+						},
+					}) + "\n",
+				);
+				if (kind !== "quiet")
+					appendPersistentTaskEvent(record.sessionFile, {
+						type: kind === "help" ? "help-request" : "task-done",
+						task: "task",
+						generation: kind === "irrelevant" ? "other" : "generation",
+					});
+				if (kind === "behind-cursor") record.observedTaskEvents = 1;
+				if (kind === "ledger-duplicate")
+					appendPersistentDeliveryLedger(record.sessionFile, {
+						task: "task",
+						outcome: "delivered",
+						generation: "generation",
+						logicalId: "logical",
+						policyHash: record.policyHash!,
+					});
+				const counts = [0, 0, 0, 0];
+				let sends = 0;
+				const io: PiPersistentIO = {
+					...testIO,
+					readEvents: (r) => {
+						counts[0]++;
+						return testIO.readEvents(r);
+					},
+					readLedger: (r) => {
+						counts[1]++;
+						return testIO.readLedger(r);
+					},
+					readTaskSummary: (r) => {
+						counts[2]++;
+						return testIO.readTaskSummary(r);
+					},
+				};
+				const exec = childProcess.execFileSync;
+				// Preserve every overloaded call unchanged; count only during this drain.
+				Reflect.set(
+					childProcess,
+					"execFileSync",
+					(...args: Parameters<typeof exec>) => {
+						counts[3]++;
+						return exec(...args);
+					},
+				);
+				syncBuiltinESMExports();
+				try {
+					drain(
+						record,
+						{
+							sendMessage() {
+								sends++;
+							},
+						},
+						io,
+					);
+				} finally {
+					childProcess.execFileSync = exec;
+					syncBuiltinESMExports();
+				}
+				assert.deepEqual(counts, [
+					1,
+					["ledger-duplicate", "help", "done"].includes(kind) ? 1 : 0,
+					kind === "done" ? 1 : 0,
+					0,
+				]);
+				assert.equal(sends, kind === "help" || kind === "done" ? 1 : 0);
+				assert.equal(
+					record.taskId,
+					kind === "help" || kind === "done" ? undefined : "task",
+				);
+			}));
+	it("in-flight wakes skip lazy ledger and transcript reads", () =>
+		withTempDir((dir) => {
+			const record: PiRunRecord = {
+				id: "inflight",
+				name: "inflight",
+				task: "first",
+				surface: "pane",
+				startTime: 0,
+				sessionFile: join(dir, "session.jsonl"),
+				launchScriptFile: "",
+				activityFile: "",
+				interactive: false,
+				runtimePlan: undefined,
+				lifecycle: createLifecycle(0),
+				persistent: true,
+				logicalId: "logical",
+				generationId: "generation",
+				policyHash: "a".repeat(64),
+				tasksCompleted: 0,
+				taskId: "task",
+			};
+			appendPersistentTaskEvent(record.sessionFile, {
+				type: "task-done",
+				task: "task",
+				generation: "generation",
+			});
+			const counts = [0, 0, 0];
+			const io = {
+				...testIO,
+				readEvents: (r: PiRunRecord) => {
+					counts[0]++;
+					return testIO.readEvents(r);
+				},
+				readLedger: (r: PiRunRecord) => {
+					counts[1]++;
+					return testIO.readLedger(r);
+				},
+				readTaskSummary: (r: PiRunRecord) => {
+					counts[2]++;
+					return testIO.readTaskSummary(r);
+				},
+			};
+			drain(
+				record,
+				{
+					sendMessage() {
+						counts.fill(0);
+						hostModule.__test__.drainPersistentTaskEvents(
+							record,
+							{
+								sendMessage() {
+									assert.fail("duplicate in-flight send");
+								},
+							},
+							io,
+						);
+						assert.deepEqual(counts, [1, 0, 0]);
+					},
+				},
+				testIO,
+			);
+		}));
+	for (const fail of ["send", "append"] as const)
+		it(`multi-event ${fail} failure preserves earlier acknowledgements and retries only the failing event`, () =>
+			withTempDir((dir) => {
+				const record: PiRunRecord = {
+					id: "multi",
+					name: "multi",
+					task: "first",
+					surface: "pane",
+					startTime: 0,
+					sessionFile: join(dir, "session.jsonl"),
+					launchScriptFile: "",
+					activityFile: "",
+					interactive: false,
+					runtimePlan: undefined,
+					lifecycle: createLifecycle(0),
+					persistent: true,
+					logicalId: "logical",
+					generationId: "generation",
+					policyHash: "a".repeat(64),
+					tasksCompleted: 0,
+					taskId: "second",
+				};
+				appendPersistentTaskEvent(record.sessionFile, {
+					type: "task-done",
+					task: "first",
+					generation: "generation",
+				});
+				appendPersistentTaskEvent(record.sessionFile, {
+					type: "task-done",
+					task: "second",
+					generation: "generation",
+				});
+				let allow = false,
+					sends = 0,
+					reads = 0;
+				const io: PiPersistentIO = {
+					...testIO,
+					readLedger: (r) => {
+						reads++;
+						return testIO.readLedger(r);
+					},
+					acknowledge(r, event) {
+						if (event.task === "second" && !allow && fail === "append")
+							throw new Error("append failure");
+						return testIO.acknowledge(r, event);
+					},
+				};
+				const api = {
+					sendMessage() {
+						sends++;
+						if (sends === 2 && !allow && fail === "send")
+							throw new Error("send failure");
+					},
+				};
+				assert.throws(
+					() => drain(record, api, io),
+					new RegExp(`${fail} failure`),
+				);
+				assert.equal(record.observedTaskEvents, undefined);
+				assert.equal(record.taskId, "second");
+				assert.equal(record.tasksCompleted, 1);
+				assert.equal(testIO.readLedger(record).length, 1);
+				allow = true;
+				drain(record, api, io);
+				assert.equal(reads, 2);
+				assert.equal(sends, 3);
+				assert.equal(record.observedTaskEvents, 2);
+				assert.equal(record.taskId, undefined);
+				assert.equal(record.tasksCompleted, 2);
+				assert.equal(testIO.readLedger(record).length, 2);
+			}));
 });
 
 describe("persistent delivery batch ledger", () => {
@@ -8341,6 +11647,7 @@ describe("subagent interruption", () => {
 			startTime: 0,
 			sessionFile: "worker.jsonl",
 			interactive: false,
+			runtimePlan: undefined,
 			lifecycle: createLifecycle(0),
 			...overrides,
 		};
@@ -8401,7 +11708,7 @@ describe("subagent interruption", () => {
 		}
 	});
 
-	it("returns an explicit error when Escape delivery fails", () => {
+	it("returns an explicit error when Escape delivery fails", async () => {
 		const testApi = subagentsModule.__test__;
 		let aborted = false;
 		const running = makeRunning({
@@ -8412,7 +11719,7 @@ describe("subagent interruption", () => {
 			},
 		});
 
-		const result = testApi.requestSubagentInterrupt(running, () => {
+		const result = await testApi.requestSubagentInterrupt(running, () => {
 			throw new Error("mux write failed");
 		});
 
@@ -8421,7 +11728,7 @@ describe("subagent interruption", () => {
 		assert.equal("interruptRequested" in running, false);
 	});
 
-	it("leaves status unchanged when Escape delivery fails in the tool path", () => {
+	it("leaves status unchanged when Escape delivery fails in the tool path", async () => {
 		const testApi = subagentsModule.__test__;
 		const runningMap = testApi.runningSubagents;
 		runningMap.clear();
@@ -8453,7 +11760,7 @@ describe("subagent interruption", () => {
 		try {
 			runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-			const result = withMockedNow(20_000, () =>
+			const result = await withMockedNowAsync(20_000, () =>
 				testApi.handleSubagentInterrupt({ name: "Worker" }, () => {
 					throw new Error("mux write failed");
 				}),
@@ -8469,7 +11776,23 @@ describe("subagent interruption", () => {
 		}
 	});
 
-	it("sends Escape without aborting or mutating running state", () => {
+	it("returns an explicit error when async Escape delivery rejects", async () => {
+		const testApi = subagentsModule.__test__;
+		const abortController = new AbortController();
+		const running = { ...makeRunning(), abortController };
+
+		const result = await testApi.requestSubagentInterrupt(running, async () => {
+			throw new Error("async mux write failed");
+		});
+
+		assert.ok("error" in result);
+		assert.match(result.error, /Failed to send Escape/);
+		assert.match(result.error, /async mux write failed/);
+		assert.equal(abortController.signal.aborted, false);
+		assert.equal("interruptRequested" in running, false);
+	});
+
+	it("sends Escape without aborting or mutating running state", async () => {
 		const testApi = subagentsModule.__test__;
 		let aborted = false;
 		let sentSurface = "";
@@ -8481,9 +11804,10 @@ describe("subagent interruption", () => {
 			},
 		});
 
-		const result = testApi.requestSubagentInterrupt(
+		const result = await testApi.requestSubagentInterrupt(
 			running,
-			(surface: string) => {
+			async (surface: string) => {
+				await Promise.resolve();
 				sentSurface = surface;
 			},
 		);
@@ -8494,13 +11818,14 @@ describe("subagent interruption", () => {
 		assert.equal("interruptRequested" in running, false);
 	});
 
-	it("refreshes the latest activity snapshot before forcing local interrupt waiting", () => {
+	it("refreshes the latest activity snapshot before forcing local interrupt waiting", async () => {
 		const testApi = subagentsModule.__test__;
 		const runningMap = testApi.runningSubagents;
 		let sentSurface = "";
 		runningMap.clear();
 
-		withTempDir((dir) => {
+		const dir = createTestDir();
+		try {
 			mkdirSync(join(dir, "subagent-activity"), { recursive: true });
 			const activityFile = getSubagentActivityFile(dir, "a1");
 			const activity = {
@@ -8521,32 +11846,31 @@ describe("subagent interruption", () => {
 			};
 			writeFileSync(activityFile, `${JSON.stringify(activity)}\n`);
 
-			try {
-				runningMap.set("a1", makeRunning({ activityFile }));
+			runningMap.set("a1", makeRunning({ activityFile }));
 
-				withMockedNow(20_000, () =>
-					testApi.handleSubagentInterrupt(
-						{ name: "Worker" },
-						(surface: string) => {
-							sentSurface = surface;
-						},
-					),
-				);
+			await withMockedNowAsync(20_000, () =>
+				testApi.handleSubagentInterrupt(
+					{ name: "Worker" },
+					(surface: string) => {
+						sentSurface = surface;
+					},
+				),
+			);
 
-				assert.equal(sentSurface, "pane-1");
-				const lifecycle = runningMap.get("a1").lifecycle;
-				const projection = projectLifecycle(lifecycle, 20_000);
-				assert.equal(projection.kind, "interrupted");
-				assert.equal(lifecycle.turn.kind, "interrupted");
-				assert.equal(lifecycle.lastActivitySequence, 7);
-				assert.equal(lifecycle.turn.previousActivitySequence, 7);
-			} finally {
-				runningMap.clear();
-			}
-		});
+			assert.equal(sentSurface, "pane-1");
+			const lifecycle = runningMap.get("a1").lifecycle;
+			const projection = projectLifecycle(lifecycle, 20_000);
+			assert.equal(projection.kind, "interrupted");
+			assert.equal(lifecycle.turn.kind, "interrupted");
+			assert.equal(lifecycle.lastActivitySequence, 7);
+			assert.equal(lifecycle.turn.previousActivitySequence, 7);
+		} finally {
+			runningMap.clear();
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
-	it("acknowledges Pi-backed interrupt requests and forces local status waiting", () => {
+	it("acknowledges Pi-backed interrupt requests and forces local status waiting", async () => {
 		const testApi = subagentsModule.__test__;
 		const runningMap = testApi.runningSubagents;
 		let sentSurface = "";
@@ -8579,7 +11903,7 @@ describe("subagent interruption", () => {
 		try {
 			runningMap.set("a1", makeRunning({ lifecycle: activeLifecycle }));
 
-			const result = withMockedNow(20_000, () =>
+			const result = await withMockedNowAsync(20_000, () =>
 				testApi.handleSubagentInterrupt(
 					{ name: "Worker" },
 					(surface: string) => {
@@ -8609,7 +11933,7 @@ describe("subagent interruption", () => {
 		}
 	});
 
-	it("sends Escape again for repeated interrupt requests", () => {
+	it("sends Escape again for repeated interrupt requests", async () => {
 		const testApi = subagentsModule.__test__;
 		const runningMap = testApi.runningSubagents;
 		const surfaces: string[] = [];
@@ -8618,12 +11942,18 @@ describe("subagent interruption", () => {
 		try {
 			runningMap.set("a1", makeRunning());
 
-			testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-				surfaces.push(surface);
-			});
-			testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-				surfaces.push(surface);
-			});
+			await testApi.handleSubagentInterrupt(
+				{ name: "Worker" },
+				(surface: string) => {
+					surfaces.push(surface);
+				},
+			);
+			await testApi.handleSubagentInterrupt(
+				{ name: "Worker" },
+				(surface: string) => {
+					surfaces.push(surface);
+				},
+			);
 
 			assert.deepEqual(surfaces, ["pane-1", "pane-1"]);
 			assert.equal(runningMap.has("a1"), true);
@@ -8902,7 +12232,7 @@ describe("subagent interruption", () => {
 			writeFileSync(join(dir, "tracked.txt"), "dirty\n");
 			writeFileSync(join(dir, "untracked.txt"), "new\n");
 
-			const handoff = subagentsModule.__test__.captureWorktreeHandoff({
+			const handoff = captureWorktreeHandoff({
 				path: dir,
 				workspaceId: "w9",
 				paneId: "w9:p1",
@@ -8938,7 +12268,7 @@ describe("subagent interruption", () => {
 				manifestFile: join(dir, "manifest.json"),
 			};
 			const testApi = subagentsModule.__test__;
-			const handoff = testApi.captureWorktreeHandoff(worktree);
+			const handoff = captureWorktreeHandoff(worktree);
 
 			assert.equal(handoff.headSha, null);
 			assert.equal(handoff.commitsAhead, null);
@@ -8965,10 +12295,16 @@ describe("subagent interruption", () => {
 		});
 	});
 
-	it("marks launch failures as failed while retaining explicit ownership", () => {
-		withTempDir((dir) => {
-			const testApi = subagentsModule.__test__;
-			const manifestFile = join(dir, "worktree-run.json");
+	it("marks launch failures as failed while retaining explicit ownership", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "worktree-launch-failure-"));
+		try {
+			const manifestFile = join(
+				dir,
+				"artifacts",
+				"parent",
+				"worktree-runs",
+				"run-1.json",
+			);
 			const worktree = {
 				path: join(dir, "retained-worktree"),
 				workspaceId: "w9",
@@ -8978,22 +12314,59 @@ describe("subagent interruption", () => {
 				baseSha: "1111111",
 				manifestFile,
 			};
-			testApi.writeWorktreeManifest(manifestFile, {
+			writeWorktreeManifest(manifestFile, {
 				state: "provisioning",
 				id: "run-1",
 			});
 
-			assert.throws(
-				() =>
-					testApi.runSubagentScript(
-						worktree.paneId,
-						"pi",
-						undefined,
-						worktree,
-						() => {
+			const effects = createWorktreeOperations();
+			effects.resolveGitCommit = () => worktree.baseSha;
+			effects.resolveWorktreeProvisionCwd = (cwd) => cwd;
+			await assert.rejects(
+				launchPiSubagent(
+					{
+						kind: "fresh",
+						id: "run-1",
+						name: "Worker",
+						task: "bounded",
+						worktree: { branch: worktree.branch },
+						parent: {
+							cwd: dir,
+							sessionFile: join(dir, "parent.jsonl"),
+							sessionId: "parent",
+							sessionDir: dir,
+							agentDir: dir,
+						},
+						runtimePlan: {
+							provider: "test",
+							modelId: "one",
+							model: "test/one",
+							thinking: "off",
+							modelSource: "request",
+							thinkingSource: "request",
+						},
+						behavior: {
+							deniedTools: [],
+							autoExit: true,
+							interactive: false,
+							sessionMode: "standalone",
+						},
+					},
+					{
+						worktree: effects,
+						createPane: () => {
+							throw new Error("unexpected ordinary pane");
+						},
+						createWorktree: () => worktree,
+						waitForShellReady: async () => {},
+						runScript: () => {
 							throw new Error("pane rejected command");
 						},
-					),
+						closePane: () => {
+							throw new Error("must retain worktree");
+						},
+					},
+				),
 				/worktree retained.*pane rejected command/i,
 			);
 
@@ -9004,7 +12377,9 @@ describe("subagent interruption", () => {
 			assert.equal(manifest.state, "failed");
 			assert.equal(manifest.path, worktree.path);
 			assert.match(manifest.gitError, /ENOENT|no such file/i);
-		});
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	it("abbreviates large completion presentations while preserving their head, tail, and session path", () => {
@@ -9647,7 +13022,7 @@ describe("herdr.ts", () => {
 				{ mode: 0o755 },
 			);
 			const moduleUrl = new URL(
-				"../pi-extension/subagents/herdr.ts",
+				"../maestro/surfaces/herdr/herdr.ts",
 				import.meta.url,
 			).href;
 			const result = spawnSync(
@@ -10017,31 +13392,6 @@ describe("herdr.ts", () => {
 					pids: [100, 200],
 					foregroundProcesses: [],
 				}),
-				false,
-			);
-		});
-
-		it("matches only the expected Pi session and cwd", () => {
-			const process = {
-				pid: 200,
-				name: "pi",
-				argv: ["pi", "--session", "/tmp/session.jsonl"],
-				cwd: "/tmp/worktree",
-			};
-			assert.equal(
-				__herdrTest__.isExpectedPiProcess(
-					process,
-					"/tmp/session.jsonl",
-					"/tmp/worktree",
-				),
-				true,
-			);
-			assert.equal(
-				__herdrTest__.isExpectedPiProcess(
-					process,
-					"/tmp/other.jsonl",
-					"/tmp/worktree",
-				),
 				false,
 			);
 		});

@@ -4,11 +4,11 @@ import {
 	type ServerResponse,
 } from "node:http";
 import { once } from "node:events";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import {
 	isPlainObject,
 	isString,
-} from "../../pi-extension/subagents/type-guards.ts";
+} from "../../maestro/core/config/type-guards.ts";
 
 interface ChatMessage {
 	role?: string;
@@ -55,6 +55,8 @@ interface ResponsePlan {
 export const TEST_MODEL = "pi-integration/test";
 
 export interface ProviderRequest {
+	/** Arrival time, to order requests against cancel timestamps. */
+	at?: number;
 	model?: string;
 	status: number;
 	tools?: string[];
@@ -78,10 +80,26 @@ export function getProviderRequests(): readonly ProviderRequest[] {
 	return providerRequests;
 }
 
+let providerFailureGate: Promise<void> | undefined;
+
+/** Holds deterministic fallback failures until the returned release runs. */
+export function pauseProviderFailures(): () => void {
+	let release = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	providerFailureGate = gate;
+	return () => {
+		if (providerFailureGate === gate) providerFailureGate = undefined;
+		release();
+	};
+}
+
 export function resetProviderRequests(): void {
 	providerRequests.length = 0;
 	resumeRestrictionStates.clear();
 	persistentSpecialistStates.clear();
+	cancelScenarioStates.clear();
 }
 
 async function readJson(request: IncomingMessage): Promise<ChatRequest> {
@@ -333,18 +351,8 @@ async function waitForIntegrationGate(source: string): Promise<void> {
 		throw new Error(`Integration gate was not opened: ${path}`);
 }
 
-function btwText(source: string): string | undefined {
-	// Prefer the latest BTW question over inherited "Reply with only SECRET_" context.
-	if (/BTW question:\s*Say FIRST/i.test(source)) return "FIRST";
-	if (/BTW question:\s*Read the previous assistant answer/i.test(source)) {
-		const secret = source.match(/SECRET_([a-z0-9_]+)/i)?.[1];
-		return secret ? `BTW_CONFIRMED_SECRET_${secret}` : "BTW_CONFIRMED";
-	}
-	const requestedSecret = source.match(
-		/Reply with only (SECRET_[a-z0-9_]+)/i,
-	)?.[1];
-	if (requestedSecret) return requestedSecret;
-	return undefined;
+function directReplyText(source: string): string | undefined {
+	return source.match(/Reply with only ((?:SECRET|SEED)_[a-z0-9_]+)/i)?.[1];
 }
 
 function resumeRestrictionResponse(request: ChatRequest): ResponsePlan | null {
@@ -469,11 +477,95 @@ function multiWaveCoordinatorResponse(
 	};
 }
 
+// ── Parent script for subagent_cancel scenarios ──
+const cancelScenarioStates = new Map<
+	string,
+	{ cancelSent: boolean; secondSent: boolean }
+>();
+
+async function waitForQaFile(path: string, ms = 110_000): Promise<void> {
+	const deadline = Date.now() + ms;
+	while (!existsSync(path) && Date.now() < deadline) {
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	if (!existsSync(path)) throw new Error(`QA gate was not opened: ${path}`);
+}
+
+/**
+ * Parent prompt carries `INTEGRATION_CANCEL:<id>:<mode>` plus
+ * `CANCEL_<KEY>: <value>` lines. Modes: basic | double | persistent |
+ * worktree | manual. The parent launches one slow child, waits for the test's
+ * gate file (the child is provably running), then calls subagent_cancel.
+ */
+async function cancelScenarioResponse(
+	request: ChatRequest,
+): Promise<ResponsePlan | null> {
+	const names = toolNames(request);
+	const source = requestText(request);
+	const marker = source.match(/INTEGRATION_CANCEL:([A-Za-z0-9_-]+):([a-z]+)/);
+	if (!marker || !names.has("subagent")) return null;
+	const [, id, mode] = marker;
+	const field = (key: string) =>
+		source.match(new RegExp(`CANCEL_${key}:\\s*(\\S+)`))?.[1] ?? "";
+	const name = `Cancel-${id}`;
+	const startFile = field("START_FILE");
+	const sleepSeconds = field("SLEEP");
+	const slow = `echo 'START_${id}' > '${startFile}'; sleep ${sleepSeconds}; echo 'DONE_${id}' > '${startFile}.done'`;
+	const command =
+		mode === "worktree"
+			? `echo 'WT_${id}' > 'ticket-${id}.txt' && git add 'ticket-${id}.txt' && git commit -qm 'Cancel ${id}' && ${slow}`
+			: slow;
+	if (!source.includes(`Sub-agent "${name}" launched and is now running`)) {
+		const args: ToolCallArguments & { model: string } = {
+			name,
+			agent: "test-echo",
+			model: (field("MODELS_OVERRIDE") || field("MODELS")).replaceAll(
+				",",
+				", ",
+			),
+			task: `Use the bash tool to run exactly: ${command}`,
+		};
+		if (mode === "persistent") args.persistent = true;
+		if (mode === "worktree") args.worktree = { branch: field("BRANCH") };
+		return { toolCalls: [{ name: "subagent", arguments: args }] };
+	}
+	if (mode === "manual") return { text: `CANCEL_SCENARIO_WAITING_${id}` };
+	const state = cancelScenarioStates.get(id) ?? {
+		cancelSent: false,
+		secondSent: false,
+	};
+	cancelScenarioStates.set(id, state);
+	const cancel = (args: ToolCallArguments): ToolCall => ({
+		name: "subagent_cancel",
+		arguments: args,
+	});
+	if (!state.cancelSent) {
+		await waitForQaFile(field("GATE_FILE"));
+		state.cancelSent = true;
+		return {
+			toolCalls:
+				mode === "double"
+					? [cancel({ name }), cancel({ name })]
+					: [cancel({ name })],
+		};
+	}
+	if (mode === "double" && !state.secondSent) {
+		state.secondSent = true;
+		await waitForQaFile(field("ID_FILE"));
+		const runId = readFileSync(field("ID_FILE"), "utf8").trim();
+		return { toolCalls: [cancel({ name }), cancel({ id: runId })] };
+	}
+	return { text: `CANCEL_SCENARIO_DONE_${id}` };
+}
+
 async function planResponse(request: ChatRequest): Promise<ResponsePlan> {
 	const names = toolNames(request);
 	const source = requestText(request);
 	const user = lastUserText(request);
 	const lastRole = request.messages?.at(-1)?.role;
+
+	const cancelScenario = await cancelScenarioResponse(request);
+	if (cancelScenario) return cancelScenario;
 
 	const resumeRestriction = resumeRestrictionResponse(request);
 	if (resumeRestriction) return resumeRestriction;
@@ -488,8 +580,8 @@ async function planResponse(request: ChatRequest): Promise<ResponsePlan> {
 		? user.match(/RESUME_FOLLOWUP_INPUT:\s*([a-z0-9]+)/i)?.[1]
 		: undefined;
 	if (resumed) return { text: `RESUME_RESULT_${resumed}` };
-	const btw = btwText(source);
-	if (btw) return { text: btw };
+	const directReply = directReplyText(source);
+	if (directReply) return { text: directReply };
 
 	// caller_ping is always allowlisted for public children; only use it when the
 	// prompt actually asks for a help ping (test-ping), not for ordinary tasks.
@@ -639,7 +731,11 @@ const server = createServer(async (request, response) => {
 	try {
 		const chatRequest = await readJson(request);
 		if (chatRequest.model === "account-rejected") {
-			providerRequests.push({ model: chatRequest.model, status: 400 });
+			providerRequests.push({
+				at: Date.now(),
+				model: chatRequest.model,
+				status: 400,
+			});
 			response.writeHead(400, { "content-type": "application/json" });
 			response.end(
 				JSON.stringify({
@@ -655,7 +751,12 @@ const server = createServer(async (request, response) => {
 			chatRequest.model === "fallback-primary" ||
 			chatRequest.model === "fallback-fail"
 		) {
-			providerRequests.push({ model: chatRequest.model, status: 503 });
+			providerRequests.push({
+				at: Date.now(),
+				model: chatRequest.model,
+				status: 503,
+			});
+			await providerFailureGate;
 			response.writeHead(503, { "content-type": "application/json" });
 			response.end(
 				JSON.stringify({
@@ -665,6 +766,7 @@ const server = createServer(async (request, response) => {
 			return;
 		}
 		providerRequests.push({
+			at: Date.now(),
 			model: chatRequest.model,
 			status: 200,
 			tools: [...toolNames(chatRequest)].sort(),

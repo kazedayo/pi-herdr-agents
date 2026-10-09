@@ -3,10 +3,47 @@
 ## Language
 
 **Pi subagent runtime**:
-The single execution path for fresh and resumed children. `launchPiSubagent()`
-owns the complete Pi and Herdr launch transaction; completion uses Pi sidecar
-evidence first and the terminal exit marker as fallback.
+The single real execution path for fresh and resumed children, coordinated by a
+run session through the Pi harness adapter. `launchPiSubagent()` still owns each
+complete launch transaction; completion uses Pi sidecar evidence first and the
+terminal exit marker as fallback.
 _Avoid_: Runtime dispatch, adapter registry, split launch ownership
+
+**Harness adapter**:
+An object implementing the core interface for child launch, observation,
+completion evidence, and controls. Pi is the only real implementation; the fake
+is for conformance tests.
+_Avoid_: Runtime selector, adapter registry, external CLI compatibility
+
+**Surface provider**:
+An object implementing the core interface for panes, commands, inspection, and
+worktree surfaces. Herdr is the only real implementation; the fake is for
+conformance tests.
+_Avoid_: Supported multiplexer catalog, harness adapter, security sandbox
+
+**Run session**:
+The runtime owner coordinating launched attempts, retries, observations,
+settlement, and delivery-gated surface cleanup. Pi composition supplies the
+real adapter, provider, and session I/O.
+_Avoid_: Pi session file, persistent specialist identity, historical run registry
+
+**Composition root**:
+The Pi host entry point that registers tools and commands, supplies current
+launch inputs and host policy, renders status, and delivers parent results.
+Runtime composition constructs adapters and providers behind its operations.
+_Avoid_: Direct adapter dispatch, duplicated launch owner, workflow engine
+
+**Dependency rule**:
+The test-enforced import boundaries between core, adapters, surfaces, runtime,
+and the Pi host. Core stays harness-neutral; the host consumes core and runtime
+without direct adapter or surface imports.
+_Avoid_: Runtime authorization, package split, hidden compatibility re-export
+
+**Conformance suite**:
+Shared seam-contract tests applied to an in-memory fake and the real
+implementation. Fake coverage is local; real Pi and Herdr coverage uses the
+deterministic integration suite.
+_Avoid_: Second supported harness, fake-only behavior proof, release certification
 
 **Child wake-up signal**:
 An internal indication that prompts fresh inspection of an owned child. It does
@@ -17,6 +54,29 @@ _Avoid_: Completion result, user alert
 The parent-facing handoff of a child run's observed outcome and available
 evidence. Receiving it does not establish that the work is correct or accepted.
 _Avoid_: Wake-up signal, acceptance
+
+**Operator cancel**:
+A parent's `subagent_cancel` of one ordinary managed run. Its terminal intent is
+recorded before any abort, kill, or await, so no fallback, retry, or recovery
+follows. The run settles with one cancelled result only after its owned process
+or pane termination is confirmed; unconfirmed termination keeps it live for a
+retry, and shutdown suppression of it is not a cancellation. A natural result
+taken first stays authoritative.
+_Avoid_: Interrupt, suppression, persistent stop, pane-close fallback
+
+**Process identity**:
+A managed worktree child's Pi process named by immutable kernel facts (PID,
+start time, boot, and PID namespace), recorded by the child at launch and
+verified by the parent against the Herdr pane. A worktree cancel signals and
+judges exit only by it.
+_Avoid_: argv match, foreground process, shell visibility
+
+**Pi startup confirmation**:
+The bounded check that a `/worktree` handoff's Pi is running before its
+workspace is focused: a Pi process in the root pane with the worktree cwd whose
+launch-time environment names the launched session in
+`PI_HERDR_AGENTS_SESSION`. Nothing inside Pi reads that marker.
+_Avoid_: argv match, `--session` visibility, child-context hint
 
 **No-progress advisory**:
 An internal warning that an active child shows no durable progress in its session
@@ -30,38 +90,40 @@ diagnostic, and launch fails before Herdr creates a pane or worktree. Remove
 `cli` and `cli-model`, then select the model through Pi provider/model routing.
 _Avoid_: Silent Pi reinterpretation, compatibility adapter
 
-**Public review fan-out**:
-A parent procedure that materializes pinned evidence, launches fresh public
-reviewer subagents, receives automatic result delivery, and synthesizes every
-outcome. Reviewers use ordinary panes and do not poll for completion.
-_Avoid_: Hidden child runner, approval gate, parentless aggregation
+**Pack-neutral host**:
+This package as an execution host that ships no agent roles and no planning or
+review workflows. Its only skill, `pi-herdr-agents`, is a general operating guide for its own
+control tools. Role packs and project or global definitions supply every
+named role. An empty catalog is valid, and bare launches need no role.
+_Avoid_: Default role set, privileged pack, starter workflow
 
-**Pinned review evidence**:
-The parent-captured repository identity, base and head SHAs, task/spec text,
-provenance, changed-file inventory, complete diff, and deleted or base-only
-content supplied to reviewers. Dirty state is included only when explicitly
-captured and fingerprinted.
-_Avoid_: Moving-checkout inference, head-only deleted-content review
+**Role pack**:
+A separately installed Pi package that registers role definitions through the
+`pi-herdr-subagents:roles:discover:v1` event. Registered packs form the whole
+package layer below global and project definitions; duplicate names across
+packs are disabled. A pack owns its roles' workflows, skills, prerequisites, and
+workflow glossary.
+_Avoid_: Bundled layer, protected fallback, load-order winner
+
+**Child-context hint**:
+The `PI_SUBAGENT_ID` environment variable set for every fresh or resumed child
+this extension launches, and absent from `/worktree` handoff sessions. It
+distinguishes delegated children from user sessions for tool registration and
+pack state decisions. Nested processes inherit it, so it is not a security
+boundary.
+_Avoid_: Authentication token, permission check, second child protocol
+
+**Deprecated role setting**:
+A valid legacy `roles.bundled` boolean, accepted as a no-op and reported once per
+parent extension load. Malformed values remain configuration errors. The
+extension never rewrites user configuration.
+_Avoid_: Bundled-role toggle, automatic migration
 
 **Role allowlist**:
 The `tools:` inline comma-separated role-frontmatter scalar passed to Pi for a
 public child. It is the enforced capability boundary available to a reviewer.
 `read,bash` is not read-only because Bash can mutate files.
 _Avoid_: Shell-as-read-only claim, implicit capability grant
-
-**Finding record**:
-A bounded review record with a stable ID, claimed P0–P3 severity, nullable
-confirmed severity, separate provenance, evidence status (`reproduced`,
-`trace-backed`, or `unverified`), preconditions, reproduction or trace, expected
-and actual behavior, impact, and minimal fix. An unverified potential P0/P1 is
-a candidate for verification, not a certified finding.
-_Avoid_: Confidence gate, provenance-as-severity, vote count
-
-**Incomplete review**:
-A review outcome for drift, failure, missing or truncated evidence, malformed
-output, coverage gaps, or unresolved serious candidates. A child-reported
-`INCOMPLETE` propagates to the parent result.
-_Avoid_: Hidden missing coverage, certified uncertainty
 
 **Persistent specialist**:
 A logical subagent that retains one policy-bound Pi session between sequential
@@ -127,9 +189,13 @@ global enumeration and unsupported platforms remain blockers.
 _Avoid_: Proven unrelated, machine-wide inactivity, bypass permission
 
 **Explicit worktree removal**:
-A parent-requested removal of one named managed checkout and its open workspace,
-with absence verification and retained branch history. Never automatic reaping.
-_Avoid_: Branch deletion, completion cleanup
+A parent-requested removal of one named managed checkout and its open worktree
+workspace, with absence verification and retained branch history. Never automatic
+reaping. It never closes the source repository's primary workspace. When this
+process recorded that worktree creation appeared to open that workspace and a
+read taken just before the report still shows it untouched, removal suggests
+the `herdr workspace close` command, to use only if the workspace is unused.
+_Avoid_: Branch deletion, completion cleanup, automatic close of a workspace the user may have used
 
 **Dirty-state preservation**:
 Explicit opt-in staging and WIP commitment of a worktree's uncommitted and
@@ -156,9 +222,8 @@ model family than the author. For ordinary review, prefer a different
 authenticated model family. When no other authenticated model family is
 available, ordinary review may use a same-family reviewer in a fresh standalone
 session. Disclose that this review is context-isolated, not cross-family
-independent. Cross-family verification, `/skill:orchestrate`, and
-`adversarial-reviewer` must not use this fallback. Family is the independence
-boundary; project policy may separately require a
+independent. Cross-family verification must not use this fallback. Family is
+the independence boundary; project policy may separately require a
 different provider.
 _Avoid_: Generic tier, reviewer-family enforcement, per-step routing
 
