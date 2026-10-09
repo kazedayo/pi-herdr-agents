@@ -205,7 +205,17 @@ export default function (pi: ExtensionAPI) {
 							theme.fg("error", `${denied.length} denied`)
 						: "";
 
-				const content = new Text(`${agentTag}${countInfo}${deniedInfo}`, 0, 0);
+				const allowedLine = `\n${theme.fg("dim", "allowed: ")}${toolNames.join(", ")}`;
+				const deniedLine =
+					denied.length > 0
+						? `\n${theme.fg("dim", "denied: ")}${theme.fg("error", denied.join(", "))}`
+						: "";
+
+				const content = new Text(
+					`${agentTag}${countInfo}${deniedInfo}${allowedLine}${deniedLine}`,
+					0,
+					0,
+				);
 				box.addChild(content);
 
 				return box;

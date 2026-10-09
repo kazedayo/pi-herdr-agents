@@ -7170,13 +7170,21 @@ describe("subagent-done.ts", () => {
 			const lines: string[] = widget.render(80);
 			assert.equal(
 				lines.length,
-				1,
-				`widget must render one compact line: ${JSON.stringify(lines)}`,
+				3,
+				`widget must render header, allowed, and denied lines: ${JSON.stringify(lines)}`,
 			);
 			const rendered = lines[0];
 			assert.ok(
 				rendered.includes("[shortcut-test-agent] — 2 tools · 2 denied"),
 				`widget must show tool and denied counts: ${JSON.stringify(rendered)}`,
+			);
+			assert.ok(
+				lines[1].includes("allowed: bash, read"),
+				`widget must list allowed tool names: ${JSON.stringify(lines[1])}`,
+			);
+			assert.ok(
+				lines[2].includes("denied: browser_navigate, subagent"),
+				`widget must list denied tool names: ${JSON.stringify(lines[2])}`,
 			);
 			assert.equal(
 				rendered.includes("Ctrl+J"),
