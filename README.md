@@ -17,6 +17,7 @@ Delegate investigation, implementation, and review without blocking the parent s
 - **Conversation handoff** — continue the active Pi conversation in a new worktree with `/worktree` while preserving the parent session.
 - **Pack-neutral roles** — use project or global definitions and installable role packs; this package ships no default roles or workflows.
 - **Persistent specialists** — retain one policy-bound Pi session for sequential, turn-based tasks.
+- **Optional sidebar focus** — the companion [Pi Herdr Agents Sidebar](plugins/sidebar/README.md) Herdr plugin hides marked delegated children from Herdr's Agents view while you run Focus. Markers are display-only and follow the pane, so see its [limits](plugins/sidebar/README.md#reusing-a-delegated-pane).
 
 ## Requirements
 
@@ -57,7 +58,7 @@ Restart or `/reload` Pi after installation. Review package source before install
 - [Requirements](#requirements), [Install](#install), [Safety and uninstall](#safety-and-uninstall)
 - [Quick start](#quick-start), [Release notes](#release-notes), [How it works](#how-it-works)
 - [What's Included](#whats-included): tools, commands, the operating skill, role packs
-- [Async Subagent Flow](#async-subagent-flow): status, configuration, model routing
+- [Async Subagent Flow](#async-subagent-flow): status, configuration, model routing, [sidebar markers](#sidebar-markers)
 - [Spawning Subagents](#spawning-subagents), [Persistent specialists](#persistent-specialists), [Interrupting](#interrupting-a-running-subagent), [Cancelling](#cancelling-a-running-subagent)
 - [The `/worktree` Workflow](#the-worktree-workflow), [Custom Agents](#custom-agents), [Tool Access Control](#tool-access-control)
 - [Development](#development), [License](#license)
@@ -67,7 +68,8 @@ Restart or `/reload` Pi after installation. Review package source before install
 - Child agents are real Pi processes running with your user account's permissions, inside Herdr panes. Worktrees isolate Git checkouts, not processes or permissions.
 - The extension creates Herdr panes, tabs and managed worktrees only when a launch asks for them. It never pushes, merges, opens pull requests, deletes branches or removes worktrees on its own; cleanup is an explicit parent action ([worktree cleanup](#explicit-worktree-cleanup)).
 - What it writes: `$PI_CODING_AGENT_DIR/herdr-agents/config.json` (only through `/subagents-init` or the writer tool, never on startup); per-launch artifacts under the parent session's `artifacts/<session-id>/` directory beside Pi's session store, which hold the child's full task text and any `systemPrompt` as Markdown files, activity snapshots and worktree manifests; and the child's own Pi session file. A managed worktree that carries its own `.pi/agent` directory receives that child's session inside the checkout. Treat task text as potentially sensitive when you share or inspect those files.
-- To uninstall: first list and remove any retained worktrees while the extension is still loaded (`/worktree list`, then `/worktree remove <target>`), because those commands leave with the package. Then run `pi remove npm:pi-herdr-agents`, and delete `$PI_CODING_AGENT_DIR/herdr-agents/` and the `artifacts/` directories above if you no longer want the configuration and launch records.
+- Managed worktree children record their PID, process start time, boot ID, and PID namespace in `<session>.process.json` beside their session. With [`sidebar.enabled`](#sidebar-markers), every other child records the same facts, and a resumed child records them under `artifacts/<session-id>/process-identity/`. The parent then reports one display-only pane token, `piha_delegated_v1`, on each child's pane through the Herdr socket. With the setting off, the extension writes no pane metadata.
+- To uninstall: first list and remove any retained worktrees while the extension is still loaded (`/worktree list`, then `/worktree remove <target>`), because those commands leave with the package. If you installed the optional sidebar plugin, remove it with `herdr plugin uninstall pi-herdr-agents.sidebar` (or `herdr plugin unlink` for a linked copy). Then run `pi remove npm:pi-herdr-agents`, and delete `$PI_CODING_AGENT_DIR/herdr-agents/` and the `artifacts/` directories above if you no longer want the configuration and launch records.
 
 ## Quick start
 
@@ -192,7 +194,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | `worktree_list` | Parent-only inspect-only inventory of managed worktrees and cleanup blockers |
 | `worktree_remove` | Parent-only explicit removal by `target` path, branch, or workspace ID; optional `preserve: true` commits dirty state first |
 | `subagent_resume`    | Resume a previous Pi-backed sub-agent session in a new ordinary pane (async)                          |
-| `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences, optionally conditional on `expectedConfigRevision` |
+| `subagents_write_task_models` | Parent-only internal tool that validates and atomically writes `models.tasks` preferences, optionally conditional on `expectedConfigRevision` and carrying an unsaved ranking `basis` |
 
 | Skill | Description |
 | ----- | ----------- |
@@ -207,7 +209,7 @@ Subagent tabs, panes, and worktree workspaces are created without stealing keybo
 | -------------------------- | ------------------------------------ |
 | `/worktree <name> [task]`  | Continue this session in a new managed worktree (`/worktree list` lists them) |
 | `/subagent <agent> <task>` | Spawn a named agent directly (`/subagent list` lists available agents) |
-| `/subagents-init [preferences]` | Draft task-category model preferences from the live authenticated registry, with optional ranking preferences |
+| `/subagents-init [preferences]` | Draft task-category model preferences from the live authenticated registry, with optional ranking preferences; a loaded approval extension can own the write |
 
 ### Taxonomy and discovery
 
@@ -461,7 +463,10 @@ JSON without truncating models and reports its model count and JSON character
 count (not a token estimate); large catalogs still consume context. This is the
 current synchronous snapshot: a dynamic provider whose initial catalog refresh
 has not completed might be absent. Init does not refresh providers or probe the
-network for availability.
+network for availability. The brief also includes `configRevision`, the
+revision of the exact config bytes that supplied the saved preferences. Init
+does not start while a turn runs or messages are queued, and an empty registry
+ends with a notice instead of a prompt. Neither case writes anything.
 
 The draft considers current saved task, default, and per-agent preferences.
 Optional command arguments set ranking preferences. Otherwise it favors
@@ -482,8 +487,23 @@ sources, disclose uncertainty and notable exclusions, and avoid duplicate
 upstream models across routes unless deliberate redundancy is explained. Display
 names help identify candidates but, like aliases, do not prove upstream
 equivalence; research is still required. Price or context size alone is not
-quality evidence. It reports `registry-only` when
-search is unavailable or yields no usable evidence; no live model probes run.
+quality evidence. No live model probes run.
+
+The proposal carries a ranking `basis`. It is `{"kind":"registry-only"}` when
+search is unavailable or yields no usable evidence. It is `{"kind":"research"}`
+only with the http(s) `sources` consulted in this run, the `influence` each had
+on the ranking, and the remaining `uncertainty`. Code checks the basis's shape,
+not whether a source was read, so the basis is labeled as submitted and
+unverified.
+
+While init runs, it emits `pi-herdr-subagents:task-models:init:approval:v1`.
+With no offer, the prompt directs the model to `subagents_write_task_models`
+with `expectedConfigRevision`. When exactly one loaded extension offers, init
+opens that extension's flow, and the extension's instructions replace the
+writer instruction; the extension then owns approval and the write. Two or more
+offers, or an invalid one, stop init before any extension opens or a prompt is
+sent. Once an offer is recorded, a refusal or failure also stops init: it never
+falls back to the direct writer. See [Task-model init events](#task-model-init-events).
 
 The writer validates and atomically replaces `models.tasks` and `tasksMeta`,
 preserving unrelated settings. Its tool schema accepts partial nonempty
@@ -491,9 +511,15 @@ categories (omitted categories are removed), rejects empty `tasks: {}` input,
 and rejects exact duplicate refs within a category after trimming;
 IDs remain case-sensitive. Its result includes normalized saved `tasks`,
 `tasksMeta`, `configPath`, `missingCategories`, and `configRevision`. Init requests all six categories
-and a before/after table based on that saved result, not the unsaved draft. It
-must explain missing categories or changed choices; with no available models,
-it must report the limitation without writing.
+and a before/after table based on that saved result, not the unsaved draft, and
+must explain missing categories or changed choices.
+
+Optional `basis` must have the same kind as `tasksMeta.method`. A research basis
+needs at least one source with an http(s) URL that has a host and a nonblank
+`influence`, plus a nonblank `uncertainty`. The writer validates it before
+writing, returns it in the result, and never saves it; only `tasksMeta.method`
+persists. Calls without `basis`, including research calls, keep the earlier
+contract.
 
 Optional `expectedConfigRevision` makes a write conditional on the config the
 proposal was read from. A revision is `sha256:` followed by 64 lowercase hex
@@ -548,6 +574,128 @@ load naming the file and asking you to remove the key. The extension never
 rewrites the file. Other values remain configuration errors, as do unknown keys
 under `roles`. Registered role packs are the entire package layer, and global and
 project definitions keep their precedence over them.
+
+### Task-model init events
+
+Two versioned `pi.events` channels let another extension take part in
+`/subagents-init` without importing this package. Both carry the invoking
+command's live `ExtensionCommandContext`, so they are for trusted extensions in
+the same process. The context is current only while the event is emitted.
+
+The host emits `pi-herdr-subagents:task-models:init:approval:v1` while init
+runs:
+
+```typescript
+type ApprovalRequest = {
+  apiVersion: 1;
+  brief: TaskModelBrief; // frozen: operatorPreferences, categories, configRevision, current, models (never empty)
+  context: ExtensionCommandContext;
+  offer(offer: { owner: string; open(): OpenResult }): "recorded" | "closed";
+};
+type OpenResult =
+  | {
+      kind: "ready";
+      destination: { toolName: string; instructions: string };
+      cancel(): void; // closes the flow this open created
+    }
+  | { kind: "blocked"; reason: string };
+```
+
+- Call `offer` synchronously, before the listener's first `await`. After `emit`
+  returns, `offer` answers `"closed"` and records nothing.
+- Offer whenever your extension owns task-model approval, even when it is busy,
+  and refuse from `open`. `owner` is one printable token without spaces.
+- The host opens nothing until collection ends. Two offers (even with the same
+  owner) or an invalid offer stop init. With one offer, the host calls `open()`
+  once, and it must return synchronously.
+- `ready` must leave `toolName` active. Its `instructions` replace the host's
+  writer instruction in the prompt the host sends.
+- `ready` must include `cancel`. When the host does not hand the prompt to Pi
+  (the tool is inactive, or `pi.sendUserMessage` throws), it calls `cancel()`
+  once before reporting `not-started`. `cancel` must close only the flow that
+  this `open` created, never a later one. A `cancel` that throws is reported
+  with the outcome.
+- A throw, a promise, an invalid result (including a missing `cancel`), or
+  `blocked` stops init with a notice and no prompt. The host cannot undo what
+  `open` changed before failing.
+- Pi accepts the prompt asynchronously. It can still reject it after `start`
+  reports `started`, for example when the selected model has no configured
+  auth; the host refuses up front only when no model is selected. Pi delivers
+  the prompt to `input` handlers (source `"extension"`) before that check and
+  emits `before_agent_start` and `agent_start` only after it passes. An
+  extension whose flow outlives one prompt should close it when other input or
+  a run arrives before those events, so a later request cannot inherit it.
+- Pi's event bus logs and swallows listener exceptions. A listener that throws
+  before offering looks the same as no listener, so init uses the direct
+  writer. An extension that guards the writer still refuses that write.
+
+Another extension's command emits `pi-herdr-subagents:task-models:init:start:v1`
+to start the same init:
+
+```typescript
+type StartRequest = {
+  apiVersion: 1;
+  context: ExtensionCommandContext;
+  preferences: string; // ranking preferences, passed through as typed
+  offer(offer: { owner: string; start(): InitOutcome }): "recorded" | "closed";
+};
+type InitOutcome =
+  | { kind: "started"; destination: string }
+  | { kind: "not-started"; reason: string };
+```
+
+The host offers synchronously as `pi-herdr-agents` and starts nothing until the
+emitter calls `start()`. Call it only when exactly one host offered. `start`
+runs init with the request's context and returns synchronously; the emitter
+shows a `not-started` reason. The host does not listen in subagent sessions
+and unsubscribes at `session_shutdown`. Unsubscribe an approval listener there
+too, as the role-pack bridge does.
+
+### Sidebar markers
+
+Set `sidebar.enabled` to `true` to mark delegated children for the optional
+[Pi Herdr Agents Sidebar](plugins/sidebar/README.md) Herdr plugin, whose Focus
+action hides marked children from Herdr's Agents view. The setting defaults to
+`false`.
+
+```json
+{
+  "sidebar": {
+    "enabled": true
+  }
+}
+```
+
+Add the key to your existing `config.json`. The extension rejects a
+`config.json` without its `status` section, so copy `config.json.example`
+first if the file does not exist. Run `/reload` after changing the setting.
+Children launched before the change stay unmarked.
+
+Setting `sidebar.enabled` to `false` and running `/reload` retires every
+existing marker and clears the markers of running children. A clear can fail to
+reach Herdr, so a token still expires at most 15 seconds after the last write
+Herdr accepted. Setting it back to `true` marks only later launches; a child
+that was already running when you turned it off is never marked again.
+
+With markers on, every fresh, resumed, and persistent child records its own
+process identity, as managed worktree children always do. After the parent
+verifies that identity, it reports the pane token `piha_delegated_v1` with the
+value `live`, a 15-second time-to-live, and an increasing sequence number
+through `HERDR_SOCKET_PATH`. It renews the token on supervision checks while
+that exact process is alive. It clears the token when the run finalizes or is
+suppressed, or when the process exits or can no longer be verified. A
+`/worktree` handoff session is never marked.
+
+Marker writes never fail a launch or keep Pi running. Each write has a 2-second
+timeout on an unreferenced socket, failed writes are not retried, and three
+failures in a row stop that child's marker. Process identity reads Linux
+`/proc`, so on other systems, and outside Herdr, nothing is marked. After a
+parent crash, a marker can remain for up to 15 seconds after the last write
+Herdr applied. A marker belongs to the pane, so a different process started by
+hand in a delegated pane stays hidden by Focus while the original process is
+alive and supervised, even if it is suspended. Run All first or use a fresh
+pane. See [what a marker proves](plugins/sidebar/README.md#what-a-marker-proves)
+and [reusing a delegated pane](plugins/sidebar/README.md#reusing-a-delegated-pane).
 
 ### Supervision transport
 
@@ -1247,11 +1395,15 @@ provider; fakes are for conformance tests only.
 - `maestro/adapters/pi/` — Pi launch, completion, session I/O, activity files,
   model SDK glue, and registry projection behind `PiHarnessAdapter`;
   `child/subagent-done.ts` implements the child protocol.
-- `maestro/surfaces/herdr/` — `HerdrSurfaceProvider`, Herdr CLI driver, and
-  terminal scripts/placement.
+- `maestro/surfaces/herdr/` — `HerdrSurfaceProvider`, Herdr CLI driver,
+  terminal scripts/placement, and `herdr-socket.ts`, the bounded socket
+  client for pane metadata.
 - `maestro/runtime/` — run ownership, controls/retries, observation,
-  delivery-gated cleanup, Pi composition, worktree operations/handoff, and
-  task-model init composition.
+  delivery-gated cleanup, Pi composition, worktree operations/handoff,
+  task-model init composition, and sidebar markers (`delegated-marker.ts`).
+- `plugins/sidebar/` — the optional Herdr plugin. Its `sidebar.mjs` uses Node
+  built-ins only and imports nothing from the extension, so Herdr can install
+  the directory by itself.
 - `maestro/adapters/fake/`, `maestro/surfaces/fake/`, `test/maestro/` —
   conformance fakes, seam tests, and the import dependency-rule test.
 

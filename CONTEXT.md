@@ -65,11 +65,29 @@ taken first stays authoritative.
 _Avoid_: Interrupt, suppression, persistent stop, pane-close fallback
 
 **Process identity**:
-A managed worktree child's Pi process named by immutable kernel facts (PID,
-start time, boot, and PID namespace), recorded by the child at launch and
-verified by the parent against the Herdr pane. A worktree cancel signals and
-judges exit only by it.
+A child's Pi process named by immutable kernel facts (PID, start time, boot,
+and PID namespace), recorded by the child at launch and verified by the parent
+against the Herdr pane. Every managed worktree child records it; other children
+record it when sidebar markers are on. A worktree cancel signals and judges
+exit only by it, and a delegated marker renews only while it is alive.
 _Avoid_: argv match, foreground process, shell visibility
+
+**Delegated marker**:
+The display-only pane token `piha_delegated_v1=live` that a parent reports on
+a delegated child's pane when `sidebar.enabled` is on. It means the parent
+classified the pane's process as its child within the last 15 seconds, not
+that the process is alive when Herdr draws the row. One stable source, a
+15-second TTL, and increasing sequence numbers bound a leftover marker;
+renewal requires the original process identity. A `/worktree` handoff is
+never marked.
+_Avoid_: liveness proof, ownership record, security boundary, per-run source
+
+**Sidebar Focus**:
+The Herdr agent view that the optional `pi-herdr-agents.sidebar` plugin sets
+on request. It hides rows whose delegated marker is `live` while their status
+is idle, working, or done, and keeps blocked, unknown, and unmarked rows. All
+clears only this plugin's view and reports a view that another tool owns.
+_Avoid_: hiding processes, notification filter, automatic view, popup
 
 **Pi startup confirmation**:
 The bounded check that a `/worktree` handoff's Pi is running before its
@@ -210,7 +228,9 @@ architecture to planning and diagnosis, coding to workers, review to reviewers,
 QA to software and test runners, and docs to documentation workers. Categories
 describe work, not complexity. `/subagents-init [preferences]` drafts them from
 the active extension-loaded registry's synchronous snapshot and existing saved
-choices, with source-based research when available. A dynamic provider awaiting
+choices, with source-based research when available. A single loaded extension
+that offers on the task-model init approval event owns approval and the write
+instead of the host writer. A dynamic provider awaiting
 its initial catalog refresh might be absent. `task:<category>` is a subagent
 model selector, not a command or parent model change. Ordered authenticated
 candidate plans resolve before launch; ordinary nonpersistent runs can retry
@@ -226,6 +246,14 @@ independent. Cross-family verification must not use this fallback. Family is
 the independence boundary; project policy may separately require a
 different provider.
 _Avoid_: Generic tier, reviewer-family enforcement, per-step routing
+
+**Ranking basis**:
+What a task-model proposal's ranking rests on, as the proposing model submitted
+it: `registry-only`, or `research` with the http(s) sources consulted in that
+run, how each influenced the ranking, and the remaining uncertainty. It travels
+with one write for review and is never saved; `tasksMeta.method` keeps its kind.
+Code checks its shape, not that a source was read.
+_Avoid_: Verified research, evidence store
 
 **Loop template**:
 A future reusable orchestration definition beside `models`, describing stages,
